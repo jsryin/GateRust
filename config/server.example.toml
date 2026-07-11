@@ -1,0 +1,33 @@
+[quic]
+bind = "0.0.0.0:2333"
+certificate = "../certs/server.pem"
+private_key = "../certs/server-key.pem"
+
+[[groups]]
+name = "office"
+key = "replace-with-a-generated-256-bit-key"
+
+[[tunnels]]
+name = "ssh"
+group = "office"
+kind = "tcp"
+bind = "0.0.0.0:22022"
+limit_bps = 10485760
+max_connections = 128
+
+[[tunnels]]
+name = "game-udp"
+group = "office"
+kind = "udp"
+bind = "0.0.0.0:27015"
+limit_bps = 20971520
+max_udp_sessions = 512
+udp_idle_seconds = 60
+
+[[tunnels]]
+name = "private-socks"
+group = "office"
+kind = "socks5"
+bind = "127.0.0.1:1080"
+max_connections = 64
+

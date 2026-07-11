@@ -1,0 +1,23 @@
+[server]
+address = "tunnel.example.com:2333"
+name = "tunnel.example.com"
+ca_certificate = "../certs/ca.pem"
+
+[group]
+name = "office"
+key = "replace-with-the-same-generated-256-bit-key"
+
+[[services]]
+name = "ssh"
+kind = "tcp"
+target = "127.0.0.1:22"
+
+[[services]]
+name = "game-udp"
+kind = "udp"
+target = "127.0.0.1:27015"
+
+[[services]]
+name = "private-socks"
+kind = "socks5"
+

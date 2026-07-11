@@ -1,0 +1,19 @@
+[package]
+name = "gaterust-server"
+description = "GateRust QUIC tunnel server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+gaterust-tunnel = { path = "../gaterust-tunnel" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
+

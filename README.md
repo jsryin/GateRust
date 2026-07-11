@@ -1,0 +1,40 @@
+# GateRust
+
+GateRust 当前实现 QUIC 内网穿透模块，包含独立服务端、跨平台客户端和可复用传输核心。本阶段不包含控制面、Web UI、反向代理与 ACME。
+
+## 功能
+
+- 单 UDP 端口承载 QUIC/TLS，多路复用 TCP、UDP 和 SOCKS5 数据流。
+- 分组使用独立 256-bit 密钥认证，密钥只在 TLS 加密的控制流中传输。
+- 每条隧道可配置双向总流量限速、TCP 并发上限和 UDP 会话上限。
+- 服务端可热添加、删除或修改公网监听；客户端可热更新服务及内网目标。
+- 删除配置只阻止新连接，已经建立的数据流继续运行到自然结束。
+- 控制帧、任务队列、连接数及 UDP 会话均有明确上限。
+
+详细协议、安全边界和配置字段见 [QUIC 隧道文档](docs/tunnel.md)。
+
+## 快速开始
+
+生成分组密钥：
+
+```bash
+cargo run -p gaterust-client -- --generate-key
+```
+
+准备由受信 CA 签发、用途包含 `serverAuth` 的 TLS 证书。开发环境可生成本地证书：
+
+```bash
+openssl req -x509 -newkey rsa:3072 -nodes -days 365 \
+  -keyout certs/server-key.pem -out certs/server.pem \
+  -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost'
+```
+
+基于 [server.example.toml](config/server.example.toml) 和 [client.example.toml](config/client.example.toml) 创建配置后启动：
+
+```bash
+cargo run --release -p gaterust-server -- --config config/server.toml
+cargo run --release -p gaterust-client -- --config config/client.toml
+```
+
+通过 `RUST_LOG` 调整日志级别，例如 `RUST_LOG=gaterust_tunnel=debug`。配置文件可能包含密钥，不应提交到版本库；仓库已忽略常用运行时配置路径。
+

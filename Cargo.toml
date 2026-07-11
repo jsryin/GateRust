@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/gaterust-client",
+    "crates/gaterust-server",
+    "crates/gaterust-tunnel",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/jsryin/GateRust"
+
+[workspace.dependencies]
+base64 = "0.22.1"
+clap = { version = "4.5.41", features = ["derive"] }
+notify = "8.1.0"
+quinn = { version = "0.11.8", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
+rand = "0.10.2"
+rustls = { version = "0.23.29", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2.2.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+subtle = "2.6.1"
+thiserror = "2.0.12"
+tokio = { version = "1.46.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.15", features = ["rt"] }
+toml = "1.1.2"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+zeroize = "1.8.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
