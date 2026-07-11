@@ -1,0 +1,61 @@
+[proxy]
+http_bind = "0.0.0.0:80"
+https_bind = "0.0.0.0:443"
+cache_dir = "../data/acme"
+max_connections = 2048
+
+# 首次部署建议保持 production = false，确认 DNS 和端口可达后再切换生产 CA。
+[[certificates]]
+name = "site"
+domains = ["example.com", "www.example.com"]
+email = "admin@example.com"
+issuer = "lets_encrypt"
+challenge = "tls-alpn-01"
+production = false
+
+# Cloudflare Token 只需目标 Zone 的 DNS:Edit 权限。
+[[certificates]]
+name = "wildcard"
+domains = ["*.internal.example.com"]
+email = "admin@example.com"
+issuer = "lets_encrypt"
+challenge = "cloudflare-dns-01"
+production = false
+cloudflare_api_token = "replace-with-scoped-token"
+cloudflare_zone_id = "replace-with-zone-id"
+dns_propagation_seconds = 30
+
+# Google Trust Services 需要先在 Google Cloud Public CA 获取 EAB 凭据。
+[[certificates]]
+name = "google-site"
+domains = ["google.example.com"]
+email = "admin@example.com"
+issuer = "google_trust_services"
+challenge = "cloudflare-dns-01"
+production = false
+cloudflare_api_token = "replace-with-scoped-token"
+cloudflare_zone_id = "replace-with-zone-id"
+google_eab_key_id = "replace-with-eab-key-id"
+google_eab_hmac_key = "replace-with-base64url-hmac-key"
+dns_propagation_seconds = 30
+
+[[routes]]
+name = "public-site"
+host = "example.com"
+path_prefix = "/"
+upstream = "http://127.0.0.1:3000"
+certificate = "site"
+
+[[routes]]
+name = "api"
+host = "example.com"
+path_prefix = "/api"
+upstream = "http://127.0.0.1:8080"
+certificate = "site"
+
+[[routes]]
+name = "tunnel-service"
+host = "service.internal.example.com"
+path_prefix = "/"
+upstream = "http://127.0.0.1:18080"
+certificate = "wildcard"
