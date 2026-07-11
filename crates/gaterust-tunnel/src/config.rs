@@ -23,7 +23,7 @@ pub enum TunnelKind {
     Socks5,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub quic: ServerQuicConfig,
@@ -33,7 +33,7 @@ pub struct ServerConfig {
     pub tunnels: Vec<ServerTunnelConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerQuicConfig {
     pub bind: SocketAddr,
@@ -41,14 +41,14 @@ pub struct ServerQuicConfig {
     pub private_key: PathBuf,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupConfig {
     pub name: String,
     pub key: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerTunnelConfig {
     pub name: String,
@@ -64,7 +64,7 @@ pub struct ServerTunnelConfig {
     pub udp_idle_seconds: u64,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub server: ClientServerConfig,
@@ -73,7 +73,7 @@ pub struct ClientConfig {
     pub services: Vec<ClientServiceConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientServerConfig {
     pub address: String,
@@ -81,7 +81,7 @@ pub struct ClientServerConfig {
     pub ca_certificate: PathBuf,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientGroupConfig {
     pub name: String,
@@ -150,7 +150,12 @@ impl ServerConfig {
             .collect()
     }
 
-    fn validate(&self) -> Result<()> {
+    /// 验证服务端分组和隧道配置。
+    ///
+    /// # Errors
+    ///
+    /// 名称、密钥、监听地址或数量不满足约束时返回错误。
+    pub fn validate(&self) -> Result<()> {
         if self.groups.len() > 256 || self.tunnels.len() > 1_024 {
             return Err(TunnelError::InvalidConfig(
                 "分组不能超过 256 个，隧道不能超过 1024 个".into(),
@@ -237,7 +242,12 @@ impl ClientConfig {
         GroupSecret::decode(&self.group.key)
     }
 
-    fn validate(&self) -> Result<()> {
+    /// 验证客户端配置中的认证信息和服务声明。
+    ///
+    /// # Errors
+    ///
+    /// 名称、密钥、服务目标或数量不满足约束时返回错误。
+    pub fn validate(&self) -> Result<()> {
         validate_name("分组", &self.group.name)?;
         GroupSecret::decode(&self.group.key)?;
         if self.server.name.is_empty() {

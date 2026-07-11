@@ -1,0 +1,12 @@
+[web]
+bind = "127.0.0.1:8080"
+# 构建前端后由服务端直接托管；独立部署到 Cloudflare Pages 时可删除此项。
+static_dir = "../web/dist"
+admin_username = "admin"
+# 使用 `printf '%s' 'your-password' | cargo run -p gaterust-server -- hash-password` 生成。
+admin_password_hash = "replace-with-argon2id-phc-hash"
+# 使用 `cargo run -p gaterust-client -- --generate-key` 生成至少 32 字节的随机密钥。
+jwt_secret = "replace-with-a-random-256-bit-signing-secret"
+token_ttl_seconds = 3600
+# SPA 独立部署时填写其完整 Origin；同源托管时保持空数组。
+allowed_origins = []

@@ -20,12 +20,14 @@
 
 # Runtime configuration (may contain credentials and tunnel keys)
 /config.toml
+/web.toml
 /gaterust.toml
 /config/local.toml
 /config/runtime.toml
 /config/client.toml
 /config/proxy.toml
 /config/server.toml
+/config/web.toml
 !/config/*.example.toml
 !/config/*.sample.toml
 

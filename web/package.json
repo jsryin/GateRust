@@ -1,0 +1,21 @@
+{
+  "name": "gaterust-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@lucide/svelte": "^1.24.0",
+    "svelte": "^5.35.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^6.0.0",
+    "svelte-check": "^4.2.2",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.0"
+  }
+}
