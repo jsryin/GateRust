@@ -46,7 +46,7 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
-tower-http = { version = "0.6.6", features = ["cors", "fs"] }
+tower-http = { version = "0.7.0", features = ["cors", "fs"] }
 zeroize = "1.8.1"
 
 [workspace.lints.rust]
