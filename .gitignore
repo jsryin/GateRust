@@ -1,0 +1,65 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Svelte / Node.js build artifacts
+**/node_modules/
+**/.svelte-kit/
+**/build/
+**/dist/
+**/.vite/
+**/coverage/
+*.tsbuildinfo
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Runtime configuration (may contain credentials and tunnel keys)
+/config.toml
+/gaterust.toml
+/config/local.toml
+/config/runtime.toml
+!/config/*.example.toml
+!/config/*.sample.toml
+
+# Runtime state, generated client configs, certificates, and logs
+/data/
+/var/
+/run/
+/logs/
+/certs/
+/acme/
+/generated/
+/client-configs/
+*.log
+*.pid
+
+# Test and profiling output
+*.profraw
+*.profdata
+*.lcov
+/tarpaulin-report.html
+
+# Local deployment artifacts
+/*.tar.gz
+/*.tar.xz
+/*.zip
+/*.deb
+/*.rpm
+/gaterust
+/gaterust-client
+/unified-server
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
