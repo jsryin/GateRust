@@ -75,13 +75,15 @@ openssl req -x509 -newkey rsa:3072 -nodes -days 365 \
   -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost'
 ```
 
-基于 [server.example.toml](config/server.example.toml) 和 [client.example.toml](config/client.example.toml) 创建配置后启动：
+基于 [server.example.toml](config/server.example.toml) 和 [client.example.toml](config/client.example.toml) 创建配置后启动。客户端只需填写服务端分配的分组密钥；使用公共 CA 证书时可省略 `name` 和 `ca_certificate`，TLS 名称会从服务器地址推导：
 
 ```bash
 cargo run --release -p gaterust-server -- \
   --enable-tunnel --tunnel-config config/server.toml
 cargo run --release -p gaterust-client -- --config config/client.toml
 ```
+
+客户端首次启动时会在配置文件旁生成 `client.toml.device-id`，用于在共享同一分组密钥时稳定区分设备。
 
 通过 `RUST_LOG` 调整日志级别，例如 `RUST_LOG=gaterust_tunnel=debug`。配置文件可能包含密钥，不应提交到版本库；仓库已忽略常用运行时配置路径。
 

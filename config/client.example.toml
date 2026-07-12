@@ -1,11 +1,9 @@
+key = "replace-with-the-same-32-to-124-character-key"
+
 [server]
 address = "tunnel.example.com:2333"
 name = "tunnel.example.com"
 ca_certificate = "../certs/ca.pem"
-
-[group]
-name = "office"
-key = "replace-with-the-same-32-to-124-character-key"
 
 [[services]]
 name = "ssh"

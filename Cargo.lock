@@ -1020,6 +1020,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "webpki-roots 1.0.8",
  "zeroize",
 ]
 

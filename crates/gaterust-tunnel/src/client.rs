@@ -11,13 +11,15 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     Result, TunnelError,
     config::{ClientConfig, ClientServiceConfig, TunnelKind},
+    identity::DeviceIdentity,
     protocol::{
-        ClientHello, ControlMessage, HANDSHAKE_TIMEOUT, MAX_DATAGRAM, OpenRequest, OpenResponse,
-        PROTOCOL_VERSION, ServerHello, ServiceDeclaration, read_datagram, read_frame,
-        write_datagram, write_frame,
+        AuthenticationStatus, ClientHello, ControlMessage, HANDSHAKE_TIMEOUT, MAX_DATAGRAM,
+        OpenRequest, OpenResponse, PROTOCOL_VERSION, ServerHello, ServiceDeclaration,
+        read_datagram, read_frame, write_datagram, write_frame,
     },
     rate_limit::RateLimiter,
     relay::{self, QuinnStream},
+    runtime::ADMINISTRATOR_CLOSE_CODE,
     tls,
     watcher::ConfigWatcher,
 };
@@ -56,11 +58,20 @@ pub async fn run_client_with_shutdown(
 ) -> Result<()> {
     let config_path = config_path.as_ref().to_owned();
     let mut config = ClientConfig::load(&config_path)?;
+    let mut identity = DeviceIdentity::load(&config_path)?;
     let mut watcher = ConfigWatcher::new(&config_path)?;
     let mut retry = Duration::from_secs(1);
 
     while !shutdown.is_cancelled() {
-        match connect_and_run(config.clone(), &config_path, &mut watcher, &shutdown).await {
+        match connect_and_run(
+            config.clone(),
+            &identity,
+            &config_path,
+            &mut watcher,
+            &shutdown,
+        )
+        .await
+        {
             ConnectionEnd::Reconfigure(updated) => {
                 config = updated;
                 retry = Duration::from_secs(1);
@@ -81,6 +92,15 @@ pub async fn run_client_with_shutdown(
                 }
                 retry = (retry * 2).min(Duration::from_secs(30));
             }
+            ConnectionEnd::DeviceIdConflict => {
+                identity.resolve_conflict()?;
+                tracing::info!(device_id = identity.as_str(), "设备 ID 冲突，已生成新 ID");
+                retry = Duration::from_secs(1);
+            }
+            ConnectionEnd::AdministratorDisconnected => {
+                tracing::warn!(device_id = identity.as_str(), "客户端已被管理员下线");
+                break;
+            }
             ConnectionEnd::Shutdown => break,
         }
     }
@@ -91,11 +111,14 @@ pub async fn run_client_with_shutdown(
 enum ConnectionEnd {
     Reconfigure(ClientConfig),
     Disconnected(TunnelError),
+    DeviceIdConflict,
+    AdministratorDisconnected,
     Shutdown,
 }
 
 async fn connect_and_run(
     mut config: ClientConfig,
+    identity: &DeviceIdentity,
     config_path: &Path,
     watcher: &mut ConfigWatcher,
     shutdown: &CancellationToken,
@@ -104,11 +127,16 @@ async fn connect_and_run(
         Ok(address) => address,
         Err(error) => return ConnectionEnd::Disconnected(error),
     };
-    let endpoint = match tls::client_endpoint(server_address, &config.server.ca_certificate) {
-        Ok(endpoint) => endpoint,
+    let endpoint =
+        match tls::client_endpoint(server_address, config.server.ca_certificate.as_deref()) {
+            Ok(endpoint) => endpoint,
+            Err(error) => return ConnectionEnd::Disconnected(error),
+        };
+    let server_name = match config.server_name() {
+        Ok(name) => name.to_owned(),
         Err(error) => return ConnectionEnd::Disconnected(error),
     };
-    let connecting = match endpoint.connect(server_address, &config.server.name) {
+    let connecting = match endpoint.connect(server_address, &server_name) {
         Ok(connecting) => connecting,
         Err(error) => return ConnectionEnd::Disconnected(error.into()),
     };
@@ -119,8 +147,13 @@ async fn connect_and_run(
             Err(error) => return ConnectionEnd::Disconnected(error.into()),
         }
     };
-    let mut control_send = match authenticate(&connection, &config).await {
-        Ok(control_send) => control_send,
+    let mut control_send = match authenticate(&connection, &config, identity.as_str()).await {
+        Ok(AuthenticationResult::Accepted(control_send)) => control_send,
+        Ok(AuthenticationResult::DeviceIdConflict) => {
+            endpoint.close(CLOSE_SHUTDOWN, b"device id conflict");
+            endpoint.wait_idle().await;
+            return ConnectionEnd::DeviceIdConflict;
+        }
         Err(error) => {
             endpoint.close(CLOSE_SHUTDOWN, b"authentication failed");
             return ConnectionEnd::Disconnected(error);
@@ -129,7 +162,7 @@ async fn connect_and_run(
 
     tracing::info!(
         server = %config.server.address,
-        group = %config.group.name,
+        device_id = identity.as_str(),
         "已连接 QUIC 隧道服务端"
     );
     let services = Arc::new(RwLock::new(service_map(&config.services)));
@@ -152,7 +185,16 @@ async fn connect_and_run(
     result
 }
 
-async fn authenticate(connection: &Connection, config: &ClientConfig) -> Result<quinn::SendStream> {
+enum AuthenticationResult {
+    Accepted(quinn::SendStream),
+    DeviceIdConflict,
+}
+
+async fn authenticate(
+    connection: &Connection,
+    config: &ClientConfig,
+    device_id: &str,
+) -> Result<AuthenticationResult> {
     let (mut send, mut receive) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| TunnelError::Timeout("打开认证流"))??;
@@ -160,8 +202,8 @@ async fn authenticate(connection: &Connection, config: &ClientConfig) -> Result<
         &mut send,
         &ClientHello {
             version: PROTOCOL_VERSION,
-            group: config.group.name.clone(),
-            key: config.group.key.as_bytes().to_vec(),
+            device_id: device_id.into(),
+            key: config.key.as_bytes().to_vec(),
             services: declarations(&config.services),
         },
     )
@@ -169,10 +211,13 @@ async fn authenticate(connection: &Connection, config: &ClientConfig) -> Result<
     let response: ServerHello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut receive))
         .await
         .map_err(|_| TunnelError::Timeout("等待认证结果"))??;
-    if !response.accepted {
-        return Err(TunnelError::Protocol(response.message));
+    match response.status {
+        AuthenticationStatus::Accepted => Ok(AuthenticationResult::Accepted(send)),
+        AuthenticationStatus::DeviceIdConflict => Ok(AuthenticationResult::DeviceIdConflict),
+        AuthenticationStatus::Rejected | AuthenticationStatus::ServerBusy => {
+            Err(TunnelError::Protocol(response.message))
+        }
     }
-    Ok(send)
 }
 
 async fn run_connected(
@@ -188,7 +233,12 @@ async fn run_connected(
     let end = loop {
         tokio::select! {
             () = shutdown.cancelled() => break ConnectionEnd::Shutdown,
-            error = connection.closed() => break ConnectionEnd::Disconnected(error.into()),
+            error = connection.closed() => {
+                if is_administrator_disconnect(&error) {
+                    break ConnectionEnd::AdministratorDisconnected;
+                }
+                break ConnectionEnd::Disconnected(error.into());
+            },
             changed = watcher.changed() => {
                 if !changed {
                     break ConnectionEnd::Disconnected(TunnelError::Protocol("配置监听器已关闭".into()));
@@ -391,7 +441,13 @@ fn service_map(services: &[ClientServiceConfig]) -> HashMap<String, ClientServic
 }
 
 fn connection_identity_changed(current: &ClientConfig, updated: &ClientConfig) -> bool {
-    current.server != updated.server
-        || current.group.name != updated.group.name
-        || current.group.key != updated.group.key
+    current.server != updated.server || current.key != updated.key
+}
+
+fn is_administrator_disconnect(error: &quinn::ConnectionError) -> bool {
+    matches!(
+        error,
+        quinn::ConnectionError::ApplicationClosed(close)
+            if close.error_code == VarInt::from_u32(ADMINISTRATOR_CLOSE_CODE)
+    )
 }

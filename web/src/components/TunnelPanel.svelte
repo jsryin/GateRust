@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { Check, Copy, KeyRound, Pencil, Plus, RefreshCw, Save, Trash2, X } from '@lucide/svelte';
-  import { generateKey, saveTunnel } from '../lib/api';
-  import type { GroupConfig, ServerConfig, TunnelConfig, TunnelKind } from '../lib/types';
+  import { onMount } from 'svelte';
+  import { Check, Copy, KeyRound, LogOut, Pencil, Plus, RefreshCw, Save, Trash2, X } from '@lucide/svelte';
+  import { disconnectTunnelClient, generateKey, getTunnelRuntime, saveTunnel } from '../lib/api';
+  import type { GroupConfig, ServerConfig, TunnelConfig, TunnelKind, TunnelRuntimeClient, TunnelRuntimeState } from '../lib/types';
 
   export let token: string;
   export let config: ServerConfig | null | undefined;
@@ -20,8 +21,35 @@
   let saving = false;
   let message = '';
   let error = '';
+  let runtime: TunnelRuntimeState = { clients: [], tunnels: [] };
   const minGroupKeyLength = 32;
   const maxGroupKeyLength = 124;
+
+  onMount(() => {
+    refreshRuntime();
+    const timer = window.setInterval(refreshRuntime, 5000);
+    return () => window.clearInterval(timer);
+  });
+
+  async function refreshRuntime() {
+    try { runtime = await getTunnelRuntime(token); }
+    catch (cause) { if (!(cause instanceof Error && cause.message === '隧道模块未运行')) error = cause instanceof Error ? cause.message : '读取客户端状态失败'; }
+  }
+
+  function runtimeClient(sessionId: number | null): TunnelRuntimeClient | undefined {
+    return sessionId === null ? undefined : runtime.clients.find((client) => client.session_id === sessionId);
+  }
+
+  function connectedAt(timestamp: number): string {
+    return new Date(timestamp * 1000).toLocaleString();
+  }
+
+  async function disconnectClient(client: TunnelRuntimeClient) {
+    const tunnels = runtime.tunnels.filter((item) => item.owner_session_id === client.session_id).map((item) => item.name);
+    if (!confirm(`下线 ${client.device_id}？将释放隧道：${tunnels.join(', ')}`)) return;
+    try { await disconnectTunnelClient(token, client.session_id); await refreshRuntime(); }
+    catch (cause) { error = cause instanceof Error ? cause.message : '下线客户端失败'; }
+  }
 
   function newTunnel(): TunnelConfig {
     return { name: '', group: '', kind: 'tcp', bind: '0.0.0.0:8080', limit_bps: null, max_connections: 128, max_udp_sessions: 512, udp_idle_seconds: 60 };
@@ -96,7 +124,7 @@
 </section>
 
 <section class="section-block">
-  <div class="section-heading"><div><h2>访问分组</h2><p>每个客户端使用独立分组密钥认证</p></div><button class="secondary" onclick={() => openGroup()}><Plus size={17} />新建分组</button></div>
+  <div class="section-heading"><div><h2>访问分组</h2><p>同一分组共享密钥与隧道权限</p></div><button class="secondary" onclick={() => openGroup()}><Plus size={17} />新建分组</button></div>
   {#if draft.groups.length}
     <div class="table-wrap"><table><thead><tr><th>名称</th><th>密钥</th><th>隧道数</th><th></th></tr></thead><tbody>
       {#each draft.groups as item, index}
@@ -109,8 +137,12 @@
 <section class="section-block">
   <div class="section-heading"><div><h2>隧道</h2><p>公网监听、协议类型和资源边界</p></div><button class="secondary" onclick={() => openTunnel()} disabled={!draft.groups.length}><Plus size={17} />新建隧道</button></div>
   {#if draft.tunnels.length}
-    <div class="table-wrap"><table><thead><tr><th>名称</th><th>协议</th><th>分组</th><th>监听</th><th>限速</th><th></th></tr></thead><tbody>
-      {#each draft.tunnels as item, index}<tr><td><strong>{item.name}</strong></td><td><span class="protocol">{kindLabel[item.kind]}</span></td><td>{item.group}</td><td><code>{item.bind}</code></td><td>{item.limit_bps ? `${item.limit_bps.toLocaleString()} B/s` : '不限'}</td><td class="actions"><button title="编辑" onclick={() => openTunnel(index)}><Pencil size={16} /></button><button class="danger-icon" title="删除" onclick={() => { draft.tunnels = draft.tunnels.filter((_, current) => current !== index); draft = { ...draft }; }}><Trash2 size={16} /></button></td></tr>{/each}
+    <div class="table-wrap"><table><thead><tr><th>名称</th><th>协议</th><th>分组</th><th>监听</th><th>客户端</th><th>限速</th><th></th></tr></thead><tbody>
+      {#each draft.tunnels as item, index}
+        {@const state = runtime.tunnels.find((entry) => entry.name === item.name)}
+        {@const owner = runtimeClient(state?.owner_session_id ?? null)}
+        <tr><td><strong>{item.name}</strong></td><td><span class="protocol">{kindLabel[item.kind]}</span></td><td>{item.group}</td><td><code>{item.bind}</code></td><td class="client-state">{#if owner}<strong>{owner.device_id}</strong><small>{owner.remote_address} · {connectedAt(owner.connected_at)}</small>{:else}<span>未连接</span>{/if}{#if state?.waiting_session_ids.length}<small>等待：{state.waiting_session_ids.map((id) => runtimeClient(id)?.device_id ?? `#${id}`).join(', ')}</small>{/if}</td><td>{item.limit_bps ? `${item.limit_bps.toLocaleString()} B/s` : '不限'}</td><td class="actions">{#if owner}<button class="danger-icon" title="下线客户端" onclick={() => disconnectClient(owner)}><LogOut size={16} /></button>{/if}<button title="编辑" onclick={() => openTunnel(index)}><Pencil size={16} /></button><button class="danger-icon" title="删除" onclick={() => { draft.tunnels = draft.tunnels.filter((_, current) => current !== index); draft = { ...draft }; }}><Trash2 size={16} /></button></td></tr>
+      {/each}
     </tbody></table></div>
   {:else}<div class="empty"><p>暂无隧道配置</p></div>{/if}
 </section>

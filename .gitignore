@@ -42,6 +42,7 @@
 /client-configs/
 *.log
 *.pid
+*.device-id
 
 # Test and profiling output
 *.profraw

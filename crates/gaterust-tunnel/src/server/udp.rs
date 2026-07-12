@@ -9,15 +9,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Result, TunnelError,
-    config::{ServerTunnelConfig, TunnelKind},
+    config::ServerTunnelConfig,
     protocol::{
         HANDSHAKE_TIMEOUT, MAX_DATAGRAM, OpenRequest, OpenResponse, read_datagram, read_frame,
         write_datagram, write_frame,
     },
     rate_limit::RateLimiter,
+    runtime::TunnelRuntime,
 };
-
-use super::registry::SessionRegistry;
 
 const SESSION_QUEUE: usize = 64;
 
@@ -28,7 +27,7 @@ pub(super) async fn bind(config: &ServerTunnelConfig) -> Result<UdpSocket> {
 pub(super) async fn run(
     socket: UdpSocket,
     config: ServerTunnelConfig,
-    registry: Arc<SessionRegistry>,
+    runtime: TunnelRuntime,
     cancellation: CancellationToken,
     stopped: oneshot::Sender<()>,
 ) {
@@ -61,7 +60,7 @@ pub(super) async fn run(
                     sessions.insert(peer, sender);
                     let context = SessionContext {
                         socket: Arc::clone(&socket),
-                        registry: Arc::clone(&registry),
+                        runtime: runtime.clone(),
                         limiter: limiter.clone(),
                         cleanup: cleanup_sender.clone(),
                         config: config.clone(),
@@ -104,7 +103,7 @@ pub(super) async fn run(
 
 struct SessionContext {
     socket: Arc<UdpSocket>,
-    registry: Arc<SessionRegistry>,
+    runtime: TunnelRuntime,
     limiter: RateLimiter,
     cleanup: mpsc::Sender<SocketAddr>,
     config: ServerTunnelConfig,
@@ -115,11 +114,7 @@ async fn run_session(
     mut inbound: mpsc::Receiver<Vec<u8>>,
     context: &SessionContext,
 ) -> Result<()> {
-    let Some(session) = context
-        .registry
-        .find(&context.config.group, &context.config.name, TunnelKind::Udp)
-        .await
-    else {
+    let Some(session) = context.runtime.find(&context.config.name).await else {
         return Err(TunnelError::Protocol("没有可用的内网客户端".into()));
     };
     let (mut send, mut receive) =

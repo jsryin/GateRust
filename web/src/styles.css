@@ -65,6 +65,9 @@ td code { color: #344054; font-size: 11px; background: #f3f5f7; padding: 3px 5px
 .actions button.danger-icon:hover { color: #b42318; background: #fff0ee; }
 .protocol, .environment { display: inline-flex; background: #edf3f7; color: #3f5668; border-radius: 4px; padding: 4px 6px; font-size: 10px; font-weight: 750; }
 .environment.production { color: #12695b; background: #e8f5f1; }
+.client-state strong, .client-state small { display: block; }
+.client-state small { margin-top: 3px; color: #737e90; white-space: nowrap; }
+.client-state > span { color: #98a2b3; }
 .empty { min-height: 160px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #7b8596; text-align: center; padding: 25px; }
 .empty svg { margin-bottom: 11px; color: #8793a5; }
 .empty strong { color: #344054; font-size: 13px; }

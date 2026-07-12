@@ -13,9 +13,10 @@ use crate::{
     protocol::{HANDSHAKE_TIMEOUT, OpenRequest, OpenResponse, read_frame, write_frame},
     rate_limit::RateLimiter,
     relay,
+    runtime::TunnelRuntime,
 };
 
-use super::{registry::SessionRegistry, socks5};
+use super::socks5;
 
 pub(super) async fn bind(config: &ServerTunnelConfig) -> Result<(TcpListener, Arc<Semaphore>)> {
     let listener = TcpListener::bind(config.bind).await?;
@@ -26,7 +27,7 @@ pub(super) async fn run(
     listener: TcpListener,
     permits: Arc<Semaphore>,
     config: ServerTunnelConfig,
-    registry: Arc<SessionRegistry>,
+    runtime: TunnelRuntime,
     cancellation: CancellationToken,
     stopped: oneshot::Sender<()>,
 ) {
@@ -42,11 +43,11 @@ pub(super) async fn run(
                         continue;
                     };
                     let config = config.clone();
-                    let registry = Arc::clone(&registry);
+                    let runtime = runtime.clone();
                     let limiter = limiter.clone();
                     connections.spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = handle(stream, &config, &registry, &limiter).await {
+                        if let Err(error) = handle(stream, &config, &runtime, &limiter).await {
                             tracing::debug!(tunnel = %config.name, %peer, %error, "流式隧道连接结束");
                         }
                     });
@@ -77,7 +78,7 @@ pub(super) async fn run(
 async fn handle(
     mut public: TcpStream,
     config: &ServerTunnelConfig,
-    registry: &SessionRegistry,
+    runtime: &TunnelRuntime,
     limiter: &RateLimiter,
 ) -> Result<()> {
     let destination = if config.kind == TunnelKind::Socks5 {
@@ -89,10 +90,7 @@ async fn handle(
     } else {
         None
     };
-    let Some(session) = registry
-        .find(&config.group, &config.name, config.kind)
-        .await
-    else {
+    let Some(session) = runtime.find(&config.name).await else {
         if config.kind == TunnelKind::Socks5 {
             socks5::send_reply(&mut public, 1).await?;
         }

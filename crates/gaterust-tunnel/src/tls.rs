@@ -14,12 +14,16 @@ pub(crate) fn server_endpoint(config: &ServerQuicConfig) -> Result<Endpoint> {
     Endpoint::server(server, config.bind).map_err(Into::into)
 }
 
-pub(crate) fn client_endpoint(server: SocketAddr, ca_path: &Path) -> Result<Endpoint> {
+pub(crate) fn client_endpoint(server: SocketAddr, ca_path: Option<&Path>) -> Result<Endpoint> {
     let mut roots = rustls::RootCertStore::empty();
-    for certificate in read_certificates(ca_path)? {
-        roots
-            .add(certificate)
-            .map_err(|error| TunnelError::Tls(format!("添加 CA 证书失败: {error}")))?;
+    if let Some(ca_path) = ca_path {
+        for certificate in read_certificates(ca_path)? {
+            roots
+                .add(certificate)
+                .map_err(|error| TunnelError::Tls(format!("添加 CA 证书失败: {error}")))?;
+        }
+    } else {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
     let tls = rustls::ClientConfig::builder()
         .with_root_certificates(roots)

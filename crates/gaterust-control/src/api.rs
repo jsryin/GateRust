@@ -2,14 +2,14 @@ use std::{convert::Infallible, net::SocketAddr};
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
@@ -58,8 +58,8 @@ struct ApiError {
 struct ClientConfigRequest {
     group: String,
     server_address: String,
-    server_name: String,
-    ca_certificate: String,
+    server_name: Option<String>,
+    ca_certificate: Option<String>,
     services: Vec<gaterust_tunnel::ClientServiceConfig>,
 }
 
@@ -78,7 +78,7 @@ pub(crate) fn router(config: &WebConfig, auth: AuthService, store: ConfigStore) 
         .merge(module_routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     let mut cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::PUT])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
     if !config.allowed_origins.is_empty() {
         let origins = config
@@ -102,6 +102,11 @@ fn module_routes() -> Router<ApiState> {
     let router = router
         .route("/config/tunnel", put(save_tunnel))
         .route("/groups/key", post(generate_key))
+        .route("/tunnel/runtime", get(tunnel_runtime))
+        .route(
+            "/tunnel/sessions/{session_id}",
+            delete(disconnect_tunnel_client),
+        )
         .route("/client-config", post(generate_client_config));
     #[cfg(feature = "proxy")]
     let router = router.route("/config/proxy", put(save_proxy));
@@ -199,6 +204,33 @@ async fn generate_key() -> Json<serde_json::Value> {
 }
 
 #[cfg(feature = "tunnel")]
+async fn tunnel_runtime(
+    State(state): State<ApiState>,
+) -> Result<Json<gaterust_tunnel::TunnelRuntimeSnapshot>, ApiError> {
+    let runtime = state
+        .store
+        .tunnel_runtime()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "隧道模块未运行"))?;
+    Ok(Json(runtime.snapshot().await))
+}
+
+#[cfg(feature = "tunnel")]
+async fn disconnect_tunnel_client(
+    State(state): State<ApiState>,
+    Path(session_id): Path<u64>,
+) -> Result<StatusCode, ApiError> {
+    let runtime = state
+        .store
+        .tunnel_runtime()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "隧道模块未运行"))?;
+    if runtime.disconnect(session_id).await {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::new(StatusCode::NOT_FOUND, "客户端会话不存在"))
+    }
+}
+
+#[cfg(feature = "tunnel")]
 async fn generate_client_config(
     State(state): State<ApiState>,
     Json(request): Json<ClientConfigRequest>,
@@ -213,14 +245,11 @@ async fn generate_client_config(
         .find(|group| group.name == request.group)
         .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "分组不存在"))?;
     let config = gaterust_tunnel::ClientConfig {
+        key: group.key,
         server: gaterust_tunnel::ClientServerConfig {
             address: request.server_address,
             name: request.server_name,
-            ca_certificate: request.ca_certificate.into(),
-        },
-        group: gaterust_tunnel::ClientGroupConfig {
-            name: group.name,
-            key: group.key,
+            ca_certificate: request.ca_certificate.map(Into::into),
         },
         services: request.services,
     };

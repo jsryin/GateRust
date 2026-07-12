@@ -8,7 +8,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{run_client_with_shutdown, run_server_with_shutdown};
+use crate::{
+    TunnelRuntime, TunnelRuntimeSnapshot, run_client_with_shutdown, run_server_with_runtime,
+    run_server_with_shutdown,
+};
 
 const TEST_KEY: &str = "12345678901234567890123456789012";
 
@@ -110,6 +113,114 @@ async fn forwards_tcp_udp_and_socks5() {
     assert_join_ok(udp_echo, "UDP 回显服务").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shares_key_and_hands_tunnel_to_waiting_client() {
+    let directory = tempfile::tempdir().expect("应能创建测试目录");
+    write_certificate(directory.path());
+    let quic = unused_udp_address();
+    let public = unused_tcp_address();
+    let server_config = format!(
+        r#"
+[quic]
+bind = "{quic}"
+certificate = "server.pem"
+private_key = "server-key.pem"
+
+[[groups]]
+name = "shared"
+key = "{TEST_KEY}"
+
+[[tunnels]]
+name = "shared-tunnel"
+group = "shared"
+kind = "tcp"
+bind = "{public}"
+"#
+    );
+    std::fs::write(directory.path().join("server.toml"), server_config).expect("应能写服务端配置");
+    let client_config = format!(
+        r#"
+key = "{TEST_KEY}"
+
+[server]
+address = "{quic}"
+name = "localhost"
+ca_certificate = "server.pem"
+
+[[services]]
+name = "shared-tunnel"
+kind = "tcp"
+target = "127.0.0.1:9"
+"#
+    );
+    let first_path = directory.path().join("first.toml");
+    let second_path = directory.path().join("second.toml");
+    std::fs::write(&first_path, &client_config).expect("应能写第一个客户端配置");
+    std::fs::write(&second_path, client_config).expect("应能写第二个客户端配置");
+
+    let cancellation = CancellationToken::new();
+    let runtime = TunnelRuntime::new();
+    let server_cancel = cancellation.clone();
+    let server_runtime = runtime.clone();
+    let server_path = directory.path().join("server.toml");
+    let server = tokio::spawn(async move {
+        run_server_with_runtime(server_path, server_runtime, server_cancel).await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let first_cancel = cancellation.clone();
+    let first =
+        tokio::spawn(async move { run_client_with_shutdown(first_path, first_cancel).await });
+    wait_for_runtime(&runtime, |snapshot| snapshot.clients.len() == 1).await;
+    let second_cancel = cancellation.clone();
+    let second =
+        tokio::spawn(async move { run_client_with_shutdown(second_path, second_cancel).await });
+    let snapshot = wait_for_runtime(&runtime, |snapshot| {
+        snapshot.clients.len() == 2
+            && snapshot
+                .tunnels
+                .first()
+                .is_some_and(|tunnel| tunnel.waiting_session_ids.len() == 1)
+    })
+    .await;
+    let tunnel = snapshot.tunnels.first().expect("应存在隧道状态");
+    let owner = tunnel.owner_session_id.expect("应存在隧道所有者");
+    let waiting = tunnel.waiting_session_ids[0];
+    assert_ne!(owner, waiting);
+    assert!(runtime.disconnect(owner).await);
+    let promoted = wait_for_runtime(&runtime, |snapshot| {
+        snapshot.clients.len() == 1
+            && snapshot
+                .tunnels
+                .first()
+                .is_some_and(|tunnel| tunnel.owner_session_id == Some(waiting))
+    })
+    .await;
+    assert!(promoted.tunnels[0].waiting_session_ids.is_empty());
+
+    cancellation.cancel();
+    assert_task_ok(server, "服务端").await;
+    assert_task_ok(first, "第一个客户端").await;
+    assert_task_ok(second, "第二个客户端").await;
+}
+
+async fn wait_for_runtime(
+    runtime: &TunnelRuntime,
+    predicate: impl Fn(&TunnelRuntimeSnapshot) -> bool,
+) -> TunnelRuntimeSnapshot {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = runtime.snapshot().await;
+            if predicate(&snapshot) {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("等待运行时状态超时")
+}
+
 fn write_certificate(directory: &Path) {
     let certified =
         generate_simple_self_signed(vec!["localhost".into()]).expect("应能生成测试证书");
@@ -205,14 +316,13 @@ target = "{tcp_target}"
     };
     let client = format!(
         r#"
+key = "{TEST_KEY}"
+
 [server]
 address = "{quic}"
 name = "localhost"
 ca_certificate = "server.pem"
 
-[group]
-name = "test"
-key = "{TEST_KEY}"
 {tcp_service}
 
 [[services]]

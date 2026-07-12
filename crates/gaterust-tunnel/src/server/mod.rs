@@ -1,4 +1,3 @@
-mod registry;
 mod socks5;
 mod stream;
 mod udp;
@@ -16,7 +15,7 @@ use std::{
 use quinn::{Endpoint, VarInt};
 use subtle::ConstantTimeEq as _;
 use tokio::{
-    sync::{RwLock, oneshot},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore, oneshot},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -27,18 +26,18 @@ use crate::{
         GroupSecret, ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind,
         validate_group_key,
     },
+    identity::validate_device_id,
     protocol::{
-        ClientHello, ControlMessage, HANDSHAKE_TIMEOUT, PROTOCOL_VERSION, ServerHello, read_frame,
-        validate_declarations, write_frame,
+        AuthenticationStatus, ClientHello, ControlMessage, HANDSHAKE_TIMEOUT, PROTOCOL_VERSION,
+        ServerHello, read_frame, validate_declarations, write_frame,
     },
+    runtime::{RegisterError, TunnelRuntime},
     tls,
     watcher::ConfigWatcher,
 };
 
-use registry::{ClientSession, SessionRegistry};
-
-const CLOSE_REPLACED: VarInt = VarInt::from_u32(1);
 const CLOSE_SHUTDOWN: VarInt = VarInt::from_u32(2);
+const MAX_PENDING_AUTHENTICATIONS: usize = 32;
 
 /// 运行隧道服务端，并按配置变化增删公网监听。
 ///
@@ -69,18 +68,30 @@ pub async fn run_server_with_shutdown(
     config_path: impl AsRef<Path>,
     cancellation: CancellationToken,
 ) -> Result<()> {
+    run_server_with_runtime(config_path, TunnelRuntime::new(), cancellation).await
+}
+
+/// 使用可供控制面查询的运行时句柄启动隧道服务端。
+///
+/// # Errors
+///
+/// 初始配置、TLS、监听地址或文件监听器初始化失败时返回错误。
+pub async fn run_server_with_runtime(
+    config_path: impl AsRef<Path>,
+    runtime: TunnelRuntime,
+    cancellation: CancellationToken,
+) -> Result<()> {
     let config_path = config_path.as_ref().to_owned();
     let initial = ServerConfig::load(&config_path)?;
     let mut watcher = ConfigWatcher::new(&config_path)?;
     let endpoint = tls::server_endpoint(&initial.quic)?;
     let local_address = endpoint.local_addr()?;
-    let registry = Arc::new(SessionRegistry::default());
-    let groups = Arc::new(RwLock::new(initial.secrets()));
-    let mut listeners = ListenerManager::new(Arc::clone(&registry));
+    let groups = Arc::new(RwLock::new(initial.credentials()));
+    let mut listeners = ListenerManager::new(runtime.clone());
     listeners.apply(&initial.tunnels).await?;
     let accept_task = tokio::spawn(accept_connections(
         endpoint.clone(),
-        Arc::clone(&registry),
+        runtime,
         Arc::clone(&groups),
         cancellation.child_token(),
     ));
@@ -111,7 +122,7 @@ pub async fn run_server_with_shutdown(
 async fn reload_server(
     path: &Path,
     immutable: &ServerQuicConfig,
-    groups: &RwLock<HashMap<String, GroupSecret>>,
+    groups: &RwLock<Vec<(String, GroupSecret)>>,
     listeners: &mut ListenerManager,
 ) {
     let config = match ServerConfig::load(path) {
@@ -125,35 +136,41 @@ async fn reload_server(
         tracing::error!("quic.bind、证书或私钥不支持热更新，本次配置未应用");
         return;
     }
-    let secrets = config.secrets();
+    let credentials = config.credentials();
     if let Err(error) = listeners.apply(&config.tunnels).await {
         tracing::error!(%error, "应用隧道监听配置失败");
         return;
     }
-    *groups.write().await = secrets;
+    *groups.write().await = credentials;
     tracing::info!(tunnels = config.tunnels.len(), "服务端配置已热更新");
 }
 
 async fn accept_connections(
     endpoint: Endpoint,
-    registry: Arc<SessionRegistry>,
-    groups: Arc<RwLock<HashMap<String, GroupSecret>>>,
+    runtime: TunnelRuntime,
+    groups: Arc<RwLock<Vec<(String, GroupSecret)>>>,
     cancellation: CancellationToken,
 ) {
     let ids = Arc::new(AtomicU64::new(1));
+    let authentication_permits = Arc::new(Semaphore::new(MAX_PENDING_AUTHENTICATIONS));
     let mut tasks = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
             incoming = endpoint.accept() => match incoming {
                 Some(incoming) => {
-                    let registry = Arc::clone(&registry);
+                    let Ok(permit) = Arc::clone(&authentication_permits).try_acquire_owned() else {
+                        drop(incoming);
+                        tracing::debug!("待认证客户端数量已达上限，拒绝新连接");
+                        continue;
+                    };
+                    let runtime = runtime.clone();
                     let groups = Arc::clone(&groups);
                     let id = ids.fetch_add(1, Ordering::Relaxed);
                     tasks.spawn(async move {
                         match incoming.await {
                             Ok(connection) => {
-                                if let Err(error) = authenticate(connection, id, registry, groups).await {
+                                if let Err(error) = authenticate(connection, id, runtime, groups, permit).await {
                                     tracing::warn!(%error, "QUIC 客户端认证或控制通道结束");
                                 }
                             }
@@ -180,8 +197,9 @@ async fn accept_connections(
 async fn authenticate(
     connection: quinn::Connection,
     id: u64,
-    registry: Arc<SessionRegistry>,
-    groups: Arc<RwLock<HashMap<String, GroupSecret>>>,
+    runtime: TunnelRuntime,
+    groups: Arc<RwLock<Vec<(String, GroupSecret)>>>,
+    authentication_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let remote = connection.remote_address();
     let (mut send, mut receive) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
@@ -192,63 +210,112 @@ async fn authenticate(
         .map_err(|_| TunnelError::Timeout("读取认证信息"))??;
     let valid_key =
         std::str::from_utf8(&hello.key).is_ok_and(|key| validate_group_key(key).is_ok());
-    let accepted = if hello.version != PROTOCOL_VERSION
-        || !valid_key
-        || validate_declarations(&hello.services).is_err()
-    {
-        false
-    } else {
+    let valid_hello = hello.version == PROTOCOL_VERSION
+        && valid_key
+        && validate_device_id(&hello.device_id).is_ok()
+        && validate_declarations(&hello.services).is_ok();
+    let group = if valid_hello {
         let groups = groups.read().await;
-        groups
-            .get(&hello.group)
-            .is_some_and(|secret| secret.as_bytes().ct_eq(hello.key.as_slice()).into())
+        groups.iter().find_map(|(name, secret)| {
+            bool::from(secret.as_bytes().ct_eq(hello.key.as_slice())).then(|| name.clone())
+        })
+    } else {
+        None
     };
-    if !accepted {
-        write_frame(
+    let Some(group) = group else {
+        reject_authentication(
+            &connection,
             &mut send,
-            &ServerHello {
-                accepted: false,
-                message: "认证失败".into(),
-            },
+            AuthenticationStatus::Rejected,
+            "认证失败",
         )
         .await?;
-        send.finish()
-            .map_err(|error| TunnelError::Protocol(format!("结束认证响应流失败: {error}")))?;
-        connection.close(VarInt::from_u32(3), b"authentication failed");
-        return Err(TunnelError::Protocol("分组或密钥无效".into()));
+        return Err(TunnelError::Protocol("密钥或设备信息无效".into()));
+    };
+    match runtime
+        .register(
+            id,
+            hello.device_id.clone(),
+            group.clone(),
+            connection.clone(),
+            hello.services,
+        )
+        .await
+    {
+        Ok(()) => {}
+        Err(RegisterError::DeviceIdConflict) => {
+            reject_authentication(
+                &connection,
+                &mut send,
+                AuthenticationStatus::DeviceIdConflict,
+                "设备 ID 已在线",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(RegisterError::Capacity) => {
+            reject_authentication(
+                &connection,
+                &mut send,
+                AuthenticationStatus::ServerBusy,
+                "在线客户端数量已达上限",
+            )
+            .await?;
+            return Ok(());
+        }
     }
-    write_frame(
+    if let Err(error) = write_frame(
         &mut send,
         &ServerHello {
-            accepted: true,
+            status: AuthenticationStatus::Accepted,
             message: String::new(),
         },
     )
-    .await?;
-
-    let group = hello.group;
-    let session = ClientSession::new(id, connection.clone(), hello.services);
-    if let Some(previous) = registry.insert(group.clone(), session.clone()).await {
-        previous
-            .connection
-            .close(CLOSE_REPLACED, b"replaced by a newer client");
+    .await
+    {
+        runtime.unregister(id).await;
+        return Err(error);
     }
-    tracing::info!(group, %remote, "内网客户端已上线");
+    drop(authentication_permit);
+
+    let device_id = hello.device_id;
+    tracing::info!(group, %device_id, %remote, "内网客户端已上线");
     let result = loop {
         match read_frame::<_, ControlMessage>(&mut receive).await {
             Ok(ControlMessage::UpdateServices(services)) => {
                 if let Err(error) = validate_declarations(&services) {
                     break Err(error);
                 }
-                session.update_services(services).await;
-                tracing::info!(group, "客户端服务声明已更新");
+                runtime.update_services(id, services).await;
+                tracing::info!(group, %device_id, "客户端服务声明已更新");
             }
             Err(error) => break Err(error),
         }
     };
-    registry.remove(&group, id).await;
-    tracing::info!(group, %remote, "内网客户端已下线");
+    runtime.unregister(id).await;
+    tracing::info!(group, %device_id, %remote, "内网客户端已下线");
     result
+}
+
+async fn reject_authentication(
+    connection: &quinn::Connection,
+    send: &mut quinn::SendStream,
+    status: AuthenticationStatus,
+    message: &str,
+) -> Result<()> {
+    write_frame(
+        send,
+        &ServerHello {
+            status,
+            message: message.into(),
+        },
+    )
+    .await?;
+    send.finish()
+        .map_err(|error| TunnelError::Protocol(format!("结束认证响应流失败: {error}")))?;
+    let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, send.stopped()).await;
+    connection.close(VarInt::from_u32(3), b"authentication failed");
+    Ok(())
 }
 
 struct ListenerHandle {
@@ -259,15 +326,15 @@ struct ListenerHandle {
 }
 
 struct ListenerManager {
-    registry: Arc<SessionRegistry>,
+    runtime: TunnelRuntime,
     active: HashMap<String, ListenerHandle>,
     retired: Vec<JoinHandle<()>>,
 }
 
 impl ListenerManager {
-    fn new(registry: Arc<SessionRegistry>) -> Self {
+    fn new(runtime: TunnelRuntime) -> Self {
         Self {
-            registry,
+            runtime,
             active: HashMap::new(),
             retired: Vec::new(),
         }
@@ -288,6 +355,7 @@ impl ListenerManager {
             }
             return Err(error);
         }
+        self.runtime.apply_tunnels(configs).await;
         Ok(())
     }
 
@@ -307,7 +375,7 @@ impl ListenerManager {
         }
         for config in configs {
             if !self.active.contains_key(&config.name) {
-                let handle = start_listener(config.clone(), Arc::clone(&self.registry)).await?;
+                let handle = start_listener(config.clone(), self.runtime.clone()).await?;
                 tracing::info!(tunnel = %config.name, kind = ?config.kind, address = %config.bind, "公网监听已启动");
                 self.active.insert(config.name.clone(), handle);
             }
@@ -371,7 +439,7 @@ impl Drop for ListenerManager {
 
 async fn start_listener(
     config: ServerTunnelConfig,
-    registry: Arc<SessionRegistry>,
+    runtime: TunnelRuntime,
 ) -> Result<ListenerHandle> {
     let cancellation = CancellationToken::new();
     let (stopped_sender, stopped) = oneshot::channel();
@@ -384,7 +452,7 @@ async fn start_listener(
                 listener,
                 permits,
                 task_config,
-                registry,
+                runtime,
                 child,
                 stopped_sender,
             ))
@@ -396,7 +464,7 @@ async fn start_listener(
             tokio::spawn(udp::run(
                 socket,
                 task_config,
-                registry,
+                runtime,
                 child,
                 stopped_sender,
             ))

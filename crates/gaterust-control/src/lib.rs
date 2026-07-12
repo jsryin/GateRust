@@ -38,6 +38,8 @@ pub struct ControlOptions {
     pub proxy_enabled: bool,
     #[cfg(feature = "tunnel")]
     pub tunnel_config: PathBuf,
+    #[cfg(feature = "tunnel")]
+    pub tunnel_runtime: Option<gaterust_tunnel::TunnelRuntime>,
     #[cfg(feature = "proxy")]
     pub proxy_config: PathBuf,
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     net::SocketAddr,
     num::NonZeroU64,
     path::{Path, PathBuf},
@@ -69,8 +69,8 @@ pub struct ServerTunnelConfig {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
+    pub key: String,
     pub server: ClientServerConfig,
-    pub group: ClientGroupConfig,
     #[serde(default)]
     pub services: Vec<ClientServiceConfig>,
 }
@@ -79,15 +79,10 @@ pub struct ClientConfig {
 #[serde(deny_unknown_fields)]
 pub struct ClientServerConfig {
     pub address: String,
-    pub name: String,
-    pub ca_certificate: PathBuf,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientGroupConfig {
-    pub name: String,
-    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_certificate: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -139,7 +134,7 @@ impl ServerConfig {
         Ok(config)
     }
 
-    pub(crate) fn secrets(&self) -> HashMap<String, GroupSecret> {
+    pub(crate) fn credentials(&self) -> Vec<(String, GroupSecret)> {
         self.groups
             .iter()
             .map(|group| (group.name.clone(), GroupSecret::new(&group.key)))
@@ -158,6 +153,7 @@ impl ServerConfig {
             ));
         }
         let mut groups = HashSet::new();
+        let mut keys = HashSet::new();
         for group in &self.groups {
             validate_name("分组", &group.name)?;
             if !groups.insert(group.name.as_str()) {
@@ -167,6 +163,11 @@ impl ServerConfig {
                 )));
             }
             validate_group_key(&group.key)?;
+            if !keys.insert(group.key.as_str()) {
+                return Err(TunnelError::InvalidConfig(
+                    "不同分组不能使用相同密钥".into(),
+                ));
+            }
         }
 
         let mut names = HashSet::new();
@@ -229,7 +230,9 @@ impl ClientConfig {
                 path: path.to_owned(),
                 source,
             })?;
-        resolve_path(path, &mut config.server.ca_certificate);
+        if let Some(certificate) = &mut config.server.ca_certificate {
+            resolve_path(path, certificate);
+        }
         config.validate()?;
         Ok(config)
     }
@@ -240,14 +243,11 @@ impl ClientConfig {
     ///
     /// 名称、密钥、服务目标或数量不满足约束时返回错误。
     pub fn validate(&self) -> Result<()> {
-        validate_name("分组", &self.group.name)?;
-        validate_group_key(&self.group.key)?;
-        if self.server.name.is_empty() {
-            return Err(TunnelError::InvalidConfig("TLS 服务器名称不能为空".into()));
-        }
+        validate_group_key(&self.key)?;
         if self.server.address.is_empty() {
             return Err(TunnelError::InvalidConfig("QUIC 服务器地址不能为空".into()));
         }
+        self.server_name()?;
 
         if self.services.len() > 256 {
             return Err(TunnelError::InvalidConfig(
@@ -281,6 +281,17 @@ impl ClientConfig {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn server_name(&self) -> Result<&str> {
+        if let Some(name) = self.server.name.as_deref() {
+            if name.is_empty() {
+                return Err(TunnelError::InvalidConfig("TLS 服务器名称不能为空".into()));
+            }
+            return Ok(name);
+        }
+        address_host(&self.server.address)
+            .ok_or_else(|| TunnelError::InvalidConfig("无法从服务器地址推导 TLS 服务器名称".into()))
     }
 }
 
@@ -324,6 +335,15 @@ fn resolve_path(config_path: &Path, value: &mut PathBuf) {
     }
 }
 
+fn address_host(address: &str) -> Option<&str> {
+    if let Some(bracketed) = address.strip_prefix('[') {
+        return bracketed.split_once(']').map(|(host, _)| host);
+    }
+    address.rsplit_once(':').and_then(|(host, port)| {
+        (!host.is_empty() && !port.is_empty() && !host.contains(':')).then_some(host)
+    })
+}
+
 const fn default_max_connections() -> usize {
     DEFAULT_MAX_CONNECTIONS
 }
@@ -357,16 +377,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_group_keys() {
+        let config = ServerConfig {
+            quic: ServerQuicConfig {
+                bind: "127.0.0.1:2333".parse().expect("测试地址有效"),
+                certificate: "server.pem".into(),
+                private_key: "server-key.pem".into(),
+            },
+            groups: vec![
+                GroupConfig {
+                    name: "first".into(),
+                    key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                },
+                GroupConfig {
+                    name: "second".into(),
+                    key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                },
+            ],
+            tunnels: Vec::new(),
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn rejects_socks_target() {
         let config = ClientConfig {
+            key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             server: ClientServerConfig {
                 address: "127.0.0.1:4433".into(),
-                name: "localhost".into(),
-                ca_certificate: "ca.pem".into(),
-            },
-            group: ClientGroupConfig {
-                name: "main".into(),
-                key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                name: Some("localhost".into()),
+                ca_certificate: Some("ca.pem".into()),
             },
             services: vec![ClientServiceConfig {
                 name: "proxy".into(),
@@ -375,5 +415,24 @@ mod tests {
             }],
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn derives_server_name_from_address() {
+        let mut config = ClientConfig {
+            key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            server: ClientServerConfig {
+                address: "tunnel.example.com:2333".into(),
+                name: None,
+                ca_certificate: None,
+            },
+            services: Vec::new(),
+        };
+        assert_eq!(
+            config.server_name().expect("应推导域名"),
+            "tunnel.example.com"
+        );
+        config.server.address = "[::1]:2333".into();
+        assert_eq!(config.server_name().expect("应推导 IPv6"), "::1");
     }
 }

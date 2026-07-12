@@ -78,3 +78,20 @@ export interface ClientService {
   kind: TunnelKind;
   target: string | null;
 }
+
+export interface TunnelRuntimeClient {
+  session_id: number;
+  device_id: string;
+  group: string;
+  remote_address: string;
+  connected_at: number;
+}
+
+export interface TunnelRuntimeState {
+  clients: TunnelRuntimeClient[];
+  tunnels: {
+    name: string;
+    owner_session_id: number | null;
+    waiting_session_ids: number[];
+  }[];
+}

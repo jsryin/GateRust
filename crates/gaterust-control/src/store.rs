@@ -52,6 +52,8 @@ struct StoreInner {
     proxy_enabled: bool,
     #[cfg(feature = "tunnel")]
     tunnel_path: PathBuf,
+    #[cfg(feature = "tunnel")]
+    tunnel_runtime: Option<gaterust_tunnel::TunnelRuntime>,
     #[cfg(feature = "proxy")]
     proxy_path: PathBuf,
 }
@@ -79,6 +81,8 @@ impl ConfigStore {
                 proxy_enabled: options.proxy_enabled,
                 #[cfg(feature = "tunnel")]
                 tunnel_path: absolute_path(&options.tunnel_config)?,
+                #[cfg(feature = "tunnel")]
+                tunnel_runtime: options.tunnel_runtime.clone(),
                 #[cfg(feature = "proxy")]
                 proxy_path: absolute_path(&options.proxy_config)?,
             }),
@@ -91,6 +95,11 @@ impl ConfigStore {
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<Dashboard> {
         self.inner.dashboard.subscribe()
+    }
+
+    #[cfg(feature = "tunnel")]
+    pub(crate) fn tunnel_runtime(&self) -> Option<&gaterust_tunnel::TunnelRuntime> {
+        self.inner.tunnel_runtime.as_ref()
     }
 
     pub(crate) fn watched_paths(&self) -> Vec<(ConfigKind, PathBuf)> {
@@ -329,6 +338,7 @@ mod tests {
             tunnel_enabled: true,
             proxy_enabled: false,
             tunnel_config: path.clone(),
+            tunnel_runtime: None,
             #[cfg(feature = "proxy")]
             proxy_config: directory.path().join("proxy.toml"),
         };

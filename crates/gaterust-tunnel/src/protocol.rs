@@ -5,7 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{Result, TunnelError, config::TunnelKind};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const PROTOCOL_VERSION: u16 = 2;
 pub(crate) const MAX_CONTROL_FRAME: usize = 64 * 1024;
 pub(crate) const MAX_DATAGRAM: usize = u16::MAX as usize;
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -13,14 +13,23 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(serde::Deserialize, Serialize)]
 pub(crate) struct ClientHello {
     pub version: u16,
-    pub group: String,
+    pub device_id: String,
     pub key: Vec<u8>,
     pub services: Vec<ServiceDeclaration>,
 }
 
+#[derive(Clone, Copy, serde::Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AuthenticationStatus {
+    Accepted,
+    Rejected,
+    DeviceIdConflict,
+    ServerBusy,
+}
+
 #[derive(serde::Deserialize, Serialize)]
 pub(crate) struct ServerHello {
-    pub accepted: bool,
+    pub status: AuthenticationStatus,
     pub message: String,
 }
 

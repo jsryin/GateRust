@@ -1,4 +1,4 @@
-import type { ClientService, ConfigSnapshot, Dashboard, ProxyConfig, ServerConfig } from './types';
+import type { ClientService, ConfigSnapshot, Dashboard, ProxyConfig, ServerConfig, TunnelRuntimeState } from './types';
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, '') ?? '';
 
@@ -49,13 +49,19 @@ export const saveProxy = (token: string, config: ProxyConfig) =>
 export const generateKey = (token: string) =>
   request<{ key: string }>('/api/groups/key', token, { method: 'POST' });
 
+export const getTunnelRuntime = (token: string) =>
+  request<TunnelRuntimeState>('/api/tunnel/runtime', token);
+
+export const disconnectTunnelClient = (token: string, sessionId: number) =>
+  request<void>(`/api/tunnel/sessions/${sessionId}`, token, { method: 'DELETE' });
+
 export function generateClientConfig(
   token: string,
   payload: {
     group: string;
     server_address: string;
-    server_name: string;
-    ca_certificate: string;
+    server_name: string | null;
+    ca_certificate: string | null;
     services: ClientService[];
   }
 ) {
