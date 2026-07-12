@@ -1,0 +1,29 @@
+[Unit]
+Description=GateRust unified server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gaterust
+Group=gaterust
+EnvironmentFile=/var/lib/gaterust/service.env
+ExecStartPre=/usr/local/bin/gaterust-server check-config $GATERUST_ARGS
+ExecStart=/usr/local/bin/gaterust-server $GATERUST_ARGS
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/gaterust
+@PROXY_CAPABILITIES@
+
+[Install]
+WantedBy=multi-user.target

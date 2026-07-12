@@ -42,10 +42,12 @@ pub enum CertificateIssuer {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum AcmeChallenge {
+    #[serde(rename = "http-01")]
     Http01,
+    #[serde(rename = "tls-alpn-01")]
     TlsAlpn01,
+    #[serde(rename = "cloudflare-dns-01")]
     CloudflareDns01,
 }
 
@@ -372,4 +374,30 @@ const fn default_max_connections() -> usize {
 
 const fn default_dns_propagation_seconds() -> u64 {
     DEFAULT_DNS_PROPAGATION_SECONDS
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+
+    use super::AcmeChallenge;
+
+    #[derive(Deserialize)]
+    struct ChallengeConfig {
+        challenge: AcmeChallenge,
+    }
+
+    #[test]
+    fn parses_documented_acme_challenge_names() {
+        let cases = [
+            ("http-01", AcmeChallenge::Http01),
+            ("tls-alpn-01", AcmeChallenge::TlsAlpn01),
+            ("cloudflare-dns-01", AcmeChallenge::CloudflareDns01),
+        ];
+        for (name, expected) in cases {
+            let config: ChallengeConfig = toml::from_str(&format!("challenge = \"{name}\""))
+                .expect("文档中的 ACME 验证名称应有效");
+            assert_eq!(config.challenge, expected);
+        }
+    }
 }

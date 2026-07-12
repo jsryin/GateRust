@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            asset_arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            asset_arch: aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build Web UI
+        run: pnpm --dir web install --frozen-lockfile && pnpm --dir web build
+      - name: Build static Rust binary
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: '--locked --release -p gaterust-server --all-features'
+      - name: Assemble archive
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          test "$(sed -n 's/^version = "\([^"]*\)"/v\1/p' Cargo.toml | head -n 1)" = "$TAG"
+          grep -Fqx "SCRIPT_VERSION=\"$TAG\"" scripts/gaterust.sh
+          stage="dist/gaterust-$ASSET_ARCH-linux-musl"
+          mkdir -p "$stage/config"
+          install -m 0755 "target/$TARGET/release/gaterust-server" "$stage/gaterust-server"
+          cp -a web/dist "$stage/web"
+          install -m 0644 scripts/gaterust.service "$stage/gaterust.service"
+          sed 's#../certs/server.pem#/etc/gaterust/tunnel/server.pem#; s#../certs/server-key.pem#/etc/gaterust/tunnel/server-key.pem#' config/server.example.toml > "$stage/config/server.example.toml"
+          sed 's#../data/acme#/var/lib/gaterust/proxy/acme#' config/proxy.example.toml > "$stage/config/proxy.example.toml"
+          sed 's#../web/dist#/usr/local/lib/gaterust/web#' config/web.example.toml > "$stage/config/web.example.toml"
+          printf '%s\n' "$TAG" > "$stage/VERSION"
+          printf '%s\n' "$TARGET" > "$stage/TARGET"
+          tar -C "$stage" -czf "$GITHUB_WORKSPACE/dist/gaterust-$ASSET_ARCH-linux-musl.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gaterust-${{ matrix.asset_arch }}
+          path: dist/gaterust-${{ matrix.asset_arch }}-linux-musl.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gaterust-*
+          path: dist
+          merge-multiple: true
+      - name: Prepare release assets
+        run: |
+          install -m 0755 scripts/gaterust.sh dist/gaterust.sh
+          cd dist
+          sha256sum gaterust-*-linux-musl.tar.gz gaterust.sh > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/gaterust-x86_64-linux-musl.tar.gz
+            dist/gaterust-aarch64-linux-musl.tar.gz
+            dist/SHA256SUMS
+            dist/gaterust.sh

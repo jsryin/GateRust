@@ -1,6 +1,7 @@
-use std::{io::Read as _, path::PathBuf};
+#[cfg(feature = "web")]
+use std::io::Read as _;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -8,9 +9,14 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(version, about = "GateRust 统一服务端")]
 struct Arguments {
-    #[cfg(feature = "web")]
     #[command(subcommand)]
     command: Option<Command>,
+    #[command(flatten)]
+    server: ServerArguments,
+}
+
+#[derive(Args)]
+struct ServerArguments {
     /// 启用 Web 中心控制模块。
     #[cfg(feature = "web")]
     #[arg(long)]
@@ -18,7 +24,7 @@ struct Arguments {
     /// Web 中心控制 TOML 配置文件。
     #[cfg(feature = "web")]
     #[arg(long, default_value = "web.toml")]
-    web_config: PathBuf,
+    web_config: std::path::PathBuf,
     /// 启用 QUIC 内网穿透模块。
     #[cfg(feature = "tunnel")]
     #[arg(long)]
@@ -26,7 +32,7 @@ struct Arguments {
     /// QUIC 内网穿透 TOML 配置文件。
     #[cfg(any(feature = "tunnel", feature = "web"))]
     #[arg(long, default_value = "server.toml")]
-    tunnel_config: PathBuf,
+    tunnel_config: std::path::PathBuf,
     /// 启用反向代理与自动 SSL 模块。
     #[cfg(feature = "proxy")]
     #[arg(long)]
@@ -34,32 +40,31 @@ struct Arguments {
     /// 反向代理 TOML 配置文件。
     #[cfg(any(feature = "proxy", feature = "web"))]
     #[arg(long, default_value = "proxy.toml")]
-    proxy_config: PathBuf,
+    proxy_config: std::path::PathBuf,
 }
 
-#[cfg(feature = "web")]
 #[derive(Subcommand)]
 enum Command {
     /// 从标准输入读取管理员密码，输出 Argon2id 哈希后退出。
+    #[cfg(feature = "web")]
     HashPassword,
+    /// 校验所选模块的配置后退出。
+    CheckConfig(ServerArguments),
 }
 
 #[tokio::main]
 async fn main() {
     let arguments = Arguments::parse();
-    #[cfg(feature = "web")]
-    if matches!(arguments.command, Some(Command::HashPassword)) {
-        let mut password = String::new();
-        if let Err(error) = std::io::stdin().read_to_string(&mut password) {
-            eprintln!("读取密码失败: {error}");
-            std::process::exit(1);
-        }
-        let password = password.trim_end_matches(['\r', '\n']);
-        match gaterust_control::hash_password(password.as_bytes()) {
-            Ok(hash) => println!("{hash}"),
-            Err(error) => {
-                eprintln!("生成密码哈希失败: {error}");
-                std::process::exit(1);
+    if let Some(command) = arguments.command {
+        match command {
+            #[cfg(feature = "web")]
+            Command::HashPassword => hash_password(),
+            Command::CheckConfig(arguments) => {
+                if let Err(error) = check_config(&arguments) {
+                    eprintln!("配置校验失败: {error}");
+                    std::process::exit(1);
+                }
+                println!("配置校验通过");
             }
         }
         return;
@@ -69,18 +74,68 @@ async fn main() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    if let Err(error) = run(arguments).await {
+    if let Err(error) = run(arguments.server).await {
         tracing::error!(%error, "服务端退出");
         std::process::exit(1);
     }
 }
 
-async fn run(arguments: Arguments) -> Result<(), String> {
+#[cfg(feature = "web")]
+fn hash_password() {
+    let mut password = String::new();
+    if let Err(error) = std::io::stdin().read_to_string(&mut password) {
+        eprintln!("读取密码失败: {error}");
+        std::process::exit(1);
+    }
+    let password = password.trim_end_matches(['\r', '\n']);
+    match gaterust_control::hash_password(password.as_bytes()) {
+        Ok(hash) => println!("{hash}"),
+        Err(error) => {
+            eprintln!("生成密码哈希失败: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn check_config(arguments: &ServerArguments) -> Result<(), String> {
+    let enabled = 0_u8;
+    #[cfg(feature = "tunnel")]
+    let enabled = if arguments.enable_tunnel {
+        gaterust_tunnel::ServerConfig::load(&arguments.tunnel_config)
+            .map_err(|error| format!("隧道模块: {error}"))?;
+        enabled + 1
+    } else {
+        enabled
+    };
+    #[cfg(feature = "proxy")]
+    let enabled = if arguments.enable_proxy {
+        gaterust_proxy::ProxyConfig::load(&arguments.proxy_config)
+            .map_err(|error| format!("代理模块: {error}"))?;
+        enabled + 1
+    } else {
+        enabled
+    };
+    #[cfg(feature = "web")]
+    let enabled = if arguments.enable_web {
+        gaterust_control::check_config(&arguments.web_config)
+            .map_err(|error| format!("Web 控制模块: {error}"))?;
+        enabled + 1
+    } else {
+        enabled
+    };
+    let _ = arguments;
+    if enabled == 0 {
+        return Err("至少需要启用一个已编译模块".into());
+    }
+    Ok(())
+}
+
+async fn run(arguments: ServerArguments) -> Result<(), String> {
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
-    #[cfg(any(feature = "tunnel", feature = "web"))]
+    #[cfg(feature = "web")]
     let tunnel_config = arguments.tunnel_config.clone();
-    #[cfg(any(feature = "proxy", feature = "web"))]
+    #[cfg(feature = "web")]
     let proxy_config = arguments.proxy_config.clone();
     #[cfg(feature = "tunnel")]
     if arguments.enable_tunnel {
@@ -122,6 +177,7 @@ async fn run(arguments: Arguments) -> Result<(), String> {
         });
     }
     if tasks.is_empty() {
+        let _ = arguments;
         return Err("至少需要启用一个已编译模块".into());
     }
 

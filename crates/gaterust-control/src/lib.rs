@@ -21,6 +21,17 @@ pub use config::ControlConfig;
 pub use error::{ControlError, Result};
 use store::{ConfigKind, ConfigStore};
 
+/// 校验 Web 控制平面配置，包括运行时认证参数。
+///
+/// # Errors
+///
+/// 配置文件不可读、字段无效或密码哈希格式错误时返回错误。
+pub fn check_config(path: &Path) -> Result<()> {
+    let config = ControlConfig::load(path)?;
+    auth::AuthService::new(&config.web)?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ControlOptions {
     pub tunnel_enabled: bool,
