@@ -14,6 +14,10 @@ LEGACY_CTL="${CTL}ctl"
 LIB_DIR="$ROOT/usr/local/lib/gaterust"
 ETC_DIR="$ROOT/etc/gaterust"
 DATA_DIR="$ROOT/var/lib/gaterust"
+TUNNEL_DIR="$ETC_DIR/tunnel"
+TUNNEL_CONFIG="$TUNNEL_DIR/server.toml"
+TUNNEL_CERTIFICATE="$TUNNEL_DIR/server.pem"
+TUNNEL_PRIVATE_KEY="$TUNNEL_DIR/server-key.pem"
 STATE_FILE="$DATA_DIR/install-state"
 ENV_FILE="$DATA_DIR/service.env"
 UNIT_FILE="$ROOT/etc/systemd/system/gaterust.service"
@@ -31,10 +35,17 @@ say() { printf '%s\n' "$*"; }
 warn() { printf '警告：%s\n' "$*" >&2; }
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
 
+cleanup_generated_tunnel_files() {
+    [ "${GENERATED_TUNNEL_FILES_INSTALLED:-0}" -eq 1 ] || return
+    rm -f "$TUNNEL_CONFIG" "$TUNNEL_CERTIFICATE" "$TUNNEL_PRIVATE_KEY"
+    GENERATED_TUNNEL_FILES_INSTALLED=0
+}
+
 cleanup() {
     if [ "$TRANSACTION" -eq 1 ]; then
         rollback_install
     fi
+    cleanup_generated_tunnel_files
     if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
         rm -rf "$TEMP_DIR"
     fi
@@ -221,7 +232,7 @@ prepare_release() {
 
 module_config() {
     case "$1" in
-        tunnel) MODULE_CONFIG="$ETC_DIR/tunnel/server.toml"; MODULE_EXAMPLE="server.example.toml" ;;
+        tunnel) MODULE_CONFIG=$TUNNEL_CONFIG; MODULE_EXAMPLE="server.example.toml" ;;
         proxy) MODULE_CONFIG="$ETC_DIR/proxy/proxy.toml"; MODULE_EXAMPLE="proxy.example.toml" ;;
         web) MODULE_CONFIG="$ETC_DIR/web/web.toml"; MODULE_EXAMPLE="web.example.toml" ;;
     esac
@@ -336,6 +347,7 @@ rollback_install() {
     TRANSACTION=0
     warn "启动失败，正在恢复原版本"
     "$SYSTEMCTL" stop gaterust.service >/dev/null 2>&1 || true
+    cleanup_generated_tunnel_files
     restore_backup "$BIN" binary
     restore_backup "$CTL" control
     restore_backup "$UNIT_FILE" unit
@@ -364,9 +376,16 @@ install_module_files() {
         chmod "$config_dir_mode" "$ETC_DIR/$install_module"
         chown gaterust:gaterust "$DATA_DIR/$install_module"
         chmod 0750 "$DATA_DIR/$install_module"
+        if [ "$install_module" = tunnel ] && [ -n "${GENERATED_TUNNEL_CERTIFICATE:-}" ]; then
+            [ ! -e "$TUNNEL_CERTIFICATE" ] || die "QUIC 证书已存在：$TUNNEL_CERTIFICATE"
+            [ ! -e "$TUNNEL_PRIVATE_KEY" ] || die "QUIC 私钥已存在：$TUNNEL_PRIVATE_KEY"
+            GENERATED_TUNNEL_FILES_INSTALLED=1
+            atomic_install "$GENERATED_TUNNEL_CERTIFICATE" "$TUNNEL_CERTIFICATE" 0640 root gaterust
+            atomic_install "$GENERATED_TUNNEL_PRIVATE_KEY" "$TUNNEL_PRIVATE_KEY" 0640 root gaterust
+        fi
         module_config "$install_module"
         eval_source=""
-        case "$install_module" in tunnel) eval_source=${TUNNEL_SOURCE:-} ;; proxy) eval_source=${PROXY_SOURCE:-} ;; web) eval_source=${WEB_SOURCE:-} ;; esac
+        case "$install_module" in tunnel) eval_source=${TUNNEL_INSTALL_SOURCE:-${TUNNEL_SOURCE:-}} ;; proxy) eval_source=${PROXY_SOURCE:-} ;; web) eval_source=${WEB_SOURCE:-} ;; esac
         if [ -n "$eval_source" ] && [ ! -f "$MODULE_CONFIG" ]; then
             atomic_install "$eval_source" "$MODULE_CONFIG" 0640 root gaterust
         elif [ ! -f "$MODULE_CONFIG" ] && [ ! -f "$ETC_DIR/$install_module/$MODULE_EXAMPLE" ]; then
@@ -438,6 +457,7 @@ perform_install() {
             ;;
         stop) "$SYSTEMCTL" disable --now gaterust.service >/dev/null 2>&1 || true ;;
     esac
+    GENERATED_TUNNEL_FILES_INSTALLED=0
     TRANSACTION=0
     rm -f "$LEGACY_CTL"
     rm -rf "$TEMP_DIR/web.old"
@@ -447,6 +467,11 @@ perform_install() {
         say "Web 管理用户：admin"
         say "Web 初始密码：$GENERATED_WEB_PASSWORD"
         warn "Web 初始密码只显示这一次，请立即妥善保存并限制主机登录权限"
+    fi
+    if [ -n "${GENERATED_TUNNEL_CERTIFICATE:-}" ]; then
+        say "QUIC TLS 已自动初始化（自签名证书，服务器名称：gaterust.local）"
+        say "QUIC CA 证书：/etc/gaterust/tunnel/server.pem"
+        warn "客户端需要信任该证书，并将 TLS 服务器名称设置为 gaterust.local"
     fi
 }
 
@@ -479,34 +504,52 @@ interactive_modules() {
 }
 
 choose_configs() {
-    TUNNEL_SOURCE="" PROXY_SOURCE="" WEB_SOURCE="" EXAMPLE_SELECTED=0 GENERATED_WEB_PASSWORD=""
+    TUNNEL_SOURCE="" TUNNEL_INSTALL_SOURCE="" PROXY_SOURCE="" WEB_SOURCE="" EXAMPLE_SELECTED=0
+    GENERATED_TUNNEL_CERTIFICATE="" GENERATED_TUNNEL_PRIVATE_KEY="" GENERATED_WEB_PASSWORD=""
+    GENERATED_TUNNEL_FILES_INSTALLED=0
     for choose_module in tunnel proxy web; do
         has_module "$NEW_MODULES" "$choose_module" || continue
         module_config "$choose_module"
         [ -f "$MODULE_CONFIG" ] && continue
         if [ "$INTERACTIVE" -eq 1 ]; then
             say ""
-            if [ "$choose_module" = web ]; then
-                say "Web 配置：1. 自动安全初始化  2. 导入已有配置  3. 仅安装示例配置"
-                tty_read "请选择 [默认 1]："
-                case "${REPLY:-1}" in
-                    1) generate_web_config; choose_source=$GENERATED_WEB_CONFIG ;;
-                    2) tty_read "请输入配置文件路径："; [ -f "$REPLY" ] || die "配置文件不存在：$REPLY"; choose_source=$REPLY ;;
-                    3) choose_source=""; EXAMPLE_SELECTED=1 ;;
-                    *) die "无效选择" ;;
-                esac
-            else
-                say "$choose_module 配置：1. 导入已有配置  2. 仅安装示例配置"
-                tty_read "请选择 [默认 2]："
-                case "${REPLY:-2}" in
-                    1) tty_read "请输入配置文件路径："; [ -f "$REPLY" ] || die "配置文件不存在：$REPLY"; choose_source=$REPLY ;;
-                    2) choose_source=""; EXAMPLE_SELECTED=1 ;;
-                    *) die "无效选择" ;;
-                esac
-            fi
+            case "$choose_module" in
+                tunnel)
+                    say "QUIC 配置：1. 自动生成证书和私钥  2. 导入已有配置  3. 仅安装示例配置"
+                    tty_read "请选择 [默认 1]："
+                    case "${REPLY:-1}" in
+                        1) generate_tunnel_config; choose_source=$GENERATED_TUNNEL_CHECK_CONFIG ;;
+                        2) tty_read "请输入配置文件路径："; [ -f "$REPLY" ] || die "配置文件不存在：$REPLY"; choose_source=$REPLY ;;
+                        3) choose_source=""; EXAMPLE_SELECTED=1 ;;
+                        *) die "无效选择" ;;
+                    esac
+                    ;;
+                proxy)
+                    say "Proxy 配置：1. 导入已有配置  2. 仅安装示例配置"
+                    tty_read "请选择 [默认 2]："
+                    case "${REPLY:-2}" in
+                        1) tty_read "请输入配置文件路径："; [ -f "$REPLY" ] || die "配置文件不存在：$REPLY"; choose_source=$REPLY ;;
+                        2) choose_source=""; EXAMPLE_SELECTED=1 ;;
+                        *) die "无效选择" ;;
+                    esac
+                    ;;
+                web)
+                    say "Web 配置：1. 自动安全初始化  2. 导入已有配置  3. 仅安装示例配置"
+                    tty_read "请选择 [默认 1]："
+                    case "${REPLY:-1}" in
+                        1) generate_web_config; choose_source=$GENERATED_WEB_CONFIG ;;
+                        2) tty_read "请输入配置文件路径："; [ -f "$REPLY" ] || die "配置文件不存在：$REPLY"; choose_source=$REPLY ;;
+                        3) choose_source=""; EXAMPLE_SELECTED=1 ;;
+                        *) die "无效选择" ;;
+                    esac
+                    ;;
+            esac
         else
             case "$choose_module" in tunnel) choose_source=${TUNNEL_SOURCE_ARG:-} ;; proxy) choose_source=${PROXY_SOURCE_ARG:-} ;; web) choose_source=${WEB_SOURCE_ARG:-} ;; esac
-            if [ -z "$choose_source" ] && [ "$choose_module" = web ]; then
+            if [ "$choose_module" = tunnel ] && [ "$INIT_TUNNEL" -eq 1 ]; then
+                generate_tunnel_config
+                choose_source=$GENERATED_TUNNEL_CHECK_CONFIG
+            elif [ -z "$choose_source" ] && [ "$choose_module" = web ]; then
                 generate_web_config
                 choose_source=$GENERATED_WEB_CONFIG
             elif [ -z "$choose_source" ]; then
@@ -522,6 +565,46 @@ random_hex() {
     command -v od >/dev/null 2>&1 || die "自动初始化 Web 需要 od"
     command -v tr >/dev/null 2>&1 || die "自动初始化 Web 需要 tr"
     od -An -N "$random_bytes" -tx1 /dev/urandom | tr -d ' \n'
+}
+
+write_tunnel_config() {
+    tunnel_config_path=$1
+    tunnel_certificate_path=$2
+    tunnel_private_key_path=$3
+    {
+        printf '%s\n' '[quic]'
+        printf '%s\n' 'bind = "0.0.0.0:2333"'
+        printf 'certificate = "%s"\n' "$tunnel_certificate_path"
+        printf 'private_key = "%s"\n' "$tunnel_private_key_path"
+    } > "$tunnel_config_path"
+}
+
+require_tunnel_init_targets_available() {
+    [ ! -e "$TUNNEL_CONFIG" ] || die "QUIC 正式配置已存在，不能自动初始化"
+    [ ! -e "$TUNNEL_CERTIFICATE" ] || die "QUIC 证书已存在，请选择导入已有配置"
+    [ ! -e "$TUNNEL_PRIVATE_KEY" ] || die "QUIC 私钥已存在，请选择导入已有配置"
+}
+
+generate_tunnel_config() {
+    command -v openssl >/dev/null 2>&1 || die "自动初始化 QUIC 需要 openssl"
+    require_tunnel_init_targets_available
+    GENERATED_TUNNEL_CERTIFICATE="$TEMP_DIR/server.pem"
+    GENERATED_TUNNEL_PRIVATE_KEY="$TEMP_DIR/server-key.pem"
+    GENERATED_TUNNEL_CONFIG="$TEMP_DIR/server.toml"
+    GENERATED_TUNNEL_CHECK_CONFIG="$TEMP_DIR/server-check.toml"
+    (
+        umask 077
+        openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 3650 \
+            -subj '/CN=gaterust.local' \
+            -addext 'subjectAltName=DNS:gaterust.local' \
+            -keyout "$GENERATED_TUNNEL_PRIVATE_KEY" \
+            -out "$GENERATED_TUNNEL_CERTIFICATE" >/dev/null 2>&1 || exit 1
+        write_tunnel_config "$GENERATED_TUNNEL_CONFIG" \
+            "$TUNNEL_CERTIFICATE" "$TUNNEL_PRIVATE_KEY"
+        write_tunnel_config "$GENERATED_TUNNEL_CHECK_CONFIG" \
+            "$GENERATED_TUNNEL_CERTIFICATE" "$GENERATED_TUNNEL_PRIVATE_KEY"
+    ) || die "生成 QUIC 证书和私钥失败"
+    TUNNEL_INSTALL_SOURCE=$GENERATED_TUNNEL_CONFIG
 }
 
 generate_web_config() {
@@ -556,7 +639,12 @@ install_command() {
     normalize_modules "$REQUEST_MODULES"
     merge_modules "$existing_modules" "$NORMALIZED"
     NEW_MODULES=$NORMALIZED
-    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$had_state" -eq 1 ] && [ "$STATE_VERSION" = "$SCRIPT_VERSION" ] && [ "$NEW_MODULES" = "$existing_modules" ]; then
+    if [ "$INIT_TUNNEL" -eq 1 ]; then
+        has_module "$NEW_MODULES" tunnel || die "--init-tunnel 需要安装 QUIC 模块"
+        [ -z "$TUNNEL_SOURCE_ARG" ] || die "--init-tunnel 不能与 --tunnel-config 同时使用"
+        require_tunnel_init_targets_available
+    fi
+    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$INIT_TUNNEL" -eq 0 ] && [ "$had_state" -eq 1 ] && [ "$STATE_VERSION" = "$SCRIPT_VERSION" ] && [ "$NEW_MODULES" = "$existing_modules" ]; then
         say "GateRust $SCRIPT_VERSION 和所选模块已安装，无需更新"
         release_lock
         return
@@ -893,7 +981,7 @@ interactive_main() {
 }
 
 REQUEST_MODULES="" TUNNEL_SOURCE_ARG="" PROXY_SOURCE_ARG="" WEB_SOURCE_ARG=""
-START_MODE=default INTERACTIVE=0 ASSUME_YES=0 KEEP_CONFIG=0 UNINSTALL_ALL=0 FORCE_INSTALL=0
+START_MODE=default INTERACTIVE=0 ASSUME_YES=0 KEEP_CONFIG=0 UNINSTALL_ALL=0 FORCE_INSTALL=0 INIT_TUNNEL=0
 [ "${GATERUST_LIBRARY_ONLY:-0}" -eq 1 ] && return 0
 command_name=${1:-}
 case "$command_name" in
@@ -908,6 +996,7 @@ if [ -n "$command_name" ]; then shift; fi
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --modules) [ "$#" -ge 2 ] || die "--modules 缺少参数"; REQUEST_MODULES=$2; shift 2 ;;
+        --init-tunnel) INIT_TUNNEL=1; shift ;;
         --tunnel-config) [ "$#" -ge 2 ] || die "--tunnel-config 缺少参数"; TUNNEL_SOURCE_ARG=$2; shift 2 ;;
         --proxy-config) [ "$#" -ge 2 ] || die "--proxy-config 缺少参数"; PROXY_SOURCE_ARG=$2; shift 2 ;;
         --web-config) [ "$#" -ge 2 ] || die "--web-config 缺少参数"; WEB_SOURCE_ARG=$2; shift 2 ;;

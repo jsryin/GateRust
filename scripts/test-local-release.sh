@@ -7,10 +7,22 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 OUTPUT_ROOT=${GATERUST_LOCAL_RELEASE_DIR:-"$REPO_ROOT/dist-local"}
 SERVER_HOST=${GATERUST_LOCAL_RELEASE_HOST:-127.0.0.1}
 SERVER_PORT=${GATERUST_LOCAL_RELEASE_PORT:-18080}
+TUNNEL_DIR=/etc/gaterust/tunnel
+TUNNEL_CONFIG=$TUNNEL_DIR/server.toml
+TUNNEL_CERTIFICATE=$TUNNEL_DIR/server.pem
+TUNNEL_PRIVATE_KEY=$TUNNEL_DIR/server-key.pem
 
 SERVER_PID=""
 SERVER_LOG=""
 TEMP_DIRS=()
+MANAGED_PATHS=(
+    /usr/local/bin/gaterust-server
+    /usr/local/sbin/gaterust
+    /etc/gaterust
+    /etc/systemd/system/gaterust.service
+    /var/lib/gaterust
+    /usr/local/lib/gaterust
+)
 
 say() { printf '%s\n' "$*"; }
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
@@ -189,13 +201,7 @@ start_server() {
 ensure_clean_vm() {
     [[ "${GATERUST_ALLOW_EXISTING:-0}" == 1 ]] && return
     local managed_path
-    for managed_path in \
-        /usr/local/bin/gaterust-server \
-        /usr/local/sbin/gaterust \
-        /etc/gaterust \
-        /etc/systemd/system/gaterust.service \
-        /var/lib/gaterust \
-        /usr/local/lib/gaterust; do
+    for managed_path in "${MANAGED_PATHS[@]}"; do
         if as_root test -e "$managed_path"; then
             die "检测到已有路径 $managed_path；请使用一次性 VM，或明确设置 GATERUST_ALLOW_EXISTING=1"
         fi
@@ -205,7 +211,8 @@ ensure_clean_vm() {
 verify_install() {
     local default_install=$1 expect_running=$2
     local state modules expected_state service_environment service_environment_attributes
-    local attempt tunnel_mode proxy_mode
+    local attempt tunnel_mode proxy_mode tunnel_config_attributes tunnel_certificate_attributes
+    local tunnel_private_key_attributes
     as_root test -x /usr/local/bin/gaterust-server || die "服务端二进制未安装"
     as_root test -x /usr/local/sbin/gaterust || die "管理脚本未安装"
     as_root test -f /etc/systemd/system/gaterust.service || die "systemd unit 未安装"
@@ -227,12 +234,28 @@ verify_install() {
         as_root test -f /etc/gaterust/web/web.toml || die "Web 正式配置不存在"
     fi
     if [[ "$default_install" == 1 ]]; then
-        as_root test ! -f /etc/gaterust/tunnel/server.toml || die "QUIC 示例配置不应成为正式配置"
+        as_root test -f "$TUNNEL_CONFIG" || die "QUIC 正式配置不存在"
+        as_root test -f "$TUNNEL_CERTIFICATE" || die "QUIC 证书不存在"
+        as_root test -f "$TUNNEL_PRIVATE_KEY" || die "QUIC 私钥不存在"
         as_root test ! -f /etc/gaterust/proxy/proxy.toml || die "Proxy 示例配置不应成为正式配置"
+        tunnel_config_attributes=$(as_root stat -c '%a %U %G' "$TUNNEL_CONFIG")
+        tunnel_certificate_attributes=$(as_root stat -c '%a %U %G' "$TUNNEL_CERTIFICATE")
+        tunnel_private_key_attributes=$(as_root stat -c '%a %U %G' "$TUNNEL_PRIVATE_KEY")
+        [[ "$tunnel_config_attributes" == "640 root gaterust" ]] ||
+            die "QUIC 配置权限不正确：$tunnel_config_attributes"
+        [[ "$tunnel_certificate_attributes" == "640 root gaterust" ]] ||
+            die "QUIC 证书权限不正确：$tunnel_certificate_attributes"
+        [[ "$tunnel_private_key_attributes" == "640 root gaterust" ]] ||
+            die "QUIC 私钥权限不正确：$tunnel_private_key_attributes"
+        as_root openssl x509 -in "$TUNNEL_CERTIFICATE" -noout -checkhost gaterust.local >/dev/null ||
+            die "QUIC 证书不包含 gaterust.local"
+        as_root /usr/local/bin/gaterust-server check-config \
+            --enable-tunnel --tunnel-config "$TUNNEL_CONFIG" ||
+            die "QUIC 自动初始化配置校验失败"
+        [[ "$service_environment" == *"--enable-tunnel"* ]] || die "服务参数未启用 QUIC"
         [[ "$service_environment" == *"--enable-web"* ]] || die "服务参数未启用 Web"
-        [[ "$service_environment" != *"--enable-tunnel"* ]] || die "服务参数不应启用未配置的 QUIC"
         [[ "$service_environment" != *"--enable-proxy"* ]] || die "服务参数不应启用未配置的 Proxy"
-        tunnel_mode=$(as_root stat -c '%a' /etc/gaterust/tunnel)
+        tunnel_mode=$(as_root stat -c '%a' "$TUNNEL_DIR")
         proxy_mode=$(as_root stat -c '%a' /etc/gaterust/proxy)
         [[ "$tunnel_mode" == 770 && "$proxy_mode" == 770 ]] || die "Web 配置目录权限不正确"
         as_root grep -Fq -- '-/etc/gaterust/tunnel' /etc/systemd/system/gaterust.service ||
@@ -258,6 +281,7 @@ verify_install() {
 
 test_release() {
     require_command systemctl
+    require_command openssl
     [[ -d /run/systemd/system ]] || die "当前 VM 未运行 systemd"
     if [[ $EUID -ne 0 ]]; then
         require_command sudo
@@ -268,7 +292,7 @@ test_release() {
     start_server
 
     local base_url="http://$SERVER_HOST:$SERVER_PORT" default_install=1 expect_running=1 argument
-    local installer_args=(install --modules tunnel,proxy,web --enable)
+    local installer_args=(install --modules tunnel,proxy,web --init-tunnel --enable)
     if [[ $# -gt 0 ]]; then
         [[ $1 == -- ]] || die "自定义安装参数前需要使用 --"
         shift
@@ -291,12 +315,17 @@ test_release() {
 }
 
 uninstall_release() {
+    local managed_path
     if [[ $EUID -ne 0 ]]; then
         require_command sudo
         sudo -v
     fi
     as_root test -x /usr/local/sbin/gaterust || die "未找到已安装的 GateRust 管理脚本"
     as_root /usr/local/sbin/gaterust uninstall --all --yes
+    for managed_path in "${MANAGED_PATHS[@]}"; do
+        as_root test ! -e "$managed_path" || die "卸载后仍有残留：$managed_path"
+    done
+    say "本地 Release 及配置、证书和私钥已完整卸载。"
 }
 
 usage() {
