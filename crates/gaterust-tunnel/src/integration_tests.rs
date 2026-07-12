@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{run_client_with_shutdown, run_server_with_shutdown};
 
-const TEST_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const TEST_KEY: &str = "12345678901234567890123456789012";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forwards_tcp_udp_and_socks5() {

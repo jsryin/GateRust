@@ -8,14 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-base64.workspace = true
 clap.workspace = true
 gaterust-tunnel = { path = "../gaterust-tunnel" }
-rand.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
-

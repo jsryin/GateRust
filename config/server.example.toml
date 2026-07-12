@@ -5,7 +5,7 @@ private_key = "../certs/server-key.pem"
 
 [[groups]]
 name = "office"
-key = "replace-with-a-generated-256-bit-key"
+key = "replace-with-a-32-to-124-character-key"
 
 [[tunnels]]
 name = "ssh"
@@ -30,4 +30,3 @@ group = "office"
 kind = "socks5"
 bind = "127.0.0.1:1080"
 max_connections = 64
-

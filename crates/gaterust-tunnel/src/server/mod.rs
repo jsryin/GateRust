@@ -23,7 +23,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Result, TunnelError,
-    config::{GroupSecret, ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind},
+    config::{
+        GroupSecret, ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind,
+        validate_group_key,
+    },
     protocol::{
         ClientHello, ControlMessage, HANDSHAKE_TIMEOUT, PROTOCOL_VERSION, ServerHello, read_frame,
         validate_declarations, write_frame,
@@ -72,7 +75,7 @@ pub async fn run_server_with_shutdown(
     let endpoint = tls::server_endpoint(&initial.quic)?;
     let local_address = endpoint.local_addr()?;
     let registry = Arc::new(SessionRegistry::default());
-    let groups = Arc::new(RwLock::new(initial.secrets()?));
+    let groups = Arc::new(RwLock::new(initial.secrets()));
     let mut listeners = ListenerManager::new(Arc::clone(&registry));
     listeners.apply(&initial.tunnels).await?;
     let accept_task = tokio::spawn(accept_connections(
@@ -122,13 +125,7 @@ async fn reload_server(
         tracing::error!("quic.bind、证书或私钥不支持热更新，本次配置未应用");
         return;
     }
-    let secrets = match config.secrets() {
-        Ok(secrets) => secrets,
-        Err(error) => {
-            tracing::error!(%error, "新分组配置无效，继续使用当前配置");
-            return;
-        }
-    };
+    let secrets = config.secrets();
     if let Err(error) = listeners.apply(&config.tunnels).await {
         tracing::error!(%error, "应用隧道监听配置失败");
         return;
@@ -193,8 +190,10 @@ async fn authenticate(
     let hello: ClientHello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut receive))
         .await
         .map_err(|_| TunnelError::Timeout("读取认证信息"))??;
+    let valid_key =
+        std::str::from_utf8(&hello.key).is_ok_and(|key| validate_group_key(key).is_ok());
     let accepted = if hello.version != PROTOCOL_VERSION
-        || hello.key.len() != 32
+        || !valid_key
         || validate_declarations(&hello.services).is_err()
     {
         false

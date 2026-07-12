@@ -13,7 +13,7 @@ mod watcher;
 pub use client::{run_client, run_client_with_shutdown};
 pub use config::{
     ClientConfig, ClientGroupConfig, ClientServerConfig, ClientServiceConfig, GroupConfig,
-    ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind,
+    ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind, generate_group_key,
 };
 pub use error::{Result, TunnelError};
 pub use server::{run_server, run_server_with_shutdown};

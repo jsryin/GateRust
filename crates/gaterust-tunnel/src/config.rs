@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand::distr::{Alphanumeric, SampleString as _};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize as _;
 
@@ -14,6 +14,8 @@ use crate::{Result, TunnelError};
 const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
 const DEFAULT_MAX_UDP_SESSIONS: usize = 1_024;
 const DEFAULT_UDP_IDLE_SECONDS: u64 = 60;
+pub(crate) const MIN_GROUP_KEY_LENGTH: usize = 32;
+pub(crate) const MAX_GROUP_KEY_LENGTH: usize = 124;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -97,20 +99,14 @@ pub struct ClientServiceConfig {
 }
 
 #[derive(Clone)]
-pub(crate) struct GroupSecret([u8; 32]);
+pub(crate) struct GroupSecret(Vec<u8>);
 
 impl GroupSecret {
-    pub(crate) fn decode(value: &str) -> Result<Self> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(value)
-            .map_err(|_| TunnelError::InvalidConfig("分组密钥必须是 URL-safe Base64".into()))?;
-        let value: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| TunnelError::InvalidConfig("分组密钥解码后必须恰好为 32 字节".into()))?;
-        Ok(Self(value))
+    pub(crate) fn new(value: &str) -> Self {
+        Self(value.as_bytes().to_vec())
     }
 
-    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
@@ -143,10 +139,10 @@ impl ServerConfig {
         Ok(config)
     }
 
-    pub(crate) fn secrets(&self) -> Result<HashMap<String, GroupSecret>> {
+    pub(crate) fn secrets(&self) -> HashMap<String, GroupSecret> {
         self.groups
             .iter()
-            .map(|group| Ok((group.name.clone(), GroupSecret::decode(&group.key)?)))
+            .map(|group| (group.name.clone(), GroupSecret::new(&group.key)))
             .collect()
     }
 
@@ -170,7 +166,7 @@ impl ServerConfig {
                     group.name
                 )));
             }
-            GroupSecret::decode(&group.key)?;
+            validate_group_key(&group.key)?;
         }
 
         let mut names = HashSet::new();
@@ -238,10 +234,6 @@ impl ClientConfig {
         Ok(config)
     }
 
-    pub(crate) fn secret(&self) -> Result<GroupSecret> {
-        GroupSecret::decode(&self.group.key)
-    }
-
     /// 验证客户端配置中的认证信息和服务声明。
     ///
     /// # Errors
@@ -249,7 +241,7 @@ impl ClientConfig {
     /// 名称、密钥、服务目标或数量不满足约束时返回错误。
     pub fn validate(&self) -> Result<()> {
         validate_name("分组", &self.group.name)?;
-        GroupSecret::decode(&self.group.key)?;
+        validate_group_key(&self.group.key)?;
         if self.server.name.is_empty() {
             return Err(TunnelError::InvalidConfig("TLS 服务器名称不能为空".into()));
         }
@@ -292,6 +284,22 @@ impl ClientConfig {
     }
 }
 
+/// 生成满足配置约束的随机分组密钥。
+#[must_use]
+pub fn generate_group_key() -> String {
+    Alphanumeric.sample_string(&mut rand::rng(), MIN_GROUP_KEY_LENGTH)
+}
+
+pub(crate) fn validate_group_key(value: &str) -> Result<()> {
+    let length = value.chars().take(MAX_GROUP_KEY_LENGTH + 1).count();
+    if !(MIN_GROUP_KEY_LENGTH..=MAX_GROUP_KEY_LENGTH).contains(&length) {
+        return Err(TunnelError::InvalidConfig(format!(
+            "分组密钥长度必须为 {MIN_GROUP_KEY_LENGTH}..={MAX_GROUP_KEY_LENGTH} 个字符"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_name(kind: &str, name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
         return Err(TunnelError::InvalidConfig(format!(
@@ -331,6 +339,22 @@ const fn default_udp_idle_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_group_key_length_boundaries() {
+        assert!(validate_group_key(&"a".repeat(31)).is_err());
+        assert!(validate_group_key(&"a".repeat(32)).is_ok());
+        assert!(validate_group_key(&"密".repeat(32)).is_ok());
+        assert!(validate_group_key(&"a".repeat(124)).is_ok());
+        assert!(validate_group_key(&"a".repeat(125)).is_err());
+    }
+
+    #[test]
+    fn generates_valid_group_key() {
+        let key = generate_group_key();
+        assert_eq!(key.len(), MIN_GROUP_KEY_LENGTH);
+        assert!(key.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+    }
 
     #[test]
     fn rejects_socks_target() {

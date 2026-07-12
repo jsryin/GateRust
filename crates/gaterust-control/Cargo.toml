@@ -10,7 +10,6 @@ repository.workspace = true
 [dependencies]
 argon2.workspace = true
 axum.workspace = true
-base64.workspace = true
 futures-util.workspace = true
 gaterust-proxy = { path = "../gaterust-proxy", optional = true }
 gaterust-tunnel = { path = "../gaterust-tunnel", optional = true }

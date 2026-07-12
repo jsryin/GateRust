@@ -20,6 +20,8 @@
   let saving = false;
   let message = '';
   let error = '';
+  const minGroupKeyLength = 32;
+  const maxGroupKeyLength = 124;
 
   function newTunnel(): TunnelConfig {
     return { name: '', group: '', kind: 'tcp', bind: '0.0.0.0:8080', limit_bps: null, max_connections: 128, max_udp_sessions: 512, udp_idle_seconds: 60 };
@@ -45,6 +47,8 @@
 
   function commitGroup() {
     if (!group.name || !group.key) { error = '名称和密钥不能为空'; return; }
+    const keyLength = [...group.key].length;
+    if (keyLength < minGroupKeyLength || keyLength > maxGroupKeyLength) { error = '密钥长度必须为 32 到 124 个字符'; return; }
     const oldName = editIndex >= 0 ? draft.groups[editIndex].name : '';
     if (editIndex >= 0) draft.groups[editIndex] = group;
     else draft.groups = [...draft.groups, group];
@@ -116,7 +120,7 @@
     <section class="editor" role="dialog" aria-modal="true">
       <header><div><p class="eyebrow">{editIndex >= 0 ? 'EDIT' : 'NEW'}</p><h2>{editor === 'group' ? '访问分组' : '隧道'}</h2></div><button class="icon-button" aria-label="关闭" onclick={() => (editor = null)}><X size={20} /></button></header>
       {#if editor === 'group'}
-        <div class="editor-body"><label>分组名称<input bind:value={group.name} placeholder="office" /></label><label>256-bit 分组密钥<div class="input-action"><input bind:value={group.key} /><button title="生成新密钥" onclick={refreshKey}><RefreshCw size={17} /></button></div></label></div>
+        <div class="editor-body"><label>分组名称<input bind:value={group.name} placeholder="office" /></label><label>分组密钥（32-124 个字符）<div class="input-action"><input bind:value={group.key} /><button title="生成新密钥" onclick={refreshKey}><RefreshCw size={17} /></button></div></label></div>
         <footer><button class="secondary" onclick={() => (editor = null)}>取消</button><button class="primary" onclick={commitGroup}>确认</button></footer>
       {:else}
         <div class="editor-body form-grid two"><label>名称<input bind:value={tunnel.name} placeholder="ssh" /></label><label>分组<select bind:value={tunnel.group}>{#each draft.groups as item}<option value={item.name}>{item.name}</option>{/each}</select></label><label>协议<select bind:value={tunnel.kind}><option value="tcp">TCP</option><option value="udp">UDP</option><option value="socks5">SOCKS5</option></select></label><label>监听地址<input bind:value={tunnel.bind} /></label><label>限速（B/s）<input type="number" min="1" bind:value={limit} placeholder="留空表示不限" /></label>{#if tunnel.kind === 'udp'}<label>最大 UDP 会话<input type="number" min="1" bind:value={tunnel.max_udp_sessions} /></label><label>UDP 空闲秒数<input type="number" min="1" bind:value={tunnel.udp_idle_seconds} /></label>{:else}<label>最大并发连接<input type="number" min="1" bind:value={tunnel.max_connections} /></label>{/if}</div>

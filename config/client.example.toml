@@ -5,7 +5,7 @@ ca_certificate = "../certs/ca.pem"
 
 [group]
 name = "office"
-key = "replace-with-the-same-generated-256-bit-key"
+key = "replace-with-the-same-32-to-124-character-key"
 
 [[services]]
 name = "ssh"
@@ -20,4 +20,3 @@ target = "127.0.0.1:27015"
 [[services]]
 name = "private-socks"
 kind = "socks5"
-

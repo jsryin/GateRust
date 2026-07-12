@@ -1,8 +1,6 @@
 use std::path::PathBuf;
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::Parser;
-use rand::RngExt as _;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -11,7 +9,7 @@ struct Arguments {
     /// 客户端 TOML 配置文件。
     #[arg(short, long, default_value = "client.toml")]
     config: PathBuf,
-    /// 生成一个 256-bit URL-safe Base64 分组密钥并退出。
+    /// 生成一个 32 字符的随机分组密钥并退出。
     #[arg(long)]
     generate_key: bool,
 }
@@ -20,9 +18,7 @@ struct Arguments {
 async fn main() {
     let arguments = Arguments::parse();
     if arguments.generate_key {
-        let mut key = [0_u8; 32];
-        rand::rng().fill(&mut key);
-        println!("{}", URL_SAFE_NO_PAD.encode(key));
+        println!("{}", gaterust_tunnel::generate_group_key());
         return;
     }
 

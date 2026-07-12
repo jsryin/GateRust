@@ -156,13 +156,12 @@ async fn authenticate(connection: &Connection, config: &ClientConfig) -> Result<
     let (mut send, mut receive) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| TunnelError::Timeout("打开认证流"))??;
-    let secret = config.secret()?;
     write_frame(
         &mut send,
         &ClientHello {
             version: PROTOCOL_VERSION,
             group: config.group.name.clone(),
-            key: secret.as_bytes().to_vec(),
+            key: config.group.key.as_bytes().to_vec(),
             services: declarations(&config.services),
         },
     )

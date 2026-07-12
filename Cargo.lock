@@ -927,10 +927,8 @@ dependencies = [
 name = "gaterust-client"
 version = "0.1.0"
 dependencies = [
- "base64",
  "clap",
  "gaterust-tunnel",
- "rand 0.10.2",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -942,7 +940,6 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
- "base64",
  "futures-util",
  "gaterust-proxy",
  "gaterust-tunnel",
@@ -1008,7 +1005,6 @@ dependencies = [
 name = "gaterust-tunnel"
 version = "0.1.0"
 dependencies = [
- "base64",
  "notify",
  "quinn",
  "rand 0.10.2",

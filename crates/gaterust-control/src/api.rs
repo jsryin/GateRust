@@ -11,9 +11,7 @@ use axum::{
     },
     routing::{get, post, put},
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt as _;
-use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::WatchStream;
 use tower_http::cors::CorsLayer;
@@ -197,9 +195,7 @@ async fn save_proxy(
 
 #[cfg(feature = "tunnel")]
 async fn generate_key() -> Json<serde_json::Value> {
-    let mut key = [0_u8; 32];
-    rand::rng().fill(&mut key);
-    Json(serde_json::json!({ "key": URL_SAFE_NO_PAD.encode(key) }))
+    Json(serde_json::json!({ "key": gaterust_tunnel::generate_group_key() }))
 }
 
 #[cfg(feature = "tunnel")]
