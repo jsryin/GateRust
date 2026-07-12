@@ -47,6 +47,21 @@ sudo gaterust uninstall --all --yes
 配置位于 `/etc/gaterust`，运行数据位于 `/var/lib/gaterust`，日志通过 `journalctl -u gaterust.service` 查看。卸载默认删除模块配置；需要保留时显式传入 `--keep-config`。
 重新执行 latest 一键安装命令会升级到脚本所属版本，并保留已安装模块、配置、数据和原服务启用状态。
 
+发布前可在一次性、运行 systemd 的 Linux VM 中构建并验证完整安装链路。默认安装全部模块的示例配置，服务保持停止：
+
+```bash
+sudo apt-get install -y musl-tools python3 curl
+./scripts/test-local-release.sh test
+./scripts/test-local-release.sh uninstall
+```
+
+导入有效配置并验证服务启动时，将参数放在 `--` 之后传给安装器：
+
+```bash
+./scripts/test-local-release.sh test -- \
+  --modules web --web-config /path/to/web.toml --enable
+```
+
 ## 客户端下载
 
 Release 提供 Linux x86_64/aarch64、Windows x86_64，以及 macOS Intel/Apple Silicon 客户端。客户端以带平台后缀的独立可执行文件发布，配置示例作为 `client.example.toml` 单独提供。Linux 和 macOS 下载后需要添加执行权限：

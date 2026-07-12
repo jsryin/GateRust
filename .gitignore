@@ -51,6 +51,7 @@
 /tarpaulin-report.html
 
 # Local deployment artifacts
+/dist-local/
 /*.tar.gz
 /*.tar.xz
 /*.zip
