@@ -203,7 +203,9 @@ ensure_clean_vm() {
 }
 
 verify_install() {
-    local state expected_state
+    local default_install=$1 expect_running=$2
+    local state modules expected_state service_environment service_environment_attributes
+    local attempt tunnel_mode proxy_mode
     as_root test -x /usr/local/bin/gaterust-server || die "服务端二进制未安装"
     as_root test -x /usr/local/sbin/gaterust || die "管理脚本未安装"
     as_root test -f /etc/systemd/system/gaterust.service || die "systemd unit 未安装"
@@ -216,9 +218,41 @@ verify_install() {
     state=$(as_root cat /var/lib/gaterust/install-state)
     expected_state=$(printf 'VERSION=%s\nARCH=%s\n' "$SCRIPT_VERSION" "$ARCH")
     [[ "$state" == "$expected_state"* ]] || die "安装状态中的版本或架构不正确"
+    modules=$(sed -n 's/^MODULES=//p' <<<"$state")
+    service_environment_attributes=$(stat -c '%a %U %G' /var/lib/gaterust/service.env)
+    [[ "$service_environment_attributes" == "644 root root" ]] ||
+        die "服务参数文件权限不正确：$service_environment_attributes"
+    service_environment=$(cat /var/lib/gaterust/service.env)
+    if [[ ",$modules," == *,web,* ]]; then
+        as_root test -f /etc/gaterust/web/web.toml || die "Web 正式配置不存在"
+    fi
+    if [[ "$default_install" == 1 ]]; then
+        as_root test ! -f /etc/gaterust/tunnel/server.toml || die "QUIC 示例配置不应成为正式配置"
+        as_root test ! -f /etc/gaterust/proxy/proxy.toml || die "Proxy 示例配置不应成为正式配置"
+        [[ "$service_environment" == *"--enable-web"* ]] || die "服务参数未启用 Web"
+        [[ "$service_environment" != *"--enable-tunnel"* ]] || die "服务参数不应启用未配置的 QUIC"
+        [[ "$service_environment" != *"--enable-proxy"* ]] || die "服务参数不应启用未配置的 Proxy"
+        tunnel_mode=$(as_root stat -c '%a' /etc/gaterust/tunnel)
+        proxy_mode=$(as_root stat -c '%a' /etc/gaterust/proxy)
+        [[ "$tunnel_mode" == 770 && "$proxy_mode" == 770 ]] || die "Web 配置目录权限不正确"
+        as_root grep -Fq -- '-/etc/gaterust/tunnel' /etc/systemd/system/gaterust.service ||
+            die "systemd 未放行 Web 写入 QUIC 配置目录"
+        as_root grep -Fq -- '-/etc/gaterust/proxy' /etc/systemd/system/gaterust.service ||
+            die "systemd 未放行 Web 写入 Proxy 配置目录"
+    fi
+    if [[ "$expect_running" == 1 ]]; then
+        as_root systemctl is-active --quiet gaterust.service || die "GateRust 服务未运行"
+        if [[ "$service_environment" == *"--enable-web"* ]]; then
+            for attempt in {1..50}; do
+                curl -fsS http://127.0.0.1:8080/ >/dev/null && break
+                sleep 0.1
+            done
+            curl -fsS http://127.0.0.1:8080/ >/dev/null || die "Web 管理界面未响应"
+        fi
+    fi
 
     /usr/local/sbin/gaterust status
-    say "本地 Release 安装验证通过。"
+    say "本地 Release 安装及 Web 启动验证通过。"
     say "测试完成后可执行：$0 uninstall"
 }
 
@@ -233,18 +267,27 @@ test_release() {
     build_release
     start_server
 
-    local base_url="http://$SERVER_HOST:$SERVER_PORT"
-    local installer_args=(install --modules tunnel,proxy,web)
+    local base_url="http://$SERVER_HOST:$SERVER_PORT" default_install=1 expect_running=1 argument
+    local installer_args=(install --modules tunnel,proxy,web --enable)
     if [[ $# -gt 0 ]]; then
         [[ $1 == -- ]] || die "自定义安装参数前需要使用 --"
         shift
         installer_args=(install "$@")
+        default_install=0
     fi
+    if [[ "${GATERUST_ALLOW_EXISTING:-0}" == 1 ]]; then
+        installer_args+=(--force)
+        default_install=0
+    fi
+    expect_running=0
+    for argument in "${installer_args[@]}"; do
+        [[ "$argument" == --enable || "$argument" == --start ]] && expect_running=1
+    done
 
     say "执行本地安装器..."
     curl -fsSL "$base_url/$SCRIPT_VERSION/gaterust.sh" |
         as_root env GATERUST_RELEASE_BASE="$base_url" sh -s -- "${installer_args[@]}"
-    verify_install
+    verify_install "$default_install" "$expect_running"
 }
 
 uninstall_release() {

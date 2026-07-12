@@ -9,7 +9,7 @@
   export let onSaved: (config: ServerConfig) => void;
 
   const initial: ServerConfig = config ? structuredClone(config) : {
-    quic: { bind: '0.0.0.0:2333', certificate: 'certs/server.pem', private_key: 'certs/server-key.pem' },
+    quic: { bind: '0.0.0.0:2333', certificate: '/etc/gaterust/tunnel/server.pem', private_key: '/etc/gaterust/tunnel/server-key.pem' },
     groups: [], tunnels: []
   };
   let draft = initial;
@@ -102,7 +102,7 @@
 
   async function persist() {
     saving = true; error = ''; message = '';
-    try { draft = await saveTunnel(token, draft); onSaved(draft); message = '隧道配置已保存并触发热重载'; }
+    try { draft = await saveTunnel(token, draft); onSaved(draft); message = '配置已保存；首次启用或修改 QUIC/TLS 时请重启服务'; }
     catch (cause) { error = cause instanceof Error ? cause.message : '保存失败'; }
     finally { saving = false; }
   }

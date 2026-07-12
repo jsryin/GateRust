@@ -45,7 +45,15 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 require_root() {
-    [ "$(id -u)" -eq 0 ] || die "此操作需要 root 权限"
+    [ "$(id -u)" -eq 0 ] || die "此操作需要管理员权限，请使用 sudo"
+}
+
+run_installed_as_root() {
+    [ -z "$ROOT" ] || die "测试根目录模式不支持自动提权"
+    trusted_ctl=/usr/local/sbin/gaterust
+    [ -x "$trusted_ctl" ] || die "未找到已安装的 GateRust 管理程序：$trusted_ctl"
+    command -v sudo >/dev/null 2>&1 || die "此操作需要管理员权限，但未找到 sudo"
+    sudo -- "$trusted_ctl" "$@"
 }
 
 require_platform() {
@@ -224,18 +232,27 @@ check_configs_with() {
     check_modules=$2
     shift 2
     set -- "$check_binary" check-config
+    check_missing=0
     for check_module in tunnel proxy web; do
         if has_module "$check_modules" "$check_module"; then
             module_config "$check_module"
             check_path=$MODULE_CONFIG
             case "$check_module" in
-                tunnel) [ -n "${TUNNEL_SOURCE:-}" ] && check_path=$TUNNEL_SOURCE; set -- "$@" --enable-tunnel --tunnel-config "$check_path" ;;
-                proxy) [ -n "${PROXY_SOURCE:-}" ] && check_path=$PROXY_SOURCE; set -- "$@" --enable-proxy --proxy-config "$check_path" ;;
-                web) [ -n "${WEB_SOURCE:-}" ] && check_path=$WEB_SOURCE; set -- "$@" --enable-web --web-config "$check_path" ;;
+                tunnel) check_name="QUIC"; [ -n "${TUNNEL_SOURCE:-}" ] && check_path=$TUNNEL_SOURCE; set -- "$@" --enable-tunnel --tunnel-config "$check_path" ;;
+                proxy) check_name="Proxy"; [ -n "${PROXY_SOURCE:-}" ] && check_path=$PROXY_SOURCE; set -- "$@" --enable-proxy --proxy-config "$check_path" ;;
+                web) check_name="Web"; [ -n "${WEB_SOURCE:-}" ] && check_path=$WEB_SOURCE; set -- "$@" --enable-web --web-config "$check_path" ;;
             esac
-            [ -f "$check_path" ] || return 1
+            if [ ! -f "$check_path" ]; then
+                if [ "$check_path" = "$MODULE_CONFIG" ]; then
+                    warn "$check_name 配置文件不存在：$check_path；请基于 $ETC_DIR/$check_module/$MODULE_EXAMPLE 创建正式配置"
+                else
+                    warn "$check_name 配置文件不存在：$check_path"
+                fi
+                check_missing=1
+            fi
         fi
     done
+    [ "$check_missing" -eq 0 ] || return 1
     "$@"
 }
 
@@ -243,15 +260,25 @@ configs_valid() {
     TUNNEL_SOURCE="" PROXY_SOURCE="" WEB_SOURCE="" check_configs_with "$BIN" "$1"
 }
 
-write_service_files() {
-    service_modules=$1
+write_service_environment() {
+    environment_modules=$1
     service_args=""
-    has_module "$service_modules" tunnel && service_args="$service_args --enable-tunnel --tunnel-config /etc/gaterust/tunnel/server.toml"
-    has_module "$service_modules" proxy && service_args="$service_args --enable-proxy --proxy-config /etc/gaterust/proxy/proxy.toml"
-    has_module "$service_modules" web && service_args="$service_args --enable-web --web-config /etc/gaterust/web/web.toml"
+    has_module "$environment_modules" tunnel && service_args="$service_args --enable-tunnel --tunnel-config /etc/gaterust/tunnel/server.toml"
+    has_module "$environment_modules" proxy && service_args="$service_args --enable-proxy --proxy-config /etc/gaterust/proxy/proxy.toml"
+    has_module "$environment_modules" web && service_args="$service_args --enable-web --web-config /etc/gaterust/web/web.toml"
     service_args=${service_args# }
     printf 'GATERUST_ARGS=%s\n' "$service_args" > "$TEMP_DIR/service.env"
-    if has_module "$service_modules" proxy; then
+}
+
+install_service_environment() {
+    atomic_install "$TEMP_DIR/service.env" "$ENV_FILE" 0644 root root
+}
+
+write_service_files() {
+    installed_modules=$1
+    enabled_modules=$2
+    write_service_environment "$enabled_modules"
+    if has_module "$installed_modules" proxy; then
         awk '/@PROXY_CAPABILITIES@/ { print "AmbientCapabilities=CAP_NET_BIND_SERVICE"; print "CapabilityBoundingSet=CAP_NET_BIND_SERVICE"; next } { print }' "$package/gaterust.service" > "$TEMP_DIR/gaterust.service"
     else
         sed '/@PROXY_CAPABILITIES@/d' "$package/gaterust.service" > "$TEMP_DIR/gaterust.service"
@@ -330,7 +357,11 @@ install_module_files() {
         has_module "$NEW_MODULES" "$install_module" || continue
         mkdir -p "$ETC_DIR/$install_module" "$DATA_DIR/$install_module"
         chown root:gaterust "$ETC_DIR/$install_module"
-        chmod 0750 "$ETC_DIR/$install_module"
+        config_dir_mode=0750
+        if has_module "$NEW_MODULES" web; then
+            case "$install_module" in tunnel|proxy) config_dir_mode=0770 ;; esac
+        fi
+        chmod "$config_dir_mode" "$ETC_DIR/$install_module"
         chown gaterust:gaterust "$DATA_DIR/$install_module"
         chmod 0750 "$DATA_DIR/$install_module"
         module_config "$install_module"
@@ -362,7 +393,7 @@ perform_install() {
     save_backup "$UNIT_FILE" unit
     save_backup "$ENV_FILE" environment
     save_backup "$STATE_FILE" state
-    write_service_files "$NEW_MODULES"
+    write_service_files "$NEW_MODULES" "$RUN_MODULES"
     create_account
     install_module_files
     WEB_REPLACED=0
@@ -373,7 +404,7 @@ perform_install() {
     atomic_install "$package/gaterust-server" "$BIN" 0755 root root
     atomic_install "$TEMP_DIR/gaterust.sh" "$CTL" 0755 root root
     atomic_install "$TEMP_DIR/gaterust.service" "$UNIT_FILE" 0644 root root
-    atomic_install "$TEMP_DIR/service.env" "$ENV_FILE" 0640 root gaterust
+    install_service_environment
     printf 'VERSION=%s\nARCH=%s\nMODULES=%s\n' "$SCRIPT_VERSION" "$ARCH" "$NEW_MODULES" > "$TEMP_DIR/install-state"
     atomic_install "$TEMP_DIR/install-state" "$STATE_FILE" 0644 root root
     if has_module "$NEW_MODULES" web; then
@@ -388,7 +419,9 @@ perform_install() {
     "$SYSTEMCTL" daemon-reload
 
     FINAL_VALID=0
-    configs_valid "$NEW_MODULES" >/dev/null 2>&1 && FINAL_VALID=1 || true
+    if [ -n "$RUN_MODULES" ]; then
+        configs_valid "$RUN_MODULES" >/dev/null 2>&1 && FINAL_VALID=1 || true
+    fi
     if [ "$FINAL_VALID" -eq 0 ]; then
         START_MODE=stop
         warn "已安装示例或无效配置，服务保持停止且不开机启动"
@@ -409,6 +442,12 @@ perform_install() {
     rm -f "$LEGACY_CTL"
     rm -rf "$TEMP_DIR/web.old"
     say "GateRust $SCRIPT_VERSION 安装完成，模块：$(display_modules "$NEW_MODULES")"
+    if [ -n "${GENERATED_WEB_PASSWORD:-}" ]; then
+        say "Web 管理地址：http://127.0.0.1:8080/"
+        say "Web 管理用户：admin"
+        say "Web 初始密码：$GENERATED_WEB_PASSWORD"
+        warn "Web 初始密码只显示这一次，请立即妥善保存并限制主机登录权限"
+    fi
 }
 
 tty_read() {
@@ -440,26 +479,69 @@ interactive_modules() {
 }
 
 choose_configs() {
-    TUNNEL_SOURCE="" PROXY_SOURCE="" WEB_SOURCE="" EXAMPLE_SELECTED=0
+    TUNNEL_SOURCE="" PROXY_SOURCE="" WEB_SOURCE="" EXAMPLE_SELECTED=0 GENERATED_WEB_PASSWORD=""
     for choose_module in tunnel proxy web; do
         has_module "$NEW_MODULES" "$choose_module" || continue
         module_config "$choose_module"
         [ -f "$MODULE_CONFIG" ] && continue
         if [ "$INTERACTIVE" -eq 1 ]; then
             say ""
-            say "$choose_module 配置：1. 导入已有配置  2. 安装示例配置"
-            tty_read "请选择 [默认 2]："
-            case "${REPLY:-2}" in
-                1) tty_read "请输入配置文件路径："; [ -f "$REPLY" ] || die "配置文件不存在：$REPLY"; choose_source=$REPLY ;;
-                2) choose_source=""; EXAMPLE_SELECTED=1 ;;
-                *) die "无效选择" ;;
-            esac
+            if [ "$choose_module" = web ]; then
+                say "Web 配置：1. 自动安全初始化  2. 导入已有配置  3. 仅安装示例配置"
+                tty_read "请选择 [默认 1]："
+                case "${REPLY:-1}" in
+                    1) generate_web_config; choose_source=$GENERATED_WEB_CONFIG ;;
+                    2) tty_read "请输入配置文件路径："; [ -f "$REPLY" ] || die "配置文件不存在：$REPLY"; choose_source=$REPLY ;;
+                    3) choose_source=""; EXAMPLE_SELECTED=1 ;;
+                    *) die "无效选择" ;;
+                esac
+            else
+                say "$choose_module 配置：1. 导入已有配置  2. 仅安装示例配置"
+                tty_read "请选择 [默认 2]："
+                case "${REPLY:-2}" in
+                    1) tty_read "请输入配置文件路径："; [ -f "$REPLY" ] || die "配置文件不存在：$REPLY"; choose_source=$REPLY ;;
+                    2) choose_source=""; EXAMPLE_SELECTED=1 ;;
+                    *) die "无效选择" ;;
+                esac
+            fi
         else
             case "$choose_module" in tunnel) choose_source=${TUNNEL_SOURCE_ARG:-} ;; proxy) choose_source=${PROXY_SOURCE_ARG:-} ;; web) choose_source=${WEB_SOURCE_ARG:-} ;; esac
-            [ -n "$choose_source" ] || EXAMPLE_SELECTED=1
+            if [ -z "$choose_source" ] && [ "$choose_module" = web ]; then
+                generate_web_config
+                choose_source=$GENERATED_WEB_CONFIG
+            elif [ -z "$choose_source" ]; then
+                EXAMPLE_SELECTED=1
+            fi
         fi
         case "$choose_module" in tunnel) TUNNEL_SOURCE=$choose_source ;; proxy) PROXY_SOURCE=$choose_source ;; web) WEB_SOURCE=$choose_source ;; esac
     done
+}
+
+random_hex() {
+    random_bytes=$1
+    command -v od >/dev/null 2>&1 || die "自动初始化 Web 需要 od"
+    command -v tr >/dev/null 2>&1 || die "自动初始化 Web 需要 tr"
+    od -An -N "$random_bytes" -tx1 /dev/urandom | tr -d ' \n'
+}
+
+generate_web_config() {
+    GENERATED_WEB_PASSWORD=$(random_hex 16)
+    generated_jwt_secret=$(random_hex 32)
+    generated_password_hash=$(printf '%s' "$GENERATED_WEB_PASSWORD" | "$package/gaterust-server" hash-password) || die "生成 Web 管理员密码哈希失败"
+    GENERATED_WEB_CONFIG="$TEMP_DIR/web.toml"
+    (
+        umask 077
+        {
+            printf '%s\n' '[web]'
+            printf '%s\n' 'bind = "127.0.0.1:8080"'
+            printf '%s\n' 'static_dir = "/usr/local/lib/gaterust/web"'
+            printf '%s\n' 'admin_username = "admin"'
+            printf 'admin_password_hash = "%s"\n' "$generated_password_hash"
+            printf 'jwt_secret = "%s"\n' "$generated_jwt_secret"
+            printf '%s\n' 'token_ttl_seconds = 3600'
+            printf '%s\n' 'allowed_origins = []'
+        } > "$GENERATED_WEB_CONFIG"
+    )
 }
 
 install_command() {
@@ -474,7 +556,7 @@ install_command() {
     normalize_modules "$REQUEST_MODULES"
     merge_modules "$existing_modules" "$NORMALIZED"
     NEW_MODULES=$NORMALIZED
-    if [ "$had_state" -eq 1 ] && [ "$STATE_VERSION" = "$SCRIPT_VERSION" ] && [ "$NEW_MODULES" = "$existing_modules" ]; then
+    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$had_state" -eq 1 ] && [ "$STATE_VERSION" = "$SCRIPT_VERSION" ] && [ "$NEW_MODULES" = "$existing_modules" ]; then
         say "GateRust $SCRIPT_VERSION 和所选模块已安装，无需更新"
         release_lock
         return
@@ -494,11 +576,13 @@ install_command() {
     if [ -n "$valid_modules" ]; then
         check_configs_with "$package/gaterust-server" "$valid_modules" || die "配置校验失败"
     fi
+    RUN_MODULES=$valid_modules
     if [ "$INTERACTIVE" -eq 1 ]; then
-        if [ "$EXAMPLE_SELECTED" -eq 1 ]; then
+        if [ -z "$RUN_MODULES" ]; then
             START_MODE=stop
-            say "已选择示例配置，服务将保持停止且不开机启动。"
+            say "没有可运行的正式配置，服务将保持停止且不开机启动。"
         else
+            [ "$EXAMPLE_SELECTED" -eq 0 ] || say "未配置的模块本次不会启动，可在 Web 保存配置后执行 gaterust restart 启用。"
             say "启动方式：1. 立即启动并启用开机启动  2. 立即启动  3. 暂不启动"
             tty_read "请选择 [默认 1]："
             case "${REPLY:-1}" in 1) START_MODE=enable ;; 2) START_MODE=start ;; 3) START_MODE=stop ;; *) die "无效选择" ;; esac
@@ -509,19 +593,46 @@ install_command() {
     fi
     [ "$had_state" -eq 1 ] && [ "$START_MODE" = default ] && START_MODE=preserve
     [ "$START_MODE" = default ] && START_MODE=stop
-    [ "$EXAMPLE_SELECTED" -eq 1 ] && START_MODE=stop
+    [ -n "$RUN_MODULES" ] || START_MODE=stop
     perform_install
     release_lock
 }
 
-validate_service_config() {
+collect_configured_modules() {
+    configured_from=$1
+    RUN_MODULES=""
+    for configured_module in tunnel proxy web; do
+        has_module "$configured_from" "$configured_module" || continue
+        module_config "$configured_module"
+        if [ -f "$MODULE_CONFIG" ]; then
+            RUN_MODULES="${RUN_MODULES:+$RUN_MODULES,}$configured_module"
+        else
+            case "$configured_module" in tunnel) configured_name="QUIC" ;; proxy) configured_name="Proxy" ;; web) configured_name="Web" ;; esac
+            warn "$configured_name 尚无正式配置，本次不启用；示例位于 $ETC_DIR/$configured_module/$MODULE_EXAMPLE"
+        fi
+    done
+}
+
+prepare_service_config() {
     read_state || die "GateRust 尚未安装"
-    configs_valid "$STATE_MODULES" || die "配置校验失败，服务未操作"
+    collect_configured_modules "$STATE_MODULES"
+    [ -n "$RUN_MODULES" ] || die "没有可运行的模块，请先创建至少一个正式配置"
+    configs_valid "$RUN_MODULES" || die "配置校验失败，服务未操作"
+    write_service_environment "$RUN_MODULES"
+    install_service_environment
 }
 
 service_command() {
     service_action=$1
-    case "$service_action" in start|restart) require_root; validate_service_config ;; stop|enable|disable) require_root; read_state >/dev/null || die "GateRust 尚未安装" ;; esac
+    case "$service_action" in
+        start|restart|enable)
+            require_root
+            require_platform
+            acquire_lock
+            prepare_service_config
+            ;;
+        stop|disable) require_root; read_state >/dev/null || die "GateRust 尚未安装" ;;
+    esac
     case "$service_action" in
         start) "$SYSTEMCTL" start gaterust.service ;;
         stop) "$SYSTEMCTL" stop gaterust.service ;;
@@ -530,10 +641,28 @@ service_command() {
         disable) "$SYSTEMCTL" disable gaterust.service ;;
         logs) exec journalctl -u gaterust.service -f ;;
     esac
+    case "$service_action" in
+        start|restart|enable)
+            say "运行模块：$(display_modules "$RUN_MODULES")"
+            release_lock
+            ;;
+    esac
+}
+
+read_service_modules() {
+    SERVICE_MODULES=""
+    service_environment=""
+    [ -r "$ENV_FILE" ] || return 0
+    IFS= read -r service_environment < "$ENV_FILE" || return 0
+    case "$service_environment" in GATERUST_ARGS=*) service_arguments=${service_environment#GATERUST_ARGS=} ;; *) return 0 ;; esac
+    case " $service_arguments " in *" --enable-tunnel "*) SERVICE_MODULES=tunnel ;; esac
+    case " $service_arguments " in *" --enable-proxy "*) SERVICE_MODULES="${SERVICE_MODULES:+$SERVICE_MODULES,}proxy" ;; esac
+    case " $service_arguments " in *" --enable-web "*) SERVICE_MODULES="${SERVICE_MODULES:+$SERVICE_MODULES,}web" ;; esac
 }
 
 status_command() {
     read_state || die "GateRust 尚未安装"
+    read_service_modules
     status_active="已停止" status_enabled="未启用" status_pid="-" status_uptime="-"
     "$SYSTEMCTL" is-active --quiet gaterust.service 2>/dev/null && status_active="运行中" || true
     "$SYSTEMCTL" is-enabled --quiet gaterust.service 2>/dev/null && status_enabled="已启用" || true
@@ -553,7 +682,8 @@ status_command() {
     fi
     say "版本：$STATE_VERSION"
     say "架构：$STATE_ARCH"
-    say "模块：$(display_modules "$STATE_MODULES")"
+    say "已安装模块：$(display_modules "$STATE_MODULES")"
+    say "运行模块：$(display_modules "$SERVICE_MODULES")"
     say "配置目录：/etc/gaterust"
     say "服务：$status_active"
     say "开机启动：$status_enabled"
@@ -582,7 +712,7 @@ full_uninstall() {
     else
         rm -rf "$ETC_DIR"
     fi
-    rm -rf "$DATA_DIR" "$LIB_DIR/web"
+    rm -rf "$DATA_DIR" "$LIB_DIR"
     if id gaterust >/dev/null 2>&1; then userdel gaterust; fi
     if getent group gaterust >/dev/null 2>&1; then groupdel gaterust; fi
     rm -f "$CTL" "$LEGACY_CTL"
@@ -603,7 +733,7 @@ show_uninstall_files() {
         say "  /etc/systemd/system/gaterust.service"
         [ "$KEEP_CONFIG" -eq 1 ] || say "  /etc/gaterust/"
         say "  /var/lib/gaterust/"
-        say "  /usr/local/lib/gaterust/web/"
+        say "  /usr/local/lib/gaterust/"
         say "  gaterust 系统用户和组"
         return
     fi
@@ -637,7 +767,8 @@ uninstall_command() {
     remaining=$NORMALIZED
     if [ -n "$remaining" ]; then
         prepare_release
-        write_service_files "$remaining"
+        collect_configured_modules "$remaining"
+        write_service_files "$remaining" "$RUN_MODULES"
         printf 'VERSION=%s\nARCH=%s\nMODULES=%s\n' "$STATE_VERSION" "$STATE_ARCH" "$remaining" > "$TEMP_DIR/install-state"
     fi
     say "将卸载模块：$(display_modules "$REMOVE_MODULES")"
@@ -652,13 +783,20 @@ uninstall_command() {
     fi
     for remove_module in "$@"; do delete_module_files "$remove_module"; done
     if [ -z "$remaining" ]; then full_uninstall; release_lock; return; fi
+    if ! has_module "$remaining" web; then
+        for protected_module in tunnel proxy; do
+            has_module "$remaining" "$protected_module" && chmod 0750 "$ETC_DIR/$protected_module"
+        done
+    fi
     NEW_MODULES=$remaining
     atomic_install "$TEMP_DIR/gaterust.service" "$UNIT_FILE" 0644 root root
-    atomic_install "$TEMP_DIR/service.env" "$ENV_FILE" 0640 root gaterust
+    install_service_environment
     atomic_install "$TEMP_DIR/install-state" "$STATE_FILE" 0644 root root
     "$SYSTEMCTL" daemon-reload
     [ "$was_enabled" -eq 1 ] && "$SYSTEMCTL" enable gaterust.service >/dev/null || true
-    if [ "$was_active" -eq 1 ]; then configs_valid "$remaining" && "$SYSTEMCTL" start gaterust.service || die "剩余模块配置无效，服务保持停止"; fi
+    if [ "$was_active" -eq 1 ]; then
+        [ -n "$RUN_MODULES" ] && configs_valid "$RUN_MODULES" && "$SYSTEMCTL" start gaterust.service || die "剩余模块没有有效配置，服务保持停止"
+    fi
     say "已卸载模块：$REMOVE_MODULES；剩余模块：$remaining"
     release_lock
 }
@@ -668,8 +806,25 @@ interactive_service_menu() {
         say "1. 启动服务  2. 停止服务  3. 重启服务"
         say "4. 启用开机启动  5. 关闭开机启动  6. 查看实时日志  0. 返回"
         tty_read "请选择："
-        case "$REPLY" in 1) service_command start ;; 2) service_command stop ;; 3) service_command restart ;; 4) service_command enable ;; 5) service_command disable ;; 6) service_command logs ;; 0) return ;; *) warn "无效选择" ;; esac
+        case "$REPLY" in
+            1) interactive_service_command start ;;
+            2) interactive_service_command stop ;;
+            3) interactive_service_command restart ;;
+            4) interactive_service_command enable ;;
+            5) interactive_service_command disable ;;
+            6) service_command logs ;;
+            0) return ;;
+            *) warn "无效选择" ;;
+        esac
     done
+}
+
+interactive_service_command() {
+    if [ "$(id -u)" -eq 0 ]; then
+        service_command "$1"
+    else
+        run_installed_as_root "$1"
+    fi
 }
 
 interactive_uninstall() {
@@ -686,7 +841,28 @@ interactive_uninstall() {
         for number in "$@"; do number=$(printf '%s' "$number" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'); case "$number" in 1) name=tunnel ;; 2) name=proxy ;; 3) name=web ;; *) die "无效模块编号：$number" ;; esac; has_module "$number_modules" "$name" || number_modules="${number_modules:+$number_modules,}$name"; done
         REQUEST_MODULES=$number_modules
     fi
-    uninstall_command
+    if [ "$(id -u)" -eq 0 ]; then
+        uninstall_command
+    elif [ "$UNINSTALL_ALL" -eq 1 ]; then
+        run_installed_as_root uninstall --all
+    else
+        run_installed_as_root uninstall --modules "$REQUEST_MODULES"
+    fi
+}
+
+interactive_install() {
+    INTERACTIVE=1
+    interactive_modules || return
+    REQUEST_MODULES=$NORMALIZED
+    install_command
+}
+
+interactive_install_as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        interactive_install
+    else
+        run_installed_as_root internal-interactive-install
+    fi
 }
 
 interactive_main() {
@@ -694,10 +870,7 @@ interactive_main() {
     if ! read_state; then
         say "GateRust 安装管理程序"
         say ""
-        interactive_modules || return
-        REQUEST_MODULES=$NORMALIZED
-        prepare_interactive_start=1
-        install_command
+        interactive_install_as_root
         return
     fi
     while :; do
@@ -709,7 +882,7 @@ interactive_main() {
         say "  3. 查看安装信息和服务状态  4. 卸载模块  0. 退出"
         tty_read "请选择："
         case "$REPLY" in
-            1) interactive_modules || continue; REQUEST_MODULES=$NORMALIZED; install_command ;;
+            1) interactive_install_as_root ;;
             2) interactive_service_menu ;;
             3) status_command ;;
             4) interactive_uninstall; [ -f "$STATE_FILE" ] || return ;;
@@ -720,9 +893,17 @@ interactive_main() {
 }
 
 REQUEST_MODULES="" TUNNEL_SOURCE_ARG="" PROXY_SOURCE_ARG="" WEB_SOURCE_ARG=""
-START_MODE=default INTERACTIVE=0 ASSUME_YES=0 KEEP_CONFIG=0 UNINSTALL_ALL=0
+START_MODE=default INTERACTIVE=0 ASSUME_YES=0 KEEP_CONFIG=0 UNINSTALL_ALL=0 FORCE_INSTALL=0
 [ "${GATERUST_LIBRARY_ONLY:-0}" -eq 1 ] && return 0
 command_name=${1:-}
+case "$command_name" in
+    install|start|stop|restart|enable|disable|uninstall)
+        if [ "$(id -u)" -ne 0 ] && [ "$0" = "$CTL" ]; then
+            run_installed_as_root "$@"
+            exit $?
+        fi
+        ;;
+esac
 if [ -n "$command_name" ]; then shift; fi
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -732,6 +913,7 @@ while [ "$#" -gt 0 ]; do
         --web-config) [ "$#" -ge 2 ] || die "--web-config 缺少参数"; WEB_SOURCE_ARG=$2; shift 2 ;;
         --start) START_MODE=start; shift ;;
         --enable) START_MODE=enable; shift ;;
+        --force) FORCE_INSTALL=1; shift ;;
         --yes) ASSUME_YES=1; shift ;;
         --keep-config) KEEP_CONFIG=1; shift ;;
         --all) UNINSTALL_ALL=1; shift ;;
@@ -744,6 +926,7 @@ case "$command_name" in
     start|stop|restart|enable|disable|logs) service_command "$command_name" ;;
     status) status_command ;;
     uninstall) uninstall_command ;;
+    internal-interactive-install) interactive_install ;;
     '')
         if [ -f "$STATE_FILE" ] && [ "$(basename "$0")" != gaterust ]; then
             REQUEST_MODULES=$(awk -F= '$1 == "MODULES" { print $2 }' "$STATE_FILE")

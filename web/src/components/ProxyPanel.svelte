@@ -7,7 +7,7 @@
   export let config: ProxyConfig | null | undefined;
   export let onSaved: (config: ProxyConfig) => void;
 
-  let draft: ProxyConfig = config ? structuredClone(config) : { proxy: { http_bind: '0.0.0.0:80', https_bind: '0.0.0.0:443', cache_dir: 'data/acme', max_connections: 2048 }, certificates: [], routes: [] };
+  let draft: ProxyConfig = config ? structuredClone(config) : { proxy: { http_bind: '0.0.0.0:80', https_bind: '0.0.0.0:443', cache_dir: '/var/lib/gaterust/proxy/acme', max_connections: 2048 }, certificates: [], routes: [] };
   let tab: 'certificates' | 'routes' = 'certificates';
   let editor: 'certificate' | 'route' | null = null;
   let editIndex = -1;
@@ -36,7 +36,7 @@
     if (editIndex >= 0) draft.routes[editIndex] = route; else draft.routes = [...draft.routes, route];
     draft = { ...draft }; editor = null;
   }
-  async function persist() { saving = true; error = ''; message = ''; try { draft = await saveProxy(token, draft); onSaved(draft); message = '代理配置已保存并触发热重载'; } catch (cause) { error = cause instanceof Error ? cause.message : '保存失败'; } finally { saving = false; } }
+  async function persist() { saving = true; error = ''; message = ''; try { draft = await saveProxy(token, draft); onSaved(draft); message = '配置已保存；首次启用或修改监听参数时请重启服务'; } catch (cause) { error = cause instanceof Error ? cause.message : '保存失败'; } finally { saving = false; } }
 </script>
 
 <header class="page-header"><div><p class="eyebrow">PROXY & SSL</p><h1>域名与 SSL</h1></div><button class="primary" onclick={persist} disabled={saving}><Save size={17} />{saving ? '保存中' : '保存配置'}</button></header>

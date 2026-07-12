@@ -22,7 +22,7 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadWritePaths=/var/lib/gaterust
+ReadWritePaths=/var/lib/gaterust -/etc/gaterust/tunnel -/etc/gaterust/proxy
 @PROXY_CAPABILITIES@
 
 [Install]

@@ -101,7 +101,7 @@ fn check_config(arguments: &ServerArguments) -> Result<(), String> {
     let enabled = 0_u8;
     #[cfg(feature = "tunnel")]
     let enabled = if arguments.enable_tunnel {
-        gaterust_tunnel::ServerConfig::load(&arguments.tunnel_config)
+        gaterust_tunnel::check_server_config(&arguments.tunnel_config)
             .map_err(|error| format!("隧道模块: {error}"))?;
         enabled + 1
     } else {

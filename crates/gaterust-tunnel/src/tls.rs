@@ -6,12 +6,21 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::{Result, TunnelError, config::ServerQuicConfig};
 
 pub(crate) fn server_endpoint(config: &ServerQuicConfig) -> Result<Endpoint> {
+    let server = build_server_config(config)?;
+    Endpoint::server(server, config.bind).map_err(Into::into)
+}
+
+pub(crate) fn validate_server_credentials(config: &ServerQuicConfig) -> Result<()> {
+    build_server_config(config).map(drop)
+}
+
+fn build_server_config(config: &ServerQuicConfig) -> Result<ServerConfig> {
     let certificates = read_certificates(&config.certificate)?;
     let private_key = read_private_key(&config.private_key)?;
     let mut server = ServerConfig::with_single_cert(certificates, private_key)
         .map_err(|error| TunnelError::Tls(error.to_string()))?;
     server.transport_config(transport_config());
-    Endpoint::server(server, config.bind).map_err(Into::into)
+    Ok(server)
 }
 
 pub(crate) fn client_endpoint(server: SocketAddr, ca_path: Option<&Path>) -> Result<Endpoint> {

@@ -9,11 +9,30 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    TunnelRuntime, TunnelRuntimeSnapshot, run_client_with_shutdown, run_server_with_runtime,
-    run_server_with_shutdown,
+    TunnelRuntime, TunnelRuntimeSnapshot, check_server_config, run_client_with_shutdown,
+    run_server_with_runtime, run_server_with_shutdown,
 };
 
 const TEST_KEY: &str = "12345678901234567890123456789012";
+
+#[test]
+fn checks_server_tls_credentials_before_startup() {
+    let directory = tempfile::tempdir().expect("应能创建测试目录");
+    write_certificate(directory.path());
+    let config = r#"
+[quic]
+bind = "127.0.0.1:2333"
+certificate = "server.pem"
+private_key = "server-key.pem"
+"#;
+    let path = directory.path().join("server.toml");
+    std::fs::write(&path, config).expect("应能写服务端配置");
+    check_server_config(&path).expect("有效 TLS 凭据应通过校验");
+
+    std::fs::remove_file(directory.path().join("server-key.pem")).expect("应能删除测试私钥");
+    let error = check_server_config(&path).expect_err("缺少私钥应校验失败");
+    assert!(error.to_string().contains("server-key.pem"));
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forwards_tcp_udp_and_socks5() {
