@@ -47,6 +47,18 @@ sudo gaterust uninstall --all --yes
 配置位于 `/etc/gaterust`，运行数据位于 `/var/lib/gaterust`，日志通过 `journalctl -u gaterust.service` 查看。卸载默认删除模块配置；需要保留时显式传入 `--keep-config`。
 重新执行 latest 一键安装命令会升级到脚本所属版本，并保留已安装模块、配置、数据和原服务启用状态。
 
+## 客户端下载
+
+Release 提供 Linux x86_64/aarch64、Windows x86_64，以及 macOS Intel/Apple Silicon 客户端。客户端以带平台后缀的独立可执行文件发布，配置示例作为 `client.example.toml` 单独提供。Linux 和 macOS 下载后需要添加执行权限：
+
+```bash
+chmod +x gaterust-client-x86_64-linux-musl
+./gaterust-client-x86_64-linux-musl --generate-key
+./gaterust-client-x86_64-linux-musl --config client.toml
+```
+
+Windows 客户端文件名为 `gaterust-client-x86_64-windows.exe`。所有客户端文件均记录在 Release 的 `SHA256SUMS` 中。
+
 ## 快速开始
 
 生成分组密钥：

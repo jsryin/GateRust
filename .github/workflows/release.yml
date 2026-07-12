@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  server:
     strategy:
       fail-fast: false
       matrix:
@@ -66,8 +66,83 @@ jobs:
           path: dist/gaterust-${{ matrix.asset_arch }}-linux-musl.tar.gz
           if-no-files-found: error
 
+  client:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset_arch: x86_64
+            asset_os: linux-musl
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset_arch: aarch64
+            asset_os: linux-musl
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_arch: x86_64
+            asset_os: windows
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            asset_arch: x86_64
+            asset_os: macos
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            asset_arch: aarch64
+            asset_os: macos
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+          targets: ${{ matrix.target }}
+      - name: Build static Linux client
+        if: runner.os == 'Linux'
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: '--locked --release -p gaterust-client'
+      - name: Build client
+        if: runner.os != 'Linux'
+        run: cargo build --locked --release -p gaterust-client --target ${{ matrix.target }}
+      - name: Prepare Unix binary
+        if: runner.os != 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          ASSET_OS: ${{ matrix.asset_os }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          test "$(sed -n 's/^version = "\([^"]*\)"/v\1/p' Cargo.toml | head -n 1)" = "$TAG"
+          mkdir -p dist
+          install -m 0755 "target/$TARGET/release/gaterust-client" "dist/gaterust-client-$ASSET_ARCH-$ASSET_OS"
+      - name: Prepare Windows binary
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          ASSET_OS: ${{ matrix.asset_os }}
+          TAG: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"$').Matches.Groups[1].Value
+          if ("v$version" -ne $env:TAG) {
+            throw "Cargo version v$version does not match tag $env:TAG"
+          }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/$env:TARGET/release/gaterust-client.exe" "dist/gaterust-client-$env:ASSET_ARCH-$env:ASSET_OS.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gaterust-client-${{ matrix.asset_arch }}-${{ matrix.asset_os }}
+          path: dist/gaterust-client-${{ matrix.asset_arch }}-${{ matrix.asset_os }}*
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [server, client]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -79,12 +154,14 @@ jobs:
       - name: Prepare release assets
         run: |
           install -m 0755 scripts/gaterust.sh dist/gaterust.sh
+          install -m 0644 config/client.example.toml dist/client.example.toml
           cd dist
-          sha256sum gaterust-*-linux-musl.tar.gz gaterust.sh > SHA256SUMS
+          sha256sum gaterust-client-* gaterust-*-linux-musl.tar.gz gaterust.sh client.example.toml > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/gaterust-x86_64-linux-musl.tar.gz
-            dist/gaterust-aarch64-linux-musl.tar.gz
+            dist/gaterust-*-linux-musl.tar.gz
+            dist/gaterust-client-*
             dist/SHA256SUMS
             dist/gaterust.sh
+            dist/client.example.toml
