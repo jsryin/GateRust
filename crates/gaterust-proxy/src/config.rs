@@ -144,7 +144,7 @@ impl ProxyConfig {
                     route.name
                 )));
             }
-            route.host = normalize_domain(&route.host)?;
+            route.host = normalize_route_host(&route.host)?;
             validate_path_prefix(&route.path_prefix)?;
             validate_upstream(&route.upstream)?;
             if !route_keys.insert((route.host.as_str(), route.path_prefix.as_str())) {
@@ -304,6 +304,14 @@ fn normalize_domain(value: &str) -> Result<String> {
     Ok(value)
 }
 
+fn normalize_route_host(value: &str) -> Result<String> {
+    let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if value == "localhost" {
+        return Ok(value);
+    }
+    normalize_domain(&value)
+}
+
 fn validate_name(kind: &str, name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 64
@@ -380,7 +388,7 @@ const fn default_dns_propagation_seconds() -> u64 {
 mod tests {
     use serde::Deserialize;
 
-    use super::AcmeChallenge;
+    use super::{AcmeChallenge, normalize_domain, normalize_route_host};
 
     #[derive(Deserialize)]
     struct ChallengeConfig {
@@ -399,5 +407,11 @@ mod tests {
                 .expect("文档中的 ACME 验证名称应有效");
             assert_eq!(config.challenge, expected);
         }
+    }
+
+    #[test]
+    fn accepts_localhost_only_for_route_hosts() {
+        assert_eq!(normalize_route_host(" LOCALHOST. ").unwrap(), "localhost");
+        assert!(normalize_domain("localhost").is_err());
     }
 }
