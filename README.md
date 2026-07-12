@@ -36,12 +36,12 @@ sudo sh gaterust.sh install --modules web --web-config /path/to/web.toml --enabl
 安装后使用统一管理命令：
 
 ```bash
-sudo gaterustctl start
-sudo gaterustctl restart
-gaterustctl status
-gaterustctl logs
-sudo gaterustctl uninstall --modules proxy --yes
-sudo gaterustctl uninstall --all --yes
+sudo gaterust start
+sudo gaterust restart
+gaterust status
+gaterust logs
+sudo gaterust uninstall --modules proxy --yes
+sudo gaterust uninstall --all --yes
 ```
 
 配置位于 `/etc/gaterust`，运行数据位于 `/var/lib/gaterust`，日志通过 `journalctl -u gaterust.service` 查看。卸载默认删除模块配置；需要保留时显式传入 `--keep-config`。

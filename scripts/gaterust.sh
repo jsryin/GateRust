@@ -9,7 +9,8 @@ SYSTEMCTL="${GATERUST_SYSTEMCTL:-systemctl}"
 RELEASE_BASE="${GATERUST_RELEASE_BASE:-https://github.com/$REPOSITORY/releases/download}"
 
 BIN="$ROOT/usr/local/bin/gaterust-server"
-CTL="$ROOT/usr/local/sbin/gaterustctl"
+CTL="$ROOT/usr/local/sbin/gaterust"
+LEGACY_CTL="${CTL}ctl"
 LIB_DIR="$ROOT/usr/local/lib/gaterust"
 ETC_DIR="$ROOT/etc/gaterust"
 DATA_DIR="$ROOT/var/lib/gaterust"
@@ -405,6 +406,7 @@ perform_install() {
         stop) "$SYSTEMCTL" disable --now gaterust.service >/dev/null 2>&1 || true ;;
     esac
     TRANSACTION=0
+    rm -f "$LEGACY_CTL"
     rm -rf "$TEMP_DIR/web.old"
     say "GateRust $SCRIPT_VERSION 安装完成，模块：$(display_modules "$NEW_MODULES")"
 }
@@ -583,7 +585,7 @@ full_uninstall() {
     rm -rf "$DATA_DIR" "$LIB_DIR/web"
     if id gaterust >/dev/null 2>&1; then userdel gaterust; fi
     if getent group gaterust >/dev/null 2>&1; then groupdel gaterust; fi
-    rm -f "$CTL"
+    rm -f "$CTL" "$LEGACY_CTL"
     say "GateRust 已完整卸载"
 }
 
@@ -597,7 +599,7 @@ show_uninstall_files() {
     if [ "$UNINSTALL_ALL" -eq 1 ]; then
         say "将删除："
         say "  /usr/local/bin/gaterust-server"
-        say "  /usr/local/sbin/gaterustctl"
+        say "  /usr/local/sbin/gaterust"
         say "  /etc/systemd/system/gaterust.service"
         [ "$KEEP_CONFIG" -eq 1 ] || say "  /etc/gaterust/"
         say "  /var/lib/gaterust/"
@@ -743,7 +745,7 @@ case "$command_name" in
     status) status_command ;;
     uninstall) uninstall_command ;;
     '')
-        if [ -f "$STATE_FILE" ] && [ "$(basename "$0")" != gaterustctl ]; then
+        if [ -f "$STATE_FILE" ] && [ "$(basename "$0")" != gaterust ]; then
             REQUEST_MODULES=$(awk -F= '$1 == "MODULES" { print $2 }' "$STATE_FILE")
             install_command
         else
