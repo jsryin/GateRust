@@ -66,6 +66,18 @@ RUST_LOG=info cargo run -p gaterust-server -- \
   --proxy-config config/proxy.toml
 ```
 
+在运行服务端的终端按 `Ctrl+C`，统一关闭所有服务端模块。确认进程已经退出：
+
+```bash
+pgrep -af gaterust-server
+```
+
+如果终端已经关闭但进程仍在运行：
+
+```bash
+pkill -TERM -x gaterust-server
+```
+
 然后另开一个终端启动客户端：
 
 ```bash
