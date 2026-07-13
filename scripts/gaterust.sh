@@ -18,6 +18,8 @@ TUNNEL_DIR="$ETC_DIR/tunnel"
 TUNNEL_CONFIG="$TUNNEL_DIR/server.toml"
 TUNNEL_CERTIFICATE="$TUNNEL_DIR/server.pem"
 TUNNEL_PRIVATE_KEY="$TUNNEL_DIR/server-key.pem"
+PROXY_DIR="$ETC_DIR/proxy"
+PROXY_CONFIG="$PROXY_DIR/proxy.toml"
 STATE_FILE="$DATA_DIR/install-state"
 ENV_FILE="$DATA_DIR/service.env"
 UNIT_FILE="$ROOT/etc/systemd/system/gaterust.service"
@@ -35,17 +37,22 @@ say() { printf '%s\n' "$*"; }
 warn() { printf '警告：%s\n' "$*" >&2; }
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
 
-cleanup_generated_tunnel_files() {
-    [ "${GENERATED_TUNNEL_FILES_INSTALLED:-0}" -eq 1 ] || return
-    rm -f "$TUNNEL_CONFIG" "$TUNNEL_CERTIFICATE" "$TUNNEL_PRIVATE_KEY"
-    GENERATED_TUNNEL_FILES_INSTALLED=0
+cleanup_generated_files() {
+    if [ "${GENERATED_TUNNEL_FILES_INSTALLED:-0}" -eq 1 ]; then
+        rm -f "$TUNNEL_CONFIG" "$TUNNEL_CERTIFICATE" "$TUNNEL_PRIVATE_KEY"
+        GENERATED_TUNNEL_FILES_INSTALLED=0
+    fi
+    if [ "${GENERATED_PROXY_CONFIG_INSTALLED:-0}" -eq 1 ]; then
+        rm -f "$PROXY_CONFIG"
+        GENERATED_PROXY_CONFIG_INSTALLED=0
+    fi
 }
 
 cleanup() {
     if [ "$TRANSACTION" -eq 1 ]; then
         rollback_install
     fi
-    cleanup_generated_tunnel_files
+    cleanup_generated_files
     if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
         rm -rf "$TEMP_DIR"
     fi
@@ -107,6 +114,7 @@ display_modules() {
         case "$display_module" in tunnel) display_name="QUIC" ;; proxy) display_name="Proxy" ;; web) display_name="Web" ;; esac
         display_result="${display_result:+$display_result、}$display_name"
     done
+    [ -n "$display_result" ] || display_result="无"
     printf '%s\n' "$display_result"
 }
 
@@ -233,7 +241,7 @@ prepare_release() {
 module_config() {
     case "$1" in
         tunnel) MODULE_CONFIG=$TUNNEL_CONFIG; MODULE_EXAMPLE="server.example.toml" ;;
-        proxy) MODULE_CONFIG="$ETC_DIR/proxy/proxy.toml"; MODULE_EXAMPLE="proxy.example.toml" ;;
+        proxy) MODULE_CONFIG=$PROXY_CONFIG; MODULE_EXAMPLE="proxy.example.toml" ;;
         web) MODULE_CONFIG="$ETC_DIR/web/web.toml"; MODULE_EXAMPLE="web.example.toml" ;;
     esac
 }
@@ -347,7 +355,7 @@ rollback_install() {
     TRANSACTION=0
     warn "启动失败，正在恢复原版本"
     "$SYSTEMCTL" stop gaterust.service >/dev/null 2>&1 || true
-    cleanup_generated_tunnel_files
+    cleanup_generated_files
     restore_backup "$BIN" binary
     restore_backup "$CTL" control
     restore_backup "$UNIT_FILE" unit
@@ -388,6 +396,9 @@ install_module_files() {
         case "$install_module" in tunnel) eval_source=${TUNNEL_INSTALL_SOURCE:-${TUNNEL_SOURCE:-}} ;; proxy) eval_source=${PROXY_SOURCE:-} ;; web) eval_source=${WEB_SOURCE:-} ;; esac
         if [ -n "$eval_source" ] && [ ! -f "$MODULE_CONFIG" ]; then
             atomic_install "$eval_source" "$MODULE_CONFIG" 0640 root gaterust
+            if [ "$install_module" = proxy ] && [ -n "${GENERATED_PROXY_CONFIG:-}" ] && [ "$eval_source" = "$GENERATED_PROXY_CONFIG" ]; then
+                GENERATED_PROXY_CONFIG_INSTALLED=1
+            fi
         elif [ ! -f "$MODULE_CONFIG" ] && [ ! -f "$ETC_DIR/$install_module/$MODULE_EXAMPLE" ]; then
             atomic_install "$package/config/$MODULE_EXAMPLE" "$ETC_DIR/$install_module/$MODULE_EXAMPLE" 0640 root gaterust
         fi
@@ -458,10 +469,13 @@ perform_install() {
         stop) "$SYSTEMCTL" disable --now gaterust.service >/dev/null 2>&1 || true ;;
     esac
     GENERATED_TUNNEL_FILES_INSTALLED=0
+    GENERATED_PROXY_CONFIG_INSTALLED=0
     TRANSACTION=0
     rm -f "$LEGACY_CTL"
     rm -rf "$TEMP_DIR/web.old"
-    say "GateRust $SCRIPT_VERSION 安装完成，模块：$(display_modules "$NEW_MODULES")"
+    say "GateRust $SCRIPT_VERSION 安装完成"
+    say "已安装模块：$(display_modules "$NEW_MODULES")"
+    say "服务配置模块：$(display_modules "$RUN_MODULES")"
     if [ -n "${GENERATED_WEB_PASSWORD:-}" ]; then
         say "Web 管理地址：http://127.0.0.1:8080/"
         say "Web 管理用户：admin"
@@ -472,6 +486,10 @@ perform_install() {
         say "QUIC TLS 已自动初始化（自签名证书，服务器名称：gaterust.local）"
         say "QUIC CA 证书：/etc/gaterust/tunnel/server.pem"
         warn "客户端需要信任该证书，并将 TLS 服务器名称设置为 gaterust.local"
+    fi
+    if [ -n "${GENERATED_PROXY_CONFIG:-}" ]; then
+        say "Proxy 已自动初始化（HTTP 0.0.0.0:80，HTTPS 0.0.0.0:443）"
+        say "自动 SSL 尚无托管证书，请通过 Web 或 /etc/gaterust/proxy/proxy.toml 添加真实域名和证书配置"
     fi
 }
 
@@ -505,8 +523,8 @@ interactive_modules() {
 
 choose_configs() {
     TUNNEL_SOURCE="" TUNNEL_INSTALL_SOURCE="" PROXY_SOURCE="" WEB_SOURCE="" EXAMPLE_SELECTED=0
-    GENERATED_TUNNEL_CERTIFICATE="" GENERATED_TUNNEL_PRIVATE_KEY="" GENERATED_WEB_PASSWORD=""
-    GENERATED_TUNNEL_FILES_INSTALLED=0
+    GENERATED_TUNNEL_CERTIFICATE="" GENERATED_TUNNEL_PRIVATE_KEY="" GENERATED_PROXY_CONFIG="" GENERATED_WEB_PASSWORD=""
+    GENERATED_TUNNEL_FILES_INSTALLED=0 GENERATED_PROXY_CONFIG_INSTALLED=0
     for choose_module in tunnel proxy web; do
         has_module "$NEW_MODULES" "$choose_module" || continue
         module_config "$choose_module"
@@ -525,11 +543,12 @@ choose_configs() {
                     esac
                     ;;
                 proxy)
-                    say "Proxy 配置：1. 导入已有配置  2. 仅安装示例配置"
-                    tty_read "请选择 [默认 2]："
-                    case "${REPLY:-2}" in
-                        1) tty_read "请输入配置文件路径："; [ -f "$REPLY" ] || die "配置文件不存在：$REPLY"; choose_source=$REPLY ;;
-                        2) choose_source=""; EXAMPLE_SELECTED=1 ;;
+                    say "Proxy 配置：1. 自动生成最小配置  2. 导入已有配置  3. 仅安装示例配置"
+                    tty_read "请选择 [默认 1]："
+                    case "${REPLY:-1}" in
+                        1) generate_proxy_config; choose_source=$GENERATED_PROXY_CONFIG ;;
+                        2) tty_read "请输入配置文件路径："; [ -f "$REPLY" ] || die "配置文件不存在：$REPLY"; choose_source=$REPLY ;;
+                        3) choose_source=""; EXAMPLE_SELECTED=1 ;;
                         *) die "无效选择" ;;
                     esac
                     ;;
@@ -549,6 +568,9 @@ choose_configs() {
             if [ "$choose_module" = tunnel ] && [ "$INIT_TUNNEL" -eq 1 ]; then
                 generate_tunnel_config
                 choose_source=$GENERATED_TUNNEL_CHECK_CONFIG
+            elif [ "$choose_module" = proxy ] && [ "$INIT_PROXY" -eq 1 ]; then
+                generate_proxy_config
+                choose_source=$GENERATED_PROXY_CONFIG
             elif [ -z "$choose_source" ] && [ "$choose_module" = web ]; then
                 generate_web_config
                 choose_source=$GENERATED_WEB_CONFIG
@@ -607,6 +629,25 @@ generate_tunnel_config() {
     TUNNEL_INSTALL_SOURCE=$GENERATED_TUNNEL_CONFIG
 }
 
+require_proxy_init_target_available() {
+    [ ! -e "$PROXY_CONFIG" ] || die "Proxy 正式配置已存在，不能自动初始化"
+}
+
+generate_proxy_config() {
+    require_proxy_init_target_available
+    GENERATED_PROXY_CONFIG="$TEMP_DIR/proxy.toml"
+    (
+        umask 077
+        {
+            printf '%s\n' '[proxy]'
+            printf '%s\n' 'http_bind = "0.0.0.0:80"'
+            printf '%s\n' 'https_bind = "0.0.0.0:443"'
+            printf '%s\n' 'cache_dir = "/var/lib/gaterust/proxy/acme"'
+            printf '%s\n' 'max_connections = 2048'
+        } > "$GENERATED_PROXY_CONFIG"
+    )
+}
+
 generate_web_config() {
     GENERATED_WEB_PASSWORD=$(random_hex 16)
     generated_jwt_secret=$(random_hex 32)
@@ -644,7 +685,12 @@ install_command() {
         [ -z "$TUNNEL_SOURCE_ARG" ] || die "--init-tunnel 不能与 --tunnel-config 同时使用"
         require_tunnel_init_targets_available
     fi
-    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$INIT_TUNNEL" -eq 0 ] && [ "$had_state" -eq 1 ] && [ "$STATE_VERSION" = "$SCRIPT_VERSION" ] && [ "$NEW_MODULES" = "$existing_modules" ]; then
+    if [ "$INIT_PROXY" -eq 1 ]; then
+        has_module "$NEW_MODULES" proxy || die "--init-proxy 需要安装 Proxy 模块"
+        [ -z "$PROXY_SOURCE_ARG" ] || die "--init-proxy 不能与 --proxy-config 同时使用"
+        require_proxy_init_target_available
+    fi
+    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$INIT_TUNNEL" -eq 0 ] && [ "$INIT_PROXY" -eq 0 ] && [ "$had_state" -eq 1 ] && [ "$STATE_VERSION" = "$SCRIPT_VERSION" ] && [ "$NEW_MODULES" = "$existing_modules" ]; then
         say "GateRust $SCRIPT_VERSION 和所选模块已安装，无需更新"
         release_lock
         return
@@ -981,7 +1027,7 @@ interactive_main() {
 }
 
 REQUEST_MODULES="" TUNNEL_SOURCE_ARG="" PROXY_SOURCE_ARG="" WEB_SOURCE_ARG=""
-START_MODE=default INTERACTIVE=0 ASSUME_YES=0 KEEP_CONFIG=0 UNINSTALL_ALL=0 FORCE_INSTALL=0 INIT_TUNNEL=0
+START_MODE=default INTERACTIVE=0 ASSUME_YES=0 KEEP_CONFIG=0 UNINSTALL_ALL=0 FORCE_INSTALL=0 INIT_TUNNEL=0 INIT_PROXY=0
 [ "${GATERUST_LIBRARY_ONLY:-0}" -eq 1 ] && return 0
 command_name=${1:-}
 case "$command_name" in
@@ -997,6 +1043,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --modules) [ "$#" -ge 2 ] || die "--modules 缺少参数"; REQUEST_MODULES=$2; shift 2 ;;
         --init-tunnel) INIT_TUNNEL=1; shift ;;
+        --init-proxy) INIT_PROXY=1; shift ;;
         --tunnel-config) [ "$#" -ge 2 ] || die "--tunnel-config 缺少参数"; TUNNEL_SOURCE_ARG=$2; shift 2 ;;
         --proxy-config) [ "$#" -ge 2 ] || die "--proxy-config 缺少参数"; PROXY_SOURCE_ARG=$2; shift 2 ;;
         --web-config) [ "$#" -ge 2 ] || die "--web-config 缺少参数"; WEB_SOURCE_ARG=$2; shift 2 ;;

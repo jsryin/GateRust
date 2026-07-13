@@ -11,6 +11,8 @@ TUNNEL_DIR=/etc/gaterust/tunnel
 TUNNEL_CONFIG=$TUNNEL_DIR/server.toml
 TUNNEL_CERTIFICATE=$TUNNEL_DIR/server.pem
 TUNNEL_PRIVATE_KEY=$TUNNEL_DIR/server-key.pem
+PROXY_DIR=/etc/gaterust/proxy
+PROXY_CONFIG=$PROXY_DIR/proxy.toml
 
 SERVER_PID=""
 SERVER_LOG=""
@@ -211,8 +213,9 @@ ensure_clean_vm() {
 verify_install() {
     local default_install=$1 expect_running=$2
     local state modules expected_state service_environment service_environment_attributes
+    local proxy_config expected_proxy_config
     local attempt tunnel_mode proxy_mode tunnel_config_attributes tunnel_certificate_attributes
-    local tunnel_private_key_attributes
+    local tunnel_private_key_attributes proxy_config_attributes proxy_http_status
     as_root test -x /usr/local/bin/gaterust-server || die "服务端二进制未安装"
     as_root test -x /usr/local/sbin/gaterust || die "管理脚本未安装"
     as_root test -f /etc/systemd/system/gaterust.service || die "systemd unit 未安装"
@@ -237,26 +240,41 @@ verify_install() {
         as_root test -f "$TUNNEL_CONFIG" || die "QUIC 正式配置不存在"
         as_root test -f "$TUNNEL_CERTIFICATE" || die "QUIC 证书不存在"
         as_root test -f "$TUNNEL_PRIVATE_KEY" || die "QUIC 私钥不存在"
-        as_root test ! -f /etc/gaterust/proxy/proxy.toml || die "Proxy 示例配置不应成为正式配置"
+        as_root test -f "$PROXY_CONFIG" || die "Proxy 正式配置不存在"
+        proxy_config=$(as_root cat "$PROXY_CONFIG")
+        expected_proxy_config=$(printf '%s\n' \
+            '[proxy]' \
+            'http_bind = "0.0.0.0:80"' \
+            'https_bind = "0.0.0.0:443"' \
+            'cache_dir = "/var/lib/gaterust/proxy/acme"' \
+            'max_connections = 2048')
+        [[ "$proxy_config" == "$expected_proxy_config" ]] ||
+            die "Proxy 自动初始化配置内容不正确"
         tunnel_config_attributes=$(as_root stat -c '%a %U %G' "$TUNNEL_CONFIG")
         tunnel_certificate_attributes=$(as_root stat -c '%a %U %G' "$TUNNEL_CERTIFICATE")
         tunnel_private_key_attributes=$(as_root stat -c '%a %U %G' "$TUNNEL_PRIVATE_KEY")
+        proxy_config_attributes=$(as_root stat -c '%a %U %G' "$PROXY_CONFIG")
         [[ "$tunnel_config_attributes" == "640 root gaterust" ]] ||
             die "QUIC 配置权限不正确：$tunnel_config_attributes"
         [[ "$tunnel_certificate_attributes" == "640 root gaterust" ]] ||
             die "QUIC 证书权限不正确：$tunnel_certificate_attributes"
         [[ "$tunnel_private_key_attributes" == "640 root gaterust" ]] ||
             die "QUIC 私钥权限不正确：$tunnel_private_key_attributes"
+        [[ "$proxy_config_attributes" == "640 root gaterust" ]] ||
+            die "Proxy 配置权限不正确：$proxy_config_attributes"
         as_root openssl x509 -in "$TUNNEL_CERTIFICATE" -noout -checkhost gaterust.local >/dev/null ||
             die "QUIC 证书不包含 gaterust.local"
         as_root /usr/local/bin/gaterust-server check-config \
             --enable-tunnel --tunnel-config "$TUNNEL_CONFIG" ||
             die "QUIC 自动初始化配置校验失败"
+        as_root /usr/local/bin/gaterust-server check-config \
+            --enable-proxy --proxy-config "$PROXY_CONFIG" ||
+            die "Proxy 自动初始化配置校验失败"
         [[ "$service_environment" == *"--enable-tunnel"* ]] || die "服务参数未启用 QUIC"
+        [[ "$service_environment" == *"--enable-proxy"* ]] || die "服务参数未启用 Proxy"
         [[ "$service_environment" == *"--enable-web"* ]] || die "服务参数未启用 Web"
-        [[ "$service_environment" != *"--enable-proxy"* ]] || die "服务参数不应启用未配置的 Proxy"
         tunnel_mode=$(as_root stat -c '%a' "$TUNNEL_DIR")
-        proxy_mode=$(as_root stat -c '%a' /etc/gaterust/proxy)
+        proxy_mode=$(as_root stat -c '%a' "$PROXY_DIR")
         [[ "$tunnel_mode" == 770 && "$proxy_mode" == 770 ]] || die "Web 配置目录权限不正确"
         as_root grep -Fq -- '-/etc/gaterust/tunnel' /etc/systemd/system/gaterust.service ||
             die "systemd 未放行 Web 写入 QUIC 配置目录"
@@ -267,15 +285,26 @@ verify_install() {
         as_root systemctl is-active --quiet gaterust.service || die "GateRust 服务未运行"
         if [[ "$service_environment" == *"--enable-web"* ]]; then
             for attempt in {1..50}; do
-                curl -fsS http://127.0.0.1:8080/ >/dev/null && break
+                curl --noproxy '*' -fsS http://127.0.0.1:8080/ >/dev/null && break
                 sleep 0.1
             done
-            curl -fsS http://127.0.0.1:8080/ >/dev/null || die "Web 管理界面未响应"
+            curl --noproxy '*' -fsS http://127.0.0.1:8080/ >/dev/null || die "Web 管理界面未响应"
+        fi
+        if [[ "$service_environment" == *"--enable-proxy"* ]]; then
+            proxy_http_status=""
+            for attempt in {1..50}; do
+                proxy_http_status=$(curl -sS -o /dev/null -w '%{http_code}' \
+                    --noproxy '*' --max-time 1 http://127.0.0.1/ 2>/dev/null || true)
+                [[ "$proxy_http_status" == 404 ]] && break
+                sleep 0.1
+            done
+            [[ "$proxy_http_status" == 404 ]] ||
+                die "Proxy HTTP 监听未返回预期的 404，实际状态：${proxy_http_status:-无响应}"
         fi
     fi
 
     /usr/local/sbin/gaterust status
-    say "本地 Release 安装及 Web 启动验证通过。"
+    say "本地 Release 安装及 QUIC、Proxy、Web 启动验证通过。"
     say "测试完成后可执行：$0 uninstall"
 }
 
@@ -292,7 +321,7 @@ test_release() {
     start_server
 
     local base_url="http://$SERVER_HOST:$SERVER_PORT" default_install=1 expect_running=1 argument
-    local installer_args=(install --modules tunnel,proxy,web --init-tunnel --enable)
+    local installer_args=(install --modules tunnel,proxy,web --init-tunnel --init-proxy --enable)
     if [[ $# -gt 0 ]]; then
         [[ $1 == -- ]] || die "自定义安装参数前需要使用 --"
         shift
