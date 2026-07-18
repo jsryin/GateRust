@@ -1,9 +1,11 @@
-use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, future::Future, net::SocketAddr, path::Path, sync::Arc, time::Duration,
+};
 
 use quinn::{Connection, VarInt};
 use tokio::{
     net::{TcpStream, UdpSocket},
-    sync::RwLock,
+    sync::{RwLock, watch},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
@@ -26,6 +28,17 @@ use crate::{
 
 const CLOSE_RECONFIGURE: VarInt = VarInt::from_u32(10);
 const CLOSE_SHUTDOWN: VarInt = VarInt::from_u32(11);
+
+/// 客户端连接状态，供本机管理界面展示。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClientStatus {
+    Starting,
+    Unconfigured { reason: String },
+    Connecting { server: String },
+    Connected { server: String, device_id: String },
+    Reconnecting { error: String, retry_seconds: u64 },
+    Stopped { reason: Option<String> },
+}
 
 /// 运行隧道客户端，监听配置变化并在连接断开后自动重试。
 ///
@@ -56,19 +69,38 @@ pub async fn run_client_with_shutdown(
     config_path: impl AsRef<Path>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let (status, _status_receiver) = watch::channel(ClientStatus::Starting);
+    run_client_with_status(config_path, shutdown, status).await
+}
+
+/// 运行隧道客户端，并发布连接状态变化。
+///
+/// # Errors
+///
+/// 初始配置无效或无法创建文件监听器时返回错误。连接类错误会在内部退避重试。
+pub async fn run_client_with_status(
+    config_path: impl AsRef<Path>,
+    shutdown: CancellationToken,
+    status: watch::Sender<ClientStatus>,
+) -> Result<()> {
     let config_path = config_path.as_ref().to_owned();
     let mut config = ClientConfig::load(&config_path)?;
     let mut identity = DeviceIdentity::load(&config_path)?;
     let mut watcher = ConfigWatcher::new(&config_path)?;
     let mut retry = Duration::from_secs(1);
+    let mut stop_reason = None;
 
     while !shutdown.is_cancelled() {
+        status.send_replace(ClientStatus::Connecting {
+            server: config.server.address.clone(),
+        });
         match connect_and_run(
             config.clone(),
             &identity,
             &config_path,
             &mut watcher,
             &shutdown,
+            &status,
         )
         .await
         {
@@ -77,6 +109,10 @@ pub async fn run_client_with_shutdown(
                 retry = Duration::from_secs(1);
             }
             ConnectionEnd::Disconnected(error) => {
+                status.send_replace(ClientStatus::Reconnecting {
+                    error: error.to_string(),
+                    retry_seconds: retry.as_secs(),
+                });
                 tracing::warn!(%error, delay_seconds = retry.as_secs(), "隧道连接断开，稍后重试");
                 tokio::select! {
                     () = shutdown.cancelled() => break,
@@ -98,12 +134,16 @@ pub async fn run_client_with_shutdown(
                 retry = Duration::from_secs(1);
             }
             ConnectionEnd::AdministratorDisconnected => {
+                stop_reason = Some("客户端已被管理员下线".into());
                 tracing::warn!(device_id = identity.as_str(), "客户端已被管理员下线");
                 break;
             }
             ConnectionEnd::Shutdown => break,
         }
     }
+    status.send_replace(ClientStatus::Stopped {
+        reason: stop_reason,
+    });
     tracing::info!("QUIC 隧道客户端已停止");
     Ok(())
 }
@@ -116,16 +156,34 @@ enum ConnectionEnd {
     Shutdown,
 }
 
+enum ConnectionStep<T> {
+    Completed(T),
+    Reconfigure(ClientConfig),
+    Shutdown,
+    WatcherClosed,
+}
+
 async fn connect_and_run(
     mut config: ClientConfig,
     identity: &DeviceIdentity,
     config_path: &Path,
     watcher: &mut ConfigWatcher,
     shutdown: &CancellationToken,
+    status: &watch::Sender<ClientStatus>,
 ) -> ConnectionEnd {
-    let server_address = match resolve_one(&config.server.address).await {
-        Ok(address) => address,
-        Err(error) => return ConnectionEnd::Disconnected(error),
+    let server_address = match wait_for_connection_step(
+        resolve_one(&config.server.address),
+        config_path,
+        watcher,
+        shutdown,
+    )
+    .await
+    {
+        ConnectionStep::Completed(Ok(address)) => address,
+        ConnectionStep::Completed(Err(error)) => return ConnectionEnd::Disconnected(error),
+        ConnectionStep::Reconfigure(updated) => return ConnectionEnd::Reconfigure(updated),
+        ConnectionStep::Shutdown => return ConnectionEnd::Shutdown,
+        ConnectionStep::WatcherClosed => return config_watcher_closed(),
     };
     let endpoint =
         match tls::client_endpoint(server_address, config.server.ca_certificate.as_deref()) {
@@ -140,14 +198,41 @@ async fn connect_and_run(
         Ok(connecting) => connecting,
         Err(error) => return ConnectionEnd::Disconnected(error.into()),
     };
-    let connection = tokio::select! {
-        () = shutdown.cancelled() => return ConnectionEnd::Shutdown,
-        result = connecting => match result {
-            Ok(connection) => connection,
-            Err(error) => return ConnectionEnd::Disconnected(error.into()),
+    let connection = match wait_for_connection_step(connecting, config_path, watcher, shutdown)
+        .await
+    {
+        ConnectionStep::Completed(Ok(connection)) => connection,
+        ConnectionStep::Completed(Err(error)) => return ConnectionEnd::Disconnected(error.into()),
+        ConnectionStep::Reconfigure(updated) => return ConnectionEnd::Reconfigure(updated),
+        ConnectionStep::Shutdown => return ConnectionEnd::Shutdown,
+        ConnectionStep::WatcherClosed => return config_watcher_closed(),
+    };
+    let authentication = match wait_for_connection_step(
+        authenticate(&connection, &config, identity.as_str()),
+        config_path,
+        watcher,
+        shutdown,
+    )
+    .await
+    {
+        ConnectionStep::Completed(result) => result,
+        ConnectionStep::Reconfigure(updated) => {
+            endpoint.close(CLOSE_RECONFIGURE, b"client configuration changed");
+            endpoint.wait_idle().await;
+            return ConnectionEnd::Reconfigure(updated);
+        }
+        ConnectionStep::Shutdown => {
+            endpoint.close(CLOSE_SHUTDOWN, b"client shutting down");
+            endpoint.wait_idle().await;
+            return ConnectionEnd::Shutdown;
+        }
+        ConnectionStep::WatcherClosed => {
+            endpoint.close(CLOSE_SHUTDOWN, b"configuration watcher closed");
+            endpoint.wait_idle().await;
+            return config_watcher_closed();
         }
     };
-    let mut control_send = match authenticate(&connection, &config, identity.as_str()).await {
+    let mut control_send = match authentication {
         Ok(AuthenticationResult::Accepted(control_send)) => control_send,
         Ok(AuthenticationResult::DeviceIdConflict) => {
             endpoint.close(CLOSE_SHUTDOWN, b"device id conflict");
@@ -165,6 +250,10 @@ async fn connect_and_run(
         device_id = identity.as_str(),
         "已连接 QUIC 隧道服务端"
     );
+    status.send_replace(ClientStatus::Connected {
+        server: config.server.address.clone(),
+        device_id: identity.as_str().into(),
+    });
     let services = Arc::new(RwLock::new(service_map(&config.services)));
     let result = run_connected(
         &connection,
@@ -183,6 +272,36 @@ async fn connect_and_run(
     endpoint.close(close, b"client connection ending");
     endpoint.wait_idle().await;
     result
+}
+
+async fn wait_for_connection_step<T>(
+    future: impl Future<Output = T>,
+    config_path: &Path,
+    watcher: &mut ConfigWatcher,
+    shutdown: &CancellationToken,
+) -> ConnectionStep<T> {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return ConnectionStep::Completed(result),
+            () = shutdown.cancelled() => return ConnectionStep::Shutdown,
+            changed = watcher.changed() => {
+                if !changed {
+                    return ConnectionStep::WatcherClosed;
+                }
+                match ClientConfig::load(config_path) {
+                    Ok(updated) => return ConnectionStep::Reconfigure(updated),
+                    Err(error) => {
+                        tracing::error!(%error, "新客户端配置无效，继续使用当前配置");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn config_watcher_closed() -> ConnectionEnd {
+    ConnectionEnd::Disconnected(TunnelError::Protocol("配置监听器已关闭".into()))
 }
 
 enum AuthenticationResult {
@@ -450,4 +569,46 @@ fn is_administrator_disconnect(error: &quinn::ConnectionError) -> bool {
         quinn::ConnectionError::ApplicationClosed(close)
             if close.error_code == VarInt::from_u32(ADMINISTRATOR_CLOSE_CODE)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn configuration_change_interrupts_connection_step() {
+        let directory = tempfile::tempdir().expect("创建临时目录");
+        let path = directory.path().join("client.toml");
+        ClientConfig::ensure_exists(&path).expect("创建初始客户端配置");
+        let mut watcher = ConfigWatcher::new(&path).expect("创建配置监听器");
+        let update_path = path.clone();
+        let update = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let mut config = ClientConfig::read(&update_path).expect("读取初始客户端配置");
+            config.server.address = "127.0.0.1:24444".into();
+            config.save(&update_path).expect("保存更新后的客户端配置");
+        });
+        let cancellation = CancellationToken::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_connection_step(
+                std::future::pending::<()>(),
+                &path,
+                &mut watcher,
+                &cancellation,
+            ),
+        )
+        .await
+        .expect("配置变化应及时打断连接步骤");
+        update.await.expect("配置更新任务应正常完成");
+        match result {
+            ConnectionStep::Reconfigure(config) => {
+                assert_eq!(config.server.address, "127.0.0.1:24444");
+            }
+            ConnectionStep::Completed(())
+            | ConnectionStep::Shutdown
+            | ConnectionStep::WatcherClosed => panic!("连接步骤返回了非预期状态"),
+        }
+    }
 }

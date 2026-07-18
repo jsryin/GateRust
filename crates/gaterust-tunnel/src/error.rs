@@ -10,6 +10,13 @@ pub enum TunnelError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("序列化配置 {path} 失败: {source}")]
+    SerializeConfig {
+        path: PathBuf,
+        source: toml::ser::Error,
+    },
+    #[error("写入配置 {path} 失败: {source}")]
+    WriteConfig { path: PathBuf, source: io::Error },
     #[error("配置无效: {0}")]
     InvalidConfig(String),
     #[error("地址无效: {0}")]

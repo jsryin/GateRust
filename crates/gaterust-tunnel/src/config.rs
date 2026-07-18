@@ -1,10 +1,13 @@
 use std::{
     collections::HashSet,
+    fs::OpenOptions,
+    io::{ErrorKind, Write as _},
     net::SocketAddr,
     num::NonZeroU64,
     path::{Path, PathBuf},
 };
 
+use rand::RngExt as _;
 use rand::distr::{Alphanumeric, SampleString as _};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize as _;
@@ -215,26 +218,103 @@ impl ServerConfig {
 }
 
 impl ClientConfig {
+    /// 创建可由本机管理界面继续编辑的初始客户端配置。
+    #[must_use]
+    pub fn initial() -> Self {
+        Self {
+            key: generate_group_key(),
+            server: ClientServerConfig {
+                address: String::new(),
+                name: None,
+                ca_certificate: None,
+            },
+            services: Vec::new(),
+        }
+    }
+
+    /// 配置文件不存在时创建初始配置，已存在时保持原内容不变。
+    ///
+    /// # Errors
+    ///
+    /// 无法创建目录、序列化配置或写入文件时返回错误。
+    pub fn ensure_exists(path: &Path) -> Result<bool> {
+        if path
+            .try_exists()
+            .map_err(|source| TunnelError::WriteConfig {
+                path: path.to_owned(),
+                source,
+            })?
+        {
+            return Ok(false);
+        }
+        let content = serialize_client_config(&Self::initial(), path)?;
+        let parent = config_parent(path);
+        std::fs::create_dir_all(parent).map_err(|source| TunnelError::WriteConfig {
+            path: path.to_owned(),
+            source,
+        })?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => return Ok(false),
+            Err(source) => {
+                return Err(TunnelError::WriteConfig {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        };
+        if let Err(source) = file
+            .write_all(content.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            cleanup_file(path);
+            return Err(TunnelError::WriteConfig {
+                path: path.to_owned(),
+                source,
+            });
+        }
+        Ok(true)
+    }
+
+    /// 读取客户端配置，保留配置中的相对路径。
+    ///
+    /// # Errors
+    ///
+    /// 文件不可读或 TOML 格式错误时返回错误。
+    pub fn read(path: &Path) -> Result<Self> {
+        parse_client_config(path)
+    }
+
     /// 读取并验证客户端配置，相对路径以配置文件所在目录为基准。
     ///
     /// # Errors
     ///
     /// 文件不可读、TOML 格式错误或字段不满足约束时返回错误。
     pub fn load(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path).map_err(|source| TunnelError::ReadConfig {
-            path: path.to_owned(),
-            source,
-        })?;
-        let mut config: Self =
-            toml::from_str(&content).map_err(|source| TunnelError::ParseConfig {
-                path: path.to_owned(),
-                source,
-            })?;
+        let mut config = Self::read(path)?;
+        config.validate()?;
         if let Some(certificate) = &mut config.server.ca_certificate {
             resolve_path(path, certificate);
         }
-        config.validate()?;
         Ok(config)
+    }
+
+    /// 校验并保存客户端配置。
+    ///
+    /// # Errors
+    ///
+    /// 字段不满足约束、无法序列化或无法写入文件时返回错误。
+    pub fn save(&self, path: &Path) -> Result<()> {
+        self.validate()?;
+        let content = serialize_client_config(self, path)?;
+        write_client_config(path, content.as_bytes())
     }
 
     /// 验证客户端配置中的认证信息和服务声明。
@@ -292,6 +372,85 @@ impl ClientConfig {
         }
         address_host(&self.server.address)
             .ok_or_else(|| TunnelError::InvalidConfig("无法从服务器地址推导 TLS 服务器名称".into()))
+    }
+}
+
+fn parse_client_config(path: &Path) -> Result<ClientConfig> {
+    let content = std::fs::read_to_string(path).map_err(|source| TunnelError::ReadConfig {
+        path: path.to_owned(),
+        source,
+    })?;
+    toml::from_str(&content).map_err(|source| TunnelError::ParseConfig {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn serialize_client_config(config: &ClientConfig, path: &Path) -> Result<String> {
+    toml::to_string_pretty(config).map_err(|source| TunnelError::SerializeConfig {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn write_client_config(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = config_parent(path);
+    std::fs::create_dir_all(parent).map_err(|source| TunnelError::WriteConfig {
+        path: path.to_owned(),
+        source,
+    })?;
+    let temporary = parent.join(format!(
+        ".gaterust-client-{:016x}.tmp",
+        rand::rng().random::<u64>()
+    ));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        replace_file(&temporary, path)
+    })();
+    if let Err(source) = result {
+        cleanup_file(&temporary);
+        return Err(TunnelError::WriteConfig {
+            path: path.to_owned(),
+            source,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(temporary, path)
+}
+
+#[cfg(windows)]
+fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    // Windows 标准库不能用 rename 覆盖现有文件，先同步写入再完成替换。
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(temporary, path)
+}
+
+fn config_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn cleanup_file(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), %error, "清理未完成的客户端配置失败");
     }
 }
 
@@ -434,5 +593,80 @@ mod tests {
         );
         config.server.address = "[::1]:2333".into();
         assert_eq!(config.server_name().expect("应推导 IPv6"), "::1");
+    }
+
+    #[test]
+    fn creates_initial_client_config_without_overwriting() {
+        let directory = tempfile::tempdir().expect("创建临时目录");
+        let path = directory.path().join("nested/client.toml");
+        assert!(ClientConfig::ensure_exists(&path).expect("创建初始配置"));
+        let initial = ClientConfig::read(&path).expect("读取初始配置");
+        assert!(initial.server.address.is_empty());
+        assert!(initial.services.is_empty());
+        assert!(ClientConfig::load(&path).is_err());
+        let content = std::fs::read_to_string(&path).expect("读取初始配置内容");
+
+        assert!(!ClientConfig::ensure_exists(&path).expect("保留已有配置"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("再次读取配置内容"),
+            content
+        );
+    }
+
+    #[test]
+    fn saves_valid_client_config_and_resolves_runtime_path() {
+        let directory = tempfile::tempdir().expect("创建临时目录");
+        let path = directory.path().join("client.toml");
+        let mut config = ClientConfig::initial();
+        config.server.address = "tunnel.example.com:2333".into();
+        config.server.ca_certificate = Some("certs/ca.pem".into());
+        config.services.push(ClientServiceConfig {
+            name: "ssh".into(),
+            kind: TunnelKind::Tcp,
+            target: Some("127.0.0.1:22".into()),
+        });
+        config.save(&path).expect("保存客户端配置");
+
+        let stored = ClientConfig::read(&path).expect("读取客户端配置");
+        assert_eq!(
+            stored.server.ca_certificate.as_deref(),
+            Some(Path::new("certs/ca.pem"))
+        );
+        let runtime = ClientConfig::load(&path).expect("加载运行时客户端配置");
+        assert_eq!(
+            runtime.server.ca_certificate.as_deref(),
+            Some(directory.path().join("certs/ca.pem").as_path())
+        );
+    }
+
+    #[test]
+    fn invalid_client_config_does_not_replace_existing_file() {
+        let directory = tempfile::tempdir().expect("创建临时目录");
+        let path = directory.path().join("client.toml");
+        ClientConfig::ensure_exists(&path).expect("创建初始配置");
+        let content = std::fs::read_to_string(&path).expect("读取初始配置内容");
+        let mut config = ClientConfig::read(&path).expect("读取初始配置");
+        config.key.clear();
+
+        assert!(config.save(&path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("读取未修改的配置"),
+            content
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creates_private_client_config_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("创建临时目录");
+        let path = directory.path().join("client.toml");
+        ClientConfig::ensure_exists(&path).expect("创建初始配置");
+        let mode = std::fs::metadata(path)
+            .expect("读取配置元数据")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

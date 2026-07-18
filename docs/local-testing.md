@@ -28,6 +28,8 @@ cargo run -p gaterust-client -- \
   --config config/client.toml
 ```
 
+客户端同时启动本机配置界面，可访问 `http://127.0.0.1:47823/` 查看连接状态或修改配置。纯命令行测试可添加 `--no-open`，配置文件仍会正常热更新。
+
 启动 Web 控制台：
 
 ```bash
@@ -82,6 +84,7 @@ pkill -TERM -x gaterust-server
 
 ```bash
 RUST_LOG=info cargo run -p gaterust-client -- \
+  --no-open \
   --config config/client.toml
 ```
 
