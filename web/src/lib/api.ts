@@ -49,8 +49,8 @@ export const saveProxy = (token: string, config: ProxyConfig) =>
 export const generateKey = (token: string) =>
   request<{ key: string }>('/api/groups/key', token, { method: 'POST' });
 
-export const getTunnelRuntime = (token: string) =>
-  request<TunnelRuntimeState>('/api/tunnel/runtime', token);
+export const getTunnelRuntime = (token: string, signal?: AbortSignal) =>
+  request<TunnelRuntimeState>('/api/tunnel/runtime', token, { signal });
 
 export const disconnectTunnelClient = (token: string, sessionId: number) =>
   request<void>(`/api/tunnel/sessions/${sessionId}`, token, { method: 'DELETE' });
