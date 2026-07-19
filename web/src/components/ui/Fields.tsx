@@ -57,6 +57,15 @@ export function Field({ children, className, htmlFor, label }: FieldProps) {
   );
 }
 
+export function ValueField({ children, className, label }: Omit<FieldProps, 'htmlFor'>) {
+  return (
+    <div className={classNames('grid min-w-0 content-start gap-1.5', className)}>
+      <span className="txt-compact-xsmall text-[color:var(--fg-muted)]">{label}</span>
+      <span className="txt-compact-small break-all text-[color:var(--fg-base)]">{children}</span>
+    </div>
+  );
+}
+
 interface CheckboxFieldProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 'type'> {
   label: string;
 }

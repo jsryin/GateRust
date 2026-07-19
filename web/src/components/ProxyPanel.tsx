@@ -1,18 +1,28 @@
-import { Globe2, Pencil, Plus, Save, ShieldCheck, Trash2 } from 'lucide-react';
-import { useState } from 'react';
-import { saveProxy } from '../lib/api';
+import { Globe2, Pencil, Plus, ShieldCheck, Trash2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import {
+  createCertificate,
+  createRoute,
+  deleteCertificate,
+  deleteRoute,
+  setProxyListener,
+  updateCertificate,
+  updateRoute
+} from '../lib/api';
 import { errorMessage } from '../lib/errors';
 import type {
   AcmeChallenge,
   CertificateConfig,
   CertificateIssuer,
   ProxyConfig,
+  ProxyListenerConfig,
   RouteConfig
 } from '../lib/types';
 import { Badge } from './ui/Badge';
 import { Button } from './ui/Button';
+import { ConfirmAction } from './ui/ConfirmAction';
 import { Dialog, DialogBody, DialogContent, DialogFooter } from './ui/Dialog';
-import { CheckboxField, Field, Input, Select, Textarea } from './ui/Fields';
+import { CheckboxField, Field, Input, Select, Textarea, ValueField } from './ui/Fields';
 import { FormGrid, PageIntro } from './ui/Page';
 import { EmptyState, Panel, PanelHeader } from './ui/Panel';
 import { Notice } from './ui/Notice';
@@ -25,7 +35,7 @@ interface ProxyPanelProps {
 }
 
 type Tab = 'certificates' | 'routes';
-type Editor = 'certificate' | 'route' | null;
+type Editor = 'listener' | 'certificate' | 'route' | null;
 
 function defaultCertificate(): CertificateConfig {
   return {
@@ -53,14 +63,18 @@ function defaultRoute(): RouteConfig {
   };
 }
 
+function defaultListener(): ProxyListenerConfig {
+  return {
+    http_bind: '0.0.0.0:80',
+    https_bind: '0.0.0.0:443',
+    cache_dir: '/var/lib/gaterust/proxy/acme',
+    max_connections: 2048
+  };
+}
+
 function defaultConfig(): ProxyConfig {
   return {
-    proxy: {
-      http_bind: '0.0.0.0:80',
-      https_bind: '0.0.0.0:443',
-      cache_dir: '/var/lib/gaterust/proxy/acme',
-      max_connections: 2048
-    },
+    proxy: defaultListener(),
     certificates: [],
     routes: []
   };
@@ -70,7 +84,8 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
   const [draft, setDraft] = useState<ProxyConfig>(() => structuredClone(config ?? defaultConfig()));
   const [tab, setTab] = useState<Tab>('certificates');
   const [editor, setEditor] = useState<Editor>(null);
-  const [editIndex, setEditIndex] = useState(-1);
+  const [originalName, setOriginalName] = useState<string | null>(null);
+  const [listener, setListener] = useState<ProxyListenerConfig>(defaultListener);
   const [certificate, setCertificate] = useState<CertificateConfig>(defaultCertificate);
   const [route, setRoute] = useState<RouteConfig>(defaultRoute);
   const [domains, setDomains] = useState('');
@@ -78,23 +93,45 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
 
-  function openCertificate(index = -1) {
-    const next = index >= 0 ? structuredClone(draft.certificates[index]) : defaultCertificate();
-    setEditIndex(index);
+  useEffect(() => {
+    setDraft(structuredClone(config ?? defaultConfig()));
+  }, [config]);
+
+  function openListener() {
+    setOriginalName(null);
+    setListener({ ...draft.proxy });
+    setEditor('listener');
+    setError('');
+  }
+
+  function openCertificate(item?: CertificateConfig) {
+    const next = item ? structuredClone(item) : defaultCertificate();
+    setOriginalName(item?.name ?? null);
     setCertificate(next);
     setDomains(next.domains.join('\n'));
     setEditor('certificate');
     setError('');
   }
 
-  function openRoute(index = -1) {
-    setEditIndex(index);
-    setRoute(index >= 0 ? { ...draft.routes[index] } : defaultRoute());
+  function openRoute(item?: RouteConfig) {
+    setOriginalName(item?.name ?? null);
+    setRoute(item ? { ...item } : defaultRoute());
     setEditor('route');
     setError('');
   }
 
-  function commitCertificate() {
+  async function commitListener() {
+    if (!listener.http_bind || !listener.https_bind || !listener.cache_dir || listener.max_connections < 1) {
+      setError('监听地址、缓存目录不能为空，最大连接数必须大于 0');
+      return;
+    }
+    await persistMutation(
+      () => setProxyListener(token, listener),
+      '代理监听配置已保存；修改监听参数后请重启服务'
+    );
+  }
+
+  async function commitCertificate() {
     const next: CertificateConfig = {
       ...certificate,
       domains: domains.split(/[\s,]+/).filter(Boolean),
@@ -109,55 +146,44 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
       return;
     }
 
-    setDraft((current) => {
-      const certificates = [...current.certificates];
-      if (editIndex >= 0) certificates[editIndex] = next;
-      else certificates.push(next);
-      return { ...current, certificates };
-    });
-    setEditor(null);
+    await persistMutation(
+      () => originalName
+        ? updateCertificate(token, originalName, next)
+        : createCertificate(token, next),
+      originalName ? '证书已保存' : '证书已创建'
+    );
   }
 
-  function commitRoute() {
+  async function commitRoute() {
     if (!route.name || !route.host || !route.upstream) {
       setError('名称、域名和上游地址不能为空');
       return;
     }
 
-    setDraft((current) => {
-      const routes = [...current.routes];
-      if (editIndex >= 0) routes[editIndex] = route;
-      else routes.push(route);
-      return { ...current, routes };
-    });
-    setEditor(null);
+    await persistMutation(
+      () => originalName ? updateRoute(token, originalName, route) : createRoute(token, route),
+      originalName ? '域名路由已保存' : '域名路由已创建'
+    );
   }
 
-  function removeCertificate(index: number) {
-    const name = draft.certificates[index].name;
-    setDraft((current) => ({
-      ...current,
-      certificates: current.certificates.filter((_, currentIndex) => currentIndex !== index),
-      routes: current.routes.map((item) => item.certificate === name ? { ...item, certificate: null } : item)
-    }));
+  async function removeCertificate(name: string) {
+    await persistMutation(() => deleteCertificate(token, name), '证书已删除，关联路由已停用 SSL');
   }
 
-  function removeRoute(index: number) {
-    setDraft((current) => ({
-      ...current,
-      routes: current.routes.filter((_, currentIndex) => currentIndex !== index)
-    }));
+  async function removeRoute(name: string) {
+    await persistMutation(() => deleteRoute(token, name), '域名路由已删除');
   }
 
-  async function persist() {
+  async function persistMutation(action: () => Promise<ProxyConfig>, successMessage: string) {
     setSaving(true);
     setMessage('');
     setError('');
     try {
-      const saved = await saveProxy(token, draft);
+      const saved = await action();
       setDraft(saved);
       onSaved(saved);
-      setMessage('配置已保存；首次启用或修改监听参数时请重启服务');
+      setMessage(successMessage);
+      setEditor(null);
     } catch (cause) {
       setError(errorMessage(cause, '保存失败'));
     } finally {
@@ -167,34 +193,25 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
 
   return (
     <div className="space-y-4">
-      <PageIntro
-        action={(
-          <Button disabled={saving} onClick={() => void persist()}>
-            <Save className="h-4 w-4" />
-            {saving ? '保存中' : '保存配置'}
-          </Button>
-        )}
-        description="管理反向代理入口、ACME 证书与域名路由"
-        title="代理配置"
-      />
+      <PageIntro description="管理反向代理入口、ACME 证书与域名路由" title="代理配置" />
       {message && <Notice tone="success">{message}</Notice>}
       {error && !editor && <Notice tone="error">{error}</Notice>}
 
       <Panel>
-        <PanelHeader description="HTTP、HTTPS 入口与 ACME 缓存" title="代理监听" />
+        <PanelHeader
+          action={(
+            <Button aria-label="修改代理监听" onClick={openListener} size="icon" title="修改" variant="ghost">
+              <Pencil className="h-4 w-4" />
+            </Button>
+          )}
+          description="HTTP、HTTPS 入口与 ACME 缓存"
+          title="代理监听"
+        />
         <FormGrid columns={4}>
-          <Field label="HTTP 地址">
-            <Input onChange={(event) => setDraft((current) => ({ ...current, proxy: { ...current.proxy, http_bind: event.target.value } }))} value={draft.proxy.http_bind} />
-          </Field>
-          <Field label="HTTPS 地址">
-            <Input onChange={(event) => setDraft((current) => ({ ...current, proxy: { ...current.proxy, https_bind: event.target.value } }))} value={draft.proxy.https_bind} />
-          </Field>
-          <Field label="缓存目录">
-            <Input onChange={(event) => setDraft((current) => ({ ...current, proxy: { ...current.proxy, cache_dir: event.target.value } }))} value={draft.proxy.cache_dir} />
-          </Field>
-          <Field label="最大连接数">
-            <Input min="1" onChange={(event) => setDraft((current) => ({ ...current, proxy: { ...current.proxy, max_connections: Number(event.target.value) } }))} type="number" value={draft.proxy.max_connections} />
-          </Field>
+          <ValueField label="HTTP 地址"><code>{draft.proxy.http_bind}</code></ValueField>
+          <ValueField label="HTTPS 地址"><code>{draft.proxy.https_bind}</code></ValueField>
+          <ValueField label="缓存目录"><code>{draft.proxy.cache_dir}</code></ValueField>
+          <ValueField label="最大连接数">{draft.proxy.max_connections.toLocaleString()}</ValueField>
         </FormGrid>
       </Panel>
 
@@ -244,8 +261,8 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
                 </TableRow>
               </TableHeader>
               <tbody>
-                {draft.certificates.map((item, index) => (
-                  <TableRow key={`${item.name}-${index}`}>
+                {draft.certificates.map((item) => (
+                  <TableRow key={item.name}>
                     <TableCell className="font-medium text-[color:var(--fg-base)]">{item.name}</TableCell>
                     <TableCell className="max-w-72 truncate">{item.domains.join(', ')}</TableCell>
                     <TableCell>{item.issuer === 'lets_encrypt' ? "Let's Encrypt" : 'Google Trust Services'}</TableCell>
@@ -253,8 +270,15 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
                     <TableCell><Badge tone={item.production ? 'green' : 'orange'}>{item.production ? '生产' : '测试'}</Badge></TableCell>
                     <TableCell>
                       <div className="flex justify-end gap-1">
-                        <Button aria-label={`编辑 ${item.name}`} onClick={() => openCertificate(index)} size="icon" variant="ghost"><Pencil className="h-4 w-4" /></Button>
-                        <Button aria-label={`删除 ${item.name}`} onClick={() => removeCertificate(index)} size="icon" variant="ghost"><Trash2 className="h-4 w-4 text-[color:var(--tag-red-text)]" /></Button>
+                        <Button aria-label={`编辑 ${item.name}`} onClick={() => openCertificate(item)} size="icon" variant="ghost"><Pencil className="h-4 w-4" /></Button>
+                        <ConfirmAction
+                          confirmLabel="删除"
+                          description="关联域名路由将同时停用 SSL。"
+                          onConfirm={() => removeCertificate(item.name)}
+                          title={`删除证书 ${item.name}？`}
+                        >
+                          <Button aria-label={`删除 ${item.name}`} size="icon" variant="ghost"><Trash2 className="h-4 w-4 text-[color:var(--tag-red-text)]" /></Button>
+                        </ConfirmAction>
                       </div>
                     </TableCell>
                   </TableRow>
@@ -289,16 +313,23 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
                 </TableRow>
               </TableHeader>
               <tbody>
-                {draft.routes.map((item, index) => (
-                  <TableRow key={`${item.name}-${index}`}>
+                {draft.routes.map((item) => (
+                  <TableRow key={item.name}>
                     <TableCell className="font-medium text-[color:var(--fg-base)]">{item.name}</TableCell>
                     <TableCell><code className="text-xs">{item.host}{item.path_prefix}</code></TableCell>
                     <TableCell>{item.upstream}</TableCell>
                     <TableCell>{item.certificate ?? '不启用'}</TableCell>
                     <TableCell>
                       <div className="flex justify-end gap-1">
-                        <Button aria-label={`编辑 ${item.name}`} onClick={() => openRoute(index)} size="icon" variant="ghost"><Pencil className="h-4 w-4" /></Button>
-                        <Button aria-label={`删除 ${item.name}`} onClick={() => removeRoute(index)} size="icon" variant="ghost"><Trash2 className="h-4 w-4 text-[color:var(--tag-red-text)]" /></Button>
+                        <Button aria-label={`编辑 ${item.name}`} onClick={() => openRoute(item)} size="icon" variant="ghost"><Pencil className="h-4 w-4" /></Button>
+                        <ConfirmAction
+                          confirmLabel="删除"
+                          description="删除后，该域名和路径将立即停止代理。"
+                          onConfirm={() => removeRoute(item.name)}
+                          title={`删除路由 ${item.name}？`}
+                        >
+                          <Button aria-label={`删除 ${item.name}`} size="icon" variant="ghost"><Trash2 className="h-4 w-4 text-[color:var(--tag-red-text)]" /></Button>
+                        </ConfirmAction>
                       </div>
                     </TableCell>
                   </TableRow>
@@ -311,15 +342,22 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
         </Panel>
       )}
 
-      <Dialog open={editor !== null} onOpenChange={(open) => !open && setEditor(null)}>
+      <Dialog open={editor !== null} onOpenChange={(open) => !open && !saving && setEditor(null)}>
         {editor && (
           <DialogContent
-            description={editIndex >= 0 ? '修改现有配置项' : '创建新的配置项'}
-            title={editor === 'certificate' ? '托管证书' : '域名路由'}
+            description={editor === 'listener' || originalName ? '修改现有配置项' : '创建新的配置项'}
+            title={editor === 'listener' ? '代理监听' : editor === 'certificate' ? '托管证书' : '域名路由'}
           >
             <DialogBody>
               <div className="grid gap-4 sm:grid-cols-2">
-                {editor === 'certificate' ? (
+                {editor === 'listener' ? (
+                  <>
+                    <Field label="HTTP 地址"><Input onChange={(event) => setListener((current) => ({ ...current, http_bind: event.target.value }))} value={listener.http_bind} /></Field>
+                    <Field label="HTTPS 地址"><Input onChange={(event) => setListener((current) => ({ ...current, https_bind: event.target.value }))} value={listener.https_bind} /></Field>
+                    <Field className="sm:col-span-2" label="缓存目录"><Input onChange={(event) => setListener((current) => ({ ...current, cache_dir: event.target.value }))} value={listener.cache_dir} /></Field>
+                    <Field label="最大连接数"><Input min="1" onChange={(event) => setListener((current) => ({ ...current, max_connections: Number(event.target.value) }))} type="number" value={listener.max_connections} /></Field>
+                  </>
+                ) : editor === 'certificate' ? (
                   <>
                     <Field label="名称"><Input onChange={(event) => setCertificate((current) => ({ ...current, name: event.target.value }))} value={certificate.name} /></Field>
                     <Field label="联系邮箱"><Input onChange={(event) => setCertificate((current) => ({ ...current, email: event.target.value }))} type="email" value={certificate.email} /></Field>
@@ -370,8 +408,13 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
               {error && <p className="txt-compact-small mt-4 text-[color:var(--tag-red-text)]" role="alert">{error}</p>}
             </DialogBody>
             <DialogFooter>
-              <Button onClick={() => setEditor(null)} variant="secondary">取消</Button>
-              <Button onClick={editor === 'certificate' ? commitCertificate : commitRoute}>确认</Button>
+              <Button disabled={saving} onClick={() => setEditor(null)} variant="secondary">取消</Button>
+              <Button
+                disabled={saving}
+                onClick={() => void (editor === 'listener' ? commitListener() : editor === 'certificate' ? commitCertificate() : commitRoute())}
+              >
+                {saving ? '保存中' : '保存'}
+              </Button>
             </DialogFooter>
           </DialogContent>
         )}

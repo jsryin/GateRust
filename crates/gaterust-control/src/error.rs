@@ -11,6 +11,8 @@ pub enum ControlError {
     },
     #[error("控制平面配置无效: {0}")]
     InvalidConfig(String),
+    #[error("{kind}不存在: {name}")]
+    ResourceNotFound { kind: &'static str, name: String },
     #[error("读取运行配置失败: {0}")]
     ReadRuntimeConfig(String),
     #[error("写入运行配置失败: {0}")]

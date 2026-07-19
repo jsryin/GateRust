@@ -1,4 +1,17 @@
-import type { ClientService, ConfigSnapshot, Dashboard, ProxyConfig, ServerConfig, TunnelRuntimeState } from './types';
+import type {
+  CertificateConfig,
+  ClientService,
+  ConfigSnapshot,
+  Dashboard,
+  GroupConfig,
+  ProxyConfig,
+  ProxyListenerConfig,
+  RouteConfig,
+  ServerConfig,
+  ServerQuicConfig,
+  TunnelConfig,
+  TunnelRuntimeState
+} from './types';
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, '') ?? '';
 
@@ -34,17 +47,61 @@ export async function login(username: string, password: string) {
 export const getConfig = (token: string) => request<ConfigSnapshot>('/api/config', token);
 export const checkSession = (token: string) => request<void>('/api/auth/session', token);
 
-export const saveTunnel = (token: string, config: ServerConfig) =>
-  request<ServerConfig>('/api/config/tunnel', token, {
-    method: 'PUT',
-    body: JSON.stringify(config)
-  });
+function namedPath(base: string, name: string) {
+  return `${base}/${encodeURIComponent(name)}`;
+}
 
-export const saveProxy = (token: string, config: ProxyConfig) =>
-  request<ProxyConfig>('/api/config/proxy', token, {
-    method: 'PUT',
-    body: JSON.stringify(config)
+function writeConfig<TConfig, TValue>(path: string, token: string, method: 'POST' | 'PUT', value: TValue) {
+  return request<TConfig>(path, token, {
+    method,
+    body: JSON.stringify(value)
   });
+}
+
+const deleteConfig = <TConfig>(path: string, token: string) =>
+  request<TConfig>(path, token, { method: 'DELETE' });
+
+export const setTunnelQuic = (token: string, quic: ServerQuicConfig) =>
+  writeConfig<ServerConfig, ServerQuicConfig>('/api/config/tunnel/quic', token, 'PUT', quic);
+
+export const createGroup = (token: string, group: GroupConfig) =>
+  writeConfig<ServerConfig, GroupConfig>('/api/config/tunnel/groups', token, 'POST', group);
+
+export const updateGroup = (token: string, name: string, group: GroupConfig) =>
+  writeConfig<ServerConfig, GroupConfig>(namedPath('/api/config/tunnel/groups', name), token, 'PUT', group);
+
+export const deleteGroup = (token: string, name: string) =>
+  deleteConfig<ServerConfig>(namedPath('/api/config/tunnel/groups', name), token);
+
+export const createTunnel = (token: string, tunnel: TunnelConfig) =>
+  writeConfig<ServerConfig, TunnelConfig>('/api/config/tunnel/tunnels', token, 'POST', tunnel);
+
+export const updateTunnel = (token: string, name: string, tunnel: TunnelConfig) =>
+  writeConfig<ServerConfig, TunnelConfig>(namedPath('/api/config/tunnel/tunnels', name), token, 'PUT', tunnel);
+
+export const deleteTunnel = (token: string, name: string) =>
+  deleteConfig<ServerConfig>(namedPath('/api/config/tunnel/tunnels', name), token);
+
+export const setProxyListener = (token: string, listener: ProxyListenerConfig) =>
+  writeConfig<ProxyConfig, ProxyListenerConfig>('/api/config/proxy/listener', token, 'PUT', listener);
+
+export const createCertificate = (token: string, certificate: CertificateConfig) =>
+  writeConfig<ProxyConfig, CertificateConfig>('/api/config/proxy/certificates', token, 'POST', certificate);
+
+export const updateCertificate = (token: string, name: string, certificate: CertificateConfig) =>
+  writeConfig<ProxyConfig, CertificateConfig>(namedPath('/api/config/proxy/certificates', name), token, 'PUT', certificate);
+
+export const deleteCertificate = (token: string, name: string) =>
+  deleteConfig<ProxyConfig>(namedPath('/api/config/proxy/certificates', name), token);
+
+export const createRoute = (token: string, route: RouteConfig) =>
+  writeConfig<ProxyConfig, RouteConfig>('/api/config/proxy/routes', token, 'POST', route);
+
+export const updateRoute = (token: string, name: string, route: RouteConfig) =>
+  writeConfig<ProxyConfig, RouteConfig>(namedPath('/api/config/proxy/routes', name), token, 'PUT', route);
+
+export const deleteRoute = (token: string, name: string) =>
+  deleteConfig<ProxyConfig>(namedPath('/api/config/proxy/routes', name), token);
 
 export const generateKey = (token: string) =>
   request<{ key: string }>('/api/groups/key', token, { method: 'POST' });

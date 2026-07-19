@@ -1,16 +1,20 @@
 use std::{convert::Infallible, net::SocketAddr};
 
+#[cfg(feature = "tunnel")]
+use axum::routing::delete;
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
     http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::{delete, get, post, put},
+    routing::{get, post},
 };
+#[cfg(any(feature = "tunnel", feature = "proxy"))]
+use axum::{extract::Path, routing::put};
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::WatchStream;
@@ -100,7 +104,17 @@ fn module_routes() -> Router<ApiState> {
     let router = Router::new();
     #[cfg(feature = "tunnel")]
     let router = router
-        .route("/config/tunnel", put(save_tunnel))
+        .route("/config/tunnel/quic", put(set_tunnel_quic))
+        .route("/config/tunnel/groups", post(create_group))
+        .route(
+            "/config/tunnel/groups/{name}",
+            put(update_group).delete(delete_group),
+        )
+        .route("/config/tunnel/tunnels", post(create_tunnel))
+        .route(
+            "/config/tunnel/tunnels/{name}",
+            put(update_tunnel).delete(delete_tunnel),
+        )
         .route("/groups/key", post(generate_key))
         .route("/tunnel/runtime", get(tunnel_runtime))
         .route(
@@ -109,7 +123,18 @@ fn module_routes() -> Router<ApiState> {
         )
         .route("/client-config", post(generate_client_config));
     #[cfg(feature = "proxy")]
-    let router = router.route("/config/proxy", put(save_proxy));
+    let router = router
+        .route("/config/proxy/listener", put(set_proxy_listener))
+        .route("/config/proxy/certificates", post(create_certificate))
+        .route(
+            "/config/proxy/certificates/{name}",
+            put(update_certificate).delete(delete_certificate),
+        )
+        .route("/config/proxy/routes", post(create_route))
+        .route(
+            "/config/proxy/routes/{name}",
+            put(update_route).delete(delete_route),
+        );
     router
 }
 
@@ -173,29 +198,119 @@ async fn events(
 }
 
 #[cfg(feature = "tunnel")]
-async fn save_tunnel(
+async fn set_tunnel_quic(
     State(state): State<ApiState>,
-    Json(config): Json<gaterust_tunnel::ServerConfig>,
+    Json(quic): Json<gaterust_tunnel::ServerQuicConfig>,
 ) -> Result<Json<gaterust_tunnel::ServerConfig>, ApiError> {
-    state
-        .store
-        .save_tunnel(config)
-        .await
-        .map(Json)
-        .map_err(|error| ApiError::from_control(&error))
+    saved(state.store.set_tunnel_quic(quic).await)
+}
+
+#[cfg(feature = "tunnel")]
+async fn create_group(
+    State(state): State<ApiState>,
+    Json(group): Json<gaterust_tunnel::GroupConfig>,
+) -> Result<Json<gaterust_tunnel::ServerConfig>, ApiError> {
+    saved(state.store.create_group(group).await)
+}
+
+#[cfg(feature = "tunnel")]
+async fn update_group(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Json(group): Json<gaterust_tunnel::GroupConfig>,
+) -> Result<Json<gaterust_tunnel::ServerConfig>, ApiError> {
+    saved(state.store.update_group(name, group).await)
+}
+
+#[cfg(feature = "tunnel")]
+async fn delete_group(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<gaterust_tunnel::ServerConfig>, ApiError> {
+    saved(state.store.delete_group(name).await)
+}
+
+#[cfg(feature = "tunnel")]
+async fn create_tunnel(
+    State(state): State<ApiState>,
+    Json(tunnel): Json<gaterust_tunnel::ServerTunnelConfig>,
+) -> Result<Json<gaterust_tunnel::ServerConfig>, ApiError> {
+    saved(state.store.create_tunnel(tunnel).await)
+}
+
+#[cfg(feature = "tunnel")]
+async fn update_tunnel(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Json(tunnel): Json<gaterust_tunnel::ServerTunnelConfig>,
+) -> Result<Json<gaterust_tunnel::ServerConfig>, ApiError> {
+    saved(state.store.update_tunnel_config(name, tunnel).await)
+}
+
+#[cfg(feature = "tunnel")]
+async fn delete_tunnel(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<gaterust_tunnel::ServerConfig>, ApiError> {
+    saved(state.store.delete_tunnel_config(name).await)
 }
 
 #[cfg(feature = "proxy")]
-async fn save_proxy(
+async fn set_proxy_listener(
     State(state): State<ApiState>,
-    Json(config): Json<gaterust_proxy::ProxyConfig>,
+    Json(listener): Json<gaterust_proxy::ProxyListenerConfig>,
 ) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
-    state
-        .store
-        .save_proxy(config)
-        .await
-        .map(Json)
-        .map_err(|error| ApiError::from_control(&error))
+    saved(state.store.set_proxy_listener(listener).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn create_certificate(
+    State(state): State<ApiState>,
+    Json(certificate): Json<gaterust_proxy::CertificateConfig>,
+) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
+    saved(state.store.create_certificate(certificate).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn update_certificate(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Json(certificate): Json<gaterust_proxy::CertificateConfig>,
+) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
+    saved(state.store.update_certificate(name, certificate).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn delete_certificate(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
+    saved(state.store.delete_certificate(name).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn create_route(
+    State(state): State<ApiState>,
+    Json(route): Json<gaterust_proxy::RouteConfig>,
+) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
+    saved(state.store.create_route(route).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn update_route(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Json(route): Json<gaterust_proxy::RouteConfig>,
+) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
+    saved(state.store.update_route(name, route).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn delete_route(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
+    saved(state.store.delete_route(name).await)
 }
 
 #[cfg(feature = "tunnel")]
@@ -269,10 +384,23 @@ impl ApiError {
         }
     }
 
+    #[cfg(any(feature = "tunnel", feature = "proxy"))]
     fn from_control(error: &crate::ControlError) -> Self {
         tracing::warn!(%error, "Web UI 配置操作失败");
-        Self::new(StatusCode::BAD_REQUEST, error.to_string())
+        let status = if matches!(error, crate::ControlError::ResourceNotFound { .. }) {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        Self::new(status, error.to_string())
     }
+}
+
+#[cfg(any(feature = "tunnel", feature = "proxy"))]
+fn saved<T>(result: crate::Result<T>) -> Result<Json<T>, ApiError> {
+    result
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
 }
 
 impl IntoResponse for ApiError {

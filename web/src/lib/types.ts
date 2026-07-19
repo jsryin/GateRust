@@ -16,8 +16,14 @@ export interface TunnelConfig {
   udp_idle_seconds: number;
 }
 
+export interface ServerQuicConfig {
+  bind: string;
+  certificate: string;
+  private_key: string;
+}
+
 export interface ServerConfig {
-  quic: { bind: string; certificate: string; private_key: string };
+  quic: ServerQuicConfig;
   groups: GroupConfig[];
   tunnels: TunnelConfig[];
 }
@@ -47,13 +53,15 @@ export interface RouteConfig {
   certificate: string | null;
 }
 
+export interface ProxyListenerConfig {
+  http_bind: string;
+  https_bind: string;
+  cache_dir: string;
+  max_connections: number;
+}
+
 export interface ProxyConfig {
-  proxy: {
-    http_bind: string;
-    https_bind: string;
-    cache_dir: string;
-    max_connections: number;
-  };
+  proxy: ProxyListenerConfig;
   certificates: CertificateConfig[];
   routes: RouteConfig[];
 }

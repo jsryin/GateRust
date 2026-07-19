@@ -5,15 +5,26 @@ import {
   Pencil,
   Plus,
   RefreshCw,
-  Save,
   Trash2
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { disconnectTunnelClient, generateKey, getTunnelRuntime, saveTunnel } from '../lib/api';
+import {
+  createGroup,
+  createTunnel,
+  deleteGroup,
+  deleteTunnel,
+  disconnectTunnelClient,
+  generateKey,
+  getTunnelRuntime,
+  setTunnelQuic,
+  updateGroup,
+  updateTunnel
+} from '../lib/api';
 import { errorMessage } from '../lib/errors';
 import type {
   GroupConfig,
   ServerConfig,
+  ServerQuicConfig,
   TunnelConfig,
   TunnelKind,
   TunnelRuntimeClient,
@@ -23,7 +34,7 @@ import { Badge } from './ui/Badge';
 import { Button } from './ui/Button';
 import { ConfirmAction } from './ui/ConfirmAction';
 import { Dialog, DialogBody, DialogContent, DialogFooter } from './ui/Dialog';
-import { Field, Input, Select } from './ui/Fields';
+import { Field, Input, Select, ValueField } from './ui/Fields';
 import { FormGrid, PageIntro } from './ui/Page';
 import { EmptyState, Panel, PanelHeader } from './ui/Panel';
 import { Notice } from './ui/Notice';
@@ -35,7 +46,7 @@ interface TunnelPanelProps {
   token: string;
 }
 
-type Editor = 'group' | 'tunnel' | null;
+type Editor = 'quic' | 'group' | 'tunnel' | null;
 
 const minGroupKeyLength = 32;
 const maxGroupKeyLength = 124;
@@ -54,13 +65,17 @@ function defaultTunnel(): TunnelConfig {
   };
 }
 
+function defaultQuic(): ServerQuicConfig {
+  return {
+    bind: '0.0.0.0:2333',
+    certificate: '/etc/gaterust/tunnel/server.pem',
+    private_key: '/etc/gaterust/tunnel/server-key.pem'
+  };
+}
+
 function defaultConfig(): ServerConfig {
   return {
-    quic: {
-      bind: '0.0.0.0:2333',
-      certificate: '/etc/gaterust/tunnel/server.pem',
-      private_key: '/etc/gaterust/tunnel/server-key.pem'
-    },
+    quic: defaultQuic(),
     groups: [],
     tunnels: []
   };
@@ -69,7 +84,8 @@ function defaultConfig(): ServerConfig {
 export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
   const [draft, setDraft] = useState<ServerConfig>(() => structuredClone(config ?? defaultConfig()));
   const [editor, setEditor] = useState<Editor>(null);
-  const [editIndex, setEditIndex] = useState(-1);
+  const [originalName, setOriginalName] = useState<string | null>(null);
+  const [quic, setQuic] = useState<ServerQuicConfig>(defaultQuic);
   const [group, setGroup] = useState<GroupConfig>({ name: '', key: '' });
   const [tunnel, setTunnel] = useState<TunnelConfig>(defaultTunnel);
   const [limit, setLimit] = useState('');
@@ -77,6 +93,10 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [runtime, setRuntime] = useState<TunnelRuntimeState>({ clients: [], tunnels: [] });
+
+  useEffect(() => {
+    setDraft(structuredClone(config ?? defaultConfig()));
+  }, [config]);
 
   const refreshRuntime = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -129,18 +149,25 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
     return counts;
   }, [draft.tunnels]);
 
-  function openGroup(index = -1) {
-    setEditIndex(index);
-    setGroup(index >= 0 ? { ...draft.groups[index] } : { name: '', key: '' });
+  function openQuic() {
+    setOriginalName(null);
+    setQuic({ ...draft.quic });
+    setEditor('quic');
+    setError('');
+  }
+
+  function openGroup(item?: GroupConfig) {
+    setOriginalName(item?.name ?? null);
+    setGroup(item ? { ...item } : { name: '', key: '' });
     setEditor('group');
     setError('');
   }
 
-  function openTunnel(index = -1) {
-    const next = index >= 0
-      ? { ...draft.tunnels[index] }
+  function openTunnel(item?: TunnelConfig) {
+    const next = item
+      ? { ...item }
       : { ...defaultTunnel(), group: draft.groups[0]?.name ?? '' };
-    setEditIndex(index);
+    setOriginalName(item?.name ?? null);
     setTunnel(next);
     setLimit(next.limit_bps?.toString() ?? '');
     setEditor('tunnel');
@@ -164,7 +191,18 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
     }
   }
 
-  function commitGroup() {
+  async function commitQuic() {
+    if (!quic.bind || !quic.certificate || !quic.private_key) {
+      setError('监听地址、证书路径和私钥路径不能为空');
+      return;
+    }
+    await persistMutation(
+      () => setTunnelQuic(token, quic),
+      'QUIC 监听配置已保存；修改监听或 TLS 文件后请重启服务'
+    );
+  }
+
+  async function commitGroup() {
     if (!group.name || !group.key) {
       setError('名称和密钥不能为空');
       return;
@@ -175,49 +213,31 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
       return;
     }
 
-    setDraft((current) => {
-      const groups = [...current.groups];
-      const oldName = editIndex >= 0 ? groups[editIndex].name : '';
-      if (editIndex >= 0) groups[editIndex] = group;
-      else groups.push(group);
-      const tunnels = oldName && oldName !== group.name
-        ? current.tunnels.map((item) => item.group === oldName ? { ...item, group: group.name } : item)
-        : current.tunnels;
-      return { ...current, groups, tunnels };
-    });
-    setEditor(null);
+    await persistMutation(
+      () => originalName ? updateGroup(token, originalName, group) : createGroup(token, group),
+      originalName ? '分组已保存' : '分组已创建'
+    );
   }
 
-  function commitTunnel() {
+  async function commitTunnel() {
     const next = { ...tunnel, limit_bps: limit ? Number(limit) : null };
     if (!next.name || !next.group || !next.bind) {
       setError('名称、分组和监听地址不能为空');
       return;
     }
 
-    setDraft((current) => {
-      const tunnels = [...current.tunnels];
-      if (editIndex >= 0) tunnels[editIndex] = next;
-      else tunnels.push(next);
-      return { ...current, tunnels };
-    });
-    setEditor(null);
+    await persistMutation(
+      () => originalName ? updateTunnel(token, originalName, next) : createTunnel(token, next),
+      originalName ? '隧道已保存' : '隧道已创建'
+    );
   }
 
-  function removeGroup(index: number) {
-    const name = draft.groups[index].name;
-    setDraft((current) => ({
-      ...current,
-      groups: current.groups.filter((_, currentIndex) => currentIndex !== index),
-      tunnels: current.tunnels.filter((item) => item.group !== name)
-    }));
+  async function removeGroup(name: string) {
+    await persistMutation(() => deleteGroup(token, name), '分组及其隧道已删除');
   }
 
-  function removeTunnel(index: number) {
-    setDraft((current) => ({
-      ...current,
-      tunnels: current.tunnels.filter((_, currentIndex) => currentIndex !== index)
-    }));
+  async function removeTunnel(name: string) {
+    await persistMutation(() => deleteTunnel(token, name), '隧道已删除');
   }
 
   async function disconnectClient(client: TunnelRuntimeClient) {
@@ -229,15 +249,16 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
     }
   }
 
-  async function persist() {
+  async function persistMutation(action: () => Promise<ServerConfig>, successMessage: string) {
     setSaving(true);
     setError('');
     setMessage('');
     try {
-      const saved = await saveTunnel(token, draft);
+      const saved = await action();
       setDraft(saved);
       onSaved(saved);
-      setMessage('配置已保存；首次启用或修改 QUIC/TLS 时请重启服务');
+      setMessage(successMessage);
+      setEditor(null);
     } catch (cause) {
       setError(errorMessage(cause, '保存失败'));
     } finally {
@@ -247,40 +268,24 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
 
   return (
     <div className="space-y-4">
-      <PageIntro
-        action={(
-          <Button disabled={saving} onClick={() => void persist()}>
-            <Save className="h-4 w-4" />
-            {saving ? '保存中' : '保存配置'}
-          </Button>
-        )}
-        description="管理 QUIC 入口、访问分组、隧道和在线客户端"
-        title="隧道配置"
-      />
+      <PageIntro description="管理 QUIC 入口、访问分组、隧道和在线客户端" title="隧道配置" />
       {message && <Notice tone="success">{message}</Notice>}
       {error && !editor && <Notice tone="error">{error}</Notice>}
 
       <Panel>
-        <PanelHeader description="服务端传输入口与 TLS 文件" title="QUIC 监听" />
+        <PanelHeader
+          action={(
+            <Button aria-label="修改 QUIC 监听" onClick={openQuic} size="icon" title="修改" variant="ghost">
+              <Pencil className="h-4 w-4" />
+            </Button>
+          )}
+          description="服务端传输入口与 TLS 文件"
+          title="QUIC 监听"
+        />
         <FormGrid columns={3}>
-          <Field label="监听地址">
-            <Input
-              onChange={(event) => setDraft((current) => ({ ...current, quic: { ...current.quic, bind: event.target.value } }))}
-              value={draft.quic.bind}
-            />
-          </Field>
-          <Field label="证书路径">
-            <Input
-              onChange={(event) => setDraft((current) => ({ ...current, quic: { ...current.quic, certificate: event.target.value } }))}
-              value={draft.quic.certificate}
-            />
-          </Field>
-          <Field label="私钥路径">
-            <Input
-              onChange={(event) => setDraft((current) => ({ ...current, quic: { ...current.quic, private_key: event.target.value } }))}
-              value={draft.quic.private_key}
-            />
-          </Field>
+          <ValueField label="监听地址"><code>{draft.quic.bind}</code></ValueField>
+          <ValueField label="证书路径"><code>{draft.quic.certificate}</code></ValueField>
+          <ValueField label="私钥路径"><code>{draft.quic.private_key}</code></ValueField>
         </FormGrid>
       </Panel>
 
@@ -306,8 +311,8 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
               </TableRow>
             </TableHeader>
             <tbody>
-              {draft.groups.map((item, index) => (
-                <TableRow key={`${item.name}-${index}`}>
+              {draft.groups.map((item) => (
+                <TableRow key={item.name}>
                   <TableCell className="font-medium text-[color:var(--fg-base)]">{item.name}</TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1">
@@ -326,13 +331,13 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
                   <TableCell>{tunnelCountByGroup.get(item.name) ?? 0}</TableCell>
                   <TableCell>
                     <div className="flex justify-end gap-1">
-                      <Button aria-label={`编辑 ${item.name}`} onClick={() => openGroup(index)} size="icon" variant="ghost">
+                      <Button aria-label={`编辑 ${item.name}`} onClick={() => openGroup(item)} size="icon" variant="ghost">
                         <Pencil className="h-4 w-4" />
                       </Button>
                       <ConfirmAction
                         confirmLabel="删除"
                         description={`将同时删除分组 ${item.name} 下的全部隧道。`}
-                        onConfirm={() => removeGroup(index)}
+                        onConfirm={() => removeGroup(item.name)}
                         title={`删除分组 ${item.name}？`}
                       >
                         <Button aria-label={`删除 ${item.name}`} size="icon" variant="ghost">
@@ -375,14 +380,14 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
               </TableRow>
             </TableHeader>
             <tbody>
-              {draft.tunnels.map((item, index) => {
+              {draft.tunnels.map((item) => {
                 const state = runtimeByTunnel.get(item.name);
                 const owner = state?.owner_session_id == null ? undefined : clientsById.get(state.owner_session_id);
                 const waiting = state?.waiting_session_ids.map((id) => clientsById.get(id)?.device_id ?? `#${id}`) ?? [];
                 const releasedTunnels = owner ? tunnelsByOwner.get(owner.session_id) ?? [] : [];
 
                 return (
-                  <TableRow key={`${item.name}-${index}`}>
+                  <TableRow key={item.name}>
                     <TableCell className="font-medium text-[color:var(--fg-base)]">{item.name}</TableCell>
                     <TableCell><Badge>{kindLabel[item.kind]}</Badge></TableCell>
                     <TableCell>{item.group}</TableCell>
@@ -419,12 +424,19 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
                             </Button>
                           </ConfirmAction>
                         )}
-                        <Button aria-label={`编辑 ${item.name}`} onClick={() => openTunnel(index)} size="icon" variant="ghost">
+                        <Button aria-label={`编辑 ${item.name}`} onClick={() => openTunnel(item)} size="icon" variant="ghost">
                           <Pencil className="h-4 w-4" />
                         </Button>
-                        <Button aria-label={`删除 ${item.name}`} onClick={() => removeTunnel(index)} size="icon" variant="ghost">
-                          <Trash2 className="h-4 w-4 text-[color:var(--tag-red-text)]" />
-                        </Button>
+                        <ConfirmAction
+                          confirmLabel="删除"
+                          description={`删除后，隧道 ${item.name} 将立即停止提供服务。`}
+                          onConfirm={() => removeTunnel(item.name)}
+                          title={`删除隧道 ${item.name}？`}
+                        >
+                          <Button aria-label={`删除 ${item.name}`} size="icon" variant="ghost">
+                            <Trash2 className="h-4 w-4 text-[color:var(--tag-red-text)]" />
+                          </Button>
+                        </ConfirmAction>
                       </div>
                     </TableCell>
                   </TableRow>
@@ -437,15 +449,27 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
         )}
       </Panel>
 
-      <Dialog open={editor !== null} onOpenChange={(open) => !open && setEditor(null)}>
+      <Dialog open={editor !== null} onOpenChange={(open) => !open && !saving && setEditor(null)}>
         {editor && (
           <DialogContent
-            description={editIndex >= 0 ? '修改现有配置项' : '创建新的配置项'}
-            title={editor === 'group' ? '访问分组' : '隧道'}
+            description={editor === 'quic' || originalName ? '修改现有配置项' : '创建新的配置项'}
+            title={editor === 'quic' ? 'QUIC 监听' : editor === 'group' ? '访问分组' : '隧道'}
           >
             <DialogBody>
               <div className="grid gap-4 sm:grid-cols-2">
-                {editor === 'group' ? (
+                {editor === 'quic' ? (
+                  <>
+                    <Field className="sm:col-span-2" label="监听地址">
+                      <Input onChange={(event) => setQuic((current) => ({ ...current, bind: event.target.value }))} value={quic.bind} />
+                    </Field>
+                    <Field className="sm:col-span-2" label="证书路径">
+                      <Input onChange={(event) => setQuic((current) => ({ ...current, certificate: event.target.value }))} value={quic.certificate} />
+                    </Field>
+                    <Field className="sm:col-span-2" label="私钥路径">
+                      <Input onChange={(event) => setQuic((current) => ({ ...current, private_key: event.target.value }))} value={quic.private_key} />
+                    </Field>
+                  </>
+                ) : editor === 'group' ? (
                   <>
                     <Field className="sm:col-span-2" label="分组名称">
                       <Input onChange={(event) => setGroup((current) => ({ ...current, name: event.target.value }))} placeholder="office" value={group.name} />
@@ -502,8 +526,13 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
               {error && <p className="txt-compact-small mt-4 text-[color:var(--tag-red-text)]" role="alert">{error}</p>}
             </DialogBody>
             <DialogFooter>
-              <Button onClick={() => setEditor(null)} variant="secondary">取消</Button>
-              <Button onClick={editor === 'group' ? commitGroup : commitTunnel}>确认</Button>
+              <Button disabled={saving} onClick={() => setEditor(null)} variant="secondary">取消</Button>
+              <Button
+                disabled={saving}
+                onClick={() => void (editor === 'quic' ? commitQuic() : editor === 'group' ? commitGroup() : commitTunnel())}
+              >
+                {saving ? '保存中' : '保存'}
+              </Button>
             </DialogFooter>
           </DialogContent>
         )}
