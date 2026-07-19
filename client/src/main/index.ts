@@ -107,7 +107,7 @@ function createWindow(): void {
     autoHideMenuBar: true,
     title: 'GateRust Client',
     webPreferences: {
-      preload: join(__dirname, '../preload/index.mjs'),
+      preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,
       devTools: !app.isPackaged,
       nodeIntegration: false,

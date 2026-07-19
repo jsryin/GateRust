@@ -488,6 +488,12 @@ select:disabled {
   text-align: center;
 }
 
+.startup-failure {
+  min-height: 100vh;
+  padding: 24px;
+  background: #f3f5f4;
+}
+
 .toast {
   position: fixed;
   right: 24px;
