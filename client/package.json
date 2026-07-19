@@ -1,0 +1,32 @@
+{
+  "name": "gaterust-client-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GateRust desktop client",
+  "author": "jsryin",
+  "license": "MIT",
+  "repository": "https://github.com/jsryin/GateRust",
+  "main": "out/main/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "build": "pnpm check && electron-vite build",
+    "package": "pnpm build && electron-builder --dir",
+    "dist": "pnpm build && electron-builder"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@vitejs/plugin-react": "^5.0.0",
+    "electron": "latest",
+    "electron-builder": "latest",
+    "electron-vite": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "typescript": "latest",
+    "vite": "^7.3.6"
+  }
+}

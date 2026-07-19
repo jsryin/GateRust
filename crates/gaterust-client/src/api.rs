@@ -5,7 +5,7 @@ use axum::{
     extract::{DefaultBodyLimit, Request, State},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use gaterust_tunnel::{ClientConfig, ClientStatus};
@@ -14,13 +14,9 @@ use subtle::ConstantTimeEq as _;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::app::UI_AUTHORITY;
+use crate::app::API_AUTHORITY;
 
 const MAX_API_BODY_BYTES: usize = 128 * 1_024;
-const INDEX_HTML: &str = include_str!("ui/index.html");
-const APP_CSS: &str = include_str!("ui/app.css");
-const APP_JS: &str = include_str!("ui/app.js");
-
 #[derive(Clone)]
 struct ApiState {
     config_path: Arc<PathBuf>,
@@ -85,9 +81,6 @@ pub(crate) fn router(
         .route("/shutdown", post(shutdown))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
-        .route("/", get(index))
-        .route("/app.css", get(stylesheet))
-        .route("/app.js", get(script))
         .route("/api/health", get(health))
         .route("/api/session", get(session))
         .nest("/api", protected)
@@ -95,21 +88,6 @@ pub(crate) fn router(
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(validate_host))
         .with_state(state)
-}
-
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
-}
-
-async fn stylesheet() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS)
-}
-
-async fn script() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        APP_JS,
-    )
 }
 
 async fn health() -> impl IntoResponse {
@@ -190,7 +168,7 @@ async fn validate_host(request: Request, next: Next) -> Response {
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == UI_AUTHORITY);
+        .is_some_and(|value| value == API_AUTHORITY);
     if valid {
         next.run(request).await
     } else {

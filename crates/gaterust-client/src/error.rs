@@ -6,12 +6,12 @@ pub enum ClientError {
     ConfigDirectoryUnavailable,
     #[error(transparent)]
     Tunnel(#[from] gaterust_tunnel::TunnelError),
-    #[error("绑定本机管理地址 {address} 失败: {source}")]
+    #[error("绑定客户端本机 API 地址 {address} 失败: {source}")]
     Bind {
         address: SocketAddr,
         source: io::Error,
     },
-    #[error("本机管理服务异常退出: {0}")]
+    #[error("客户端本机 API 异常退出: {0}")]
     Serve(io::Error),
     #[error("监听退出信号失败: {0}")]
     Signal(io::Error),

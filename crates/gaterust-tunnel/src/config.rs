@@ -218,7 +218,7 @@ impl ServerConfig {
 }
 
 impl ClientConfig {
-    /// 创建可由本机管理界面继续编辑的初始客户端配置。
+    /// 创建可由桌面客户端继续编辑的初始配置。
     #[must_use]
     pub fn initial() -> Self {
         Self {

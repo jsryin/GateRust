@@ -11,6 +11,9 @@
 **/.vite/
 **/coverage/
 *.tsbuildinfo
+/client/out/
+/client/release/
+/client/resources/bin/gaterust-client*
 
 # Local environment and secrets
 .env

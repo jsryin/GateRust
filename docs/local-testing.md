@@ -21,14 +21,18 @@ cargo run -p gaterust-server -- \
   --tunnel-config config/server.toml
 ```
 
-另开终端启动隧道客户端：
+先构建隧道客户端后台：
 
 ```bash
-cargo run -p gaterust-client -- \
-  --config config/client.toml
+cargo build -p gaterust-client
 ```
 
-客户端同时启动本机配置界面，可访问 `http://127.0.0.1:47823/` 查看连接状态或修改配置。纯命令行测试可添加 `--no-open`，配置文件仍会正常热更新。
+再启动 Electron 桌面界面，配置路径会透传给 Rust 后台：
+
+```bash
+pnpm --dir client install
+GATERUST_CLIENT_CONFIG=../config/client.toml pnpm --dir client dev
+```
 
 启动 Web 控制台：
 
@@ -80,12 +84,10 @@ pgrep -af gaterust-server
 pkill -TERM -x gaterust-server
 ```
 
-然后另开一个终端启动客户端：
+然后另开一个终端启动桌面客户端：
 
 ```bash
-RUST_LOG=info cargo run -p gaterust-client -- \
-  --no-open \
-  --config config/client.toml
+RUST_LOG=info GATERUST_CLIENT_CONFIG=../config/client.toml pnpm --dir client dev
 ```
 
 如果正在开发前端，再开一个终端：

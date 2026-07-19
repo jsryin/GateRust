@@ -1,0 +1,30 @@
+appId: io.github.jsryin.gaterust.client
+productName: GateRust Client
+executableName: gaterust-client
+asar: true
+directories:
+  output: release
+files:
+  - out/**
+  - package.json
+extraResources:
+  - from: resources/bin
+    to: bin
+    filter:
+      - gaterust-client*
+artifactName: gaterust-client-${arch}-${os}.${ext}
+linux:
+  target:
+    - AppImage
+  category: Network
+  synopsis: GateRust QUIC tunnel client
+mac:
+  target:
+    - dmg
+  category: public.app-category.utilities
+win:
+  target:
+    - nsis
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true

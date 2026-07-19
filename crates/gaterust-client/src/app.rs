@@ -15,28 +15,24 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    api, browser,
+    api,
     error::{ClientError, Result},
 };
 
-pub(crate) const UI_ADDRESS: SocketAddr =
+pub(crate) const API_ADDRESS: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 47_823));
-pub(crate) const UI_AUTHORITY: &str = "127.0.0.1:47823";
-pub(crate) const UI_URL: &str = "http://127.0.0.1:47823/";
+pub(crate) const API_AUTHORITY: &str = "127.0.0.1:47823";
 
-pub(crate) async fn run(config_path: PathBuf, open_browser: bool) -> Result<()> {
-    let listener = match TcpListener::bind(UI_ADDRESS).await {
+pub(crate) async fn run(config_path: PathBuf) -> Result<()> {
+    let listener = match TcpListener::bind(API_ADDRESS).await {
         Ok(listener) => listener,
         Err(source) if source.kind() == ErrorKind::AddrInUse && existing_client().await => {
-            tracing::info!(url = UI_URL, "客户端已在运行");
-            if open_browser {
-                open_browser_page();
-            }
+            tracing::info!(address = %API_ADDRESS, "客户端后台已在运行");
             return Ok(());
         }
         Err(source) => {
             return Err(ClientError::Bind {
-                address: UI_ADDRESS,
+                address: API_ADDRESS,
                 source,
             });
         }
@@ -63,10 +59,7 @@ pub(crate) async fn run(config_path: PathBuf, open_browser: bool) -> Result<()> 
         revision_sender,
         cancellation.clone(),
     );
-    tracing::info!(url = UI_URL, "客户端本机管理界面已启动");
-    if open_browser {
-        open_browser_page();
-    }
+    tracing::info!(address = %API_ADDRESS, "客户端本机 API 已启动");
 
     let server_cancellation = cancellation.clone();
     let server = axum::serve(listener, router)
@@ -148,12 +141,12 @@ async fn supervise_tunnel(
 
 async fn existing_client() -> bool {
     let Ok(Ok(mut stream)) =
-        tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(UI_ADDRESS)).await
+        tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(API_ADDRESS)).await
     else {
         return false;
     };
     let request =
-        format!("GET /api/health HTTP/1.1\r\nHost: {UI_AUTHORITY}\r\nConnection: close\r\n\r\n");
+        format!("GET /api/health HTTP/1.1\r\nHost: {API_AUTHORITY}\r\nConnection: close\r\n\r\n");
     if stream.write_all(request.as_bytes()).await.is_err() {
         return false;
     }
@@ -169,10 +162,4 @@ async fn existing_client() -> bool {
     response
         .windows(b"gaterust-client".len())
         .any(|value| value == b"gaterust-client")
-}
-
-fn open_browser_page() {
-    if let Err(error) = browser::open(UI_URL) {
-        tracing::warn!(%error, url = UI_URL, "无法自动打开浏览器，请手动访问本机管理界面");
-    }
 }

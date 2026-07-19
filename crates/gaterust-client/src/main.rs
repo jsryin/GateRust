@@ -1,6 +1,5 @@
 mod api;
 mod app;
-mod browser;
 mod error;
 mod paths;
 
@@ -15,9 +14,6 @@ struct Arguments {
     /// 客户端 TOML 配置文件；默认使用当前用户的应用配置目录。
     #[arg(short, long)]
     config: Option<PathBuf>,
-    /// 不自动打开本机管理界面。
-    #[arg(long)]
-    no_open: bool,
     /// 生成一个 32 字符的随机分组密钥并退出。
     #[arg(long)]
     generate_key: bool,
@@ -42,7 +38,7 @@ async fn main() {
         if created {
             tracing::info!(path = %config_path.display(), "已创建客户端初始配置");
         }
-        app::run(config_path, !arguments.no_open).await
+        app::run(config_path).await
     }
     .await;
     if let Err(error) = result {
