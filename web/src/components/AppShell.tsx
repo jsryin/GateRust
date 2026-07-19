@@ -13,6 +13,7 @@ import type { Theme } from '../hooks/useTheme';
 import { classNames } from '../lib/class-names';
 import { ThemeButton } from './ThemeButton';
 import { Button } from './ui/Button';
+import { ConfirmAction } from './ui/ConfirmAction';
 
 export type PageId = 'dashboard' | 'tunnel' | 'proxy' | 'client';
 
@@ -76,14 +77,6 @@ export function AppShell({ active, children, onLogout, onNavigate, onToggleTheme
           </Button>
         </div>
 
-        <div className="mt-4 flex h-10 w-full items-center justify-between rounded-md bg-[var(--button-neutral)] px-2.5 shadow-[var(--buttons-neutral)]">
-          <span className="min-w-0">
-            <span className="txt-compact-small-plus block truncate">服务端</span>
-            <span className="txt-compact-xsmall block truncate text-[color:var(--fg-muted)]">当前运行实例</span>
-          </span>
-          <span className="h-2 w-2 rounded-full bg-emerald-500" />
-        </div>
-
         <div className="txt-compact-xsmall-plus mt-5 px-2 text-[color:var(--fg-muted)]">导航</div>
         <nav className="mt-2 space-y-1" aria-label="主导航">
           {pages.map((page) => {
@@ -110,17 +103,16 @@ export function AppShell({ active, children, onLogout, onNavigate, onToggleTheme
           })}
         </nav>
 
-        <div className="txt-compact-xsmall mt-auto rounded-lg bg-[var(--bg-base)] p-3 shadow-[var(--elevation-card-rest)]">
-          <div className="flex items-center gap-2 font-medium">
-            <span className="h-2 w-2 rounded-full bg-emerald-500" />
-            控制平面在线
-          </div>
-          <div className="mt-1 text-[color:var(--fg-muted)]">GateRust Web API</div>
-        </div>
-        <Button className="mt-3 w-full justify-start" onClick={onLogout} variant="ghost">
-          <LogOut className="h-4 w-4" />
-          退出登录
-        </Button>
+        <ConfirmAction
+          confirmLabel="退出登录"
+          onConfirm={onLogout}
+          title="确认退出登录？"
+        >
+          <Button className="mt-auto w-full justify-start" variant="ghost">
+            <LogOut className="h-4 w-4" />
+            退出登录
+          </Button>
+        </ConfirmAction>
       </aside>
 
       <main className="lg:pl-[244px]">

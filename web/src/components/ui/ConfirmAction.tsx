@@ -5,7 +5,7 @@ import { Button } from './Button';
 interface ConfirmActionProps {
   children: ReactElement;
   confirmLabel?: string;
-  description: ReactNode;
+  description?: ReactNode;
   onConfirm: () => void | Promise<void>;
   title: string;
 }
@@ -31,8 +31,10 @@ export function ConfirmAction({
         >
           <div className="px-6 py-5">
             <AlertDialog.Title className="txt-compact-large-plus">{title}</AlertDialog.Title>
-            <AlertDialog.Description className="txt-compact-small mt-2 text-[color:var(--fg-subtle)]">
-              {description}
+            <AlertDialog.Description
+              className={description ? 'txt-compact-small mt-2 text-[color:var(--fg-subtle)]' : 'sr-only'}
+            >
+              {description ?? '请确认是否继续。'}
             </AlertDialog.Description>
           </div>
           <div className="flex justify-end gap-2 border-t border-[color:var(--border-base)] px-6 py-4">
