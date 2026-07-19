@@ -45,7 +45,7 @@ gaterust uninstall --all --yes
 
 ## 桌面客户端
 
-[GitHub Releases](https://github.com/jsryin/GateRust/releases) 提供 Linux AppImage、Windows 安装程序和 macOS DMG，安装包已包含 Rust 隧道后台。
+[GitHub Releases](https://github.com/jsryin/GateRust/releases) 提供免安装桌面客户端，均已包含 Rust 隧道后台：Windows 直接双击便携版 EXE，macOS 解压 ZIP 后打开应用，Linux 运行 AppImage。
 
 Linux AppImage 使用方式：
 
@@ -107,11 +107,11 @@ cargo run --release -p gaterust-server -- \
   --enable-web --web-config config/web.toml
 ```
 
-在 Linux 或 WSL2 使用系统 Wine 构建 Windows 安装包：
+在 Linux 或 WSL2 使用系统 Wine 构建 Windows 便携版：
 
 ```bash
 USE_SYSTEM_WINE=true pnpm --dir client exec electron-builder \
-  --win nsis --x64 --publish never
+  --win portable --x64 --publish never
 ```
 
-安装包输出到 `client/release/gaterust-client-x64-win.exe`。通过 `RUST_LOG` 调整日志级别；配置文件包含敏感信息时不得提交到版本库。
+便携版输出到 `client/release/gaterust-client-x64-win.exe`。通过 `RUST_LOG` 调整日志级别；配置文件包含敏感信息时不得提交到版本库。

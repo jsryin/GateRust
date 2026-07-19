@@ -20,11 +20,10 @@ linux:
   synopsis: GateRust QUIC tunnel client
 mac:
   target:
-    - dmg
+    - zip
   category: public.app-category.utilities
 win:
   target:
-    - nsis
-nsis:
-  oneClick: false
-  allowToChangeInstallationDirectory: true
+    - portable
+portable:
+  useZip: true

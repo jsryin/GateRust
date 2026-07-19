@@ -150,10 +150,10 @@ jobs:
         if: runner.os == 'macOS'
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: pnpm --dir client exec electron-builder --mac dmg --${{ matrix.electron_arch }} --publish never
+        run: pnpm --dir client exec electron-builder --mac zip --${{ matrix.electron_arch }} --publish never
       - name: Package Windows desktop client
         if: runner.os == 'Windows'
-        run: pnpm --dir client exec electron-builder --win nsis --${{ matrix.electron_arch }} --publish never
+        run: pnpm --dir client exec electron-builder --win portable --${{ matrix.electron_arch }} --publish never
       - uses: actions/upload-artifact@v4
         with:
           name: gaterust-client-${{ matrix.asset_arch }}-${{ matrix.asset_os }}
