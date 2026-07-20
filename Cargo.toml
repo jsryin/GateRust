@@ -17,38 +17,38 @@ repository = "https://github.com/jsryin/GateRust"
 
 [workspace.dependencies]
 argon2 = "0.5.3"
-axum = "0.8.4"
+axum = "0.8.9"
 base64 = "0.22.1"
 bytes = "1.12.1"
-clap = { version = "4.5.41", features = ["derive"] }
-futures-util = "0.3.32"
+clap = { version = "4.6.3", features = ["derive"] }
+futures-util = "0.3.33"
 http = "1.4.2"
-http-body-util = "0.1.3"
-hyper = { version = "1.10.1", features = ["client", "http1", "server"] }
+http-body-util = "0.1.4"
+hyper = { version = "1.11.0", features = ["client", "http1", "server"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "server", "tokio"] }
 instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "ring"] }
-jsonwebtoken = { version = "10.2.0", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
 notify = "8.2.0"
-quinn = { version = "0.11.8", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
+quinn = { version = "0.11.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 rand = "0.10.2"
-rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2.0"
 rustls-acme = { version = "0.15.3", default-features = false, features = ["ring", "tokio", "tower", "webpki-roots"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 subtle = "2.6.1"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.0", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
-tokio-stream = { version = "0.1.17", features = ["sync"] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
-toml = "1.1.2"
+toml = "1.1.3"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 tower-http = { version = "0.7.0", features = ["cors", "fs"] }
-webpki-roots = "1.0.8"
-zeroize = "1.8.1"
+webpki-roots = "1.0.9"
+zeroize = "1.9.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

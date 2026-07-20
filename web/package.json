@@ -2,6 +2,7 @@
   "name": "gaterust-web",
   "private": true,
   "version": "0.1.0",
+  "packageManager": "pnpm@11.15.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,20 +11,20 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@radix-ui/react-alert-dialog": "latest",
-    "@radix-ui/react-dialog": "latest",
-    "lucide-react": "latest",
-    "react": "latest",
-    "react-dom": "latest"
+    "@radix-ui/react-alert-dialog": "1.1.19",
+    "@radix-ui/react-dialog": "1.1.19",
+    "lucide-react": "1.25.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "latest",
-    "@types/node": "latest",
-    "@types/react": "latest",
-    "@types/react-dom": "latest",
-    "@vitejs/plugin-react": "latest",
-    "tailwindcss": "latest",
-    "typescript": "latest",
-    "vite": "latest"
+    "@tailwindcss/vite": "4.3.3",
+    "@types/node": "26.1.1",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.3",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2",
+    "vite": "8.1.5"
   }
 }
