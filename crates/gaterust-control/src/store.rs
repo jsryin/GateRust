@@ -376,7 +376,7 @@ impl ConfigStore {
         F: FnOnce(&mut gaterust_tunnel::ServerConfig) -> Result<()> + Send + 'static,
     {
         let inner = Arc::clone(&self.inner);
-        let loaded = tokio::task::spawn_blocking(move || {
+        let stored = tokio::task::spawn_blocking(move || {
             // 串行执行“读取最新文件、合并单项、原子写入”，避免旧页面快照覆盖其它改动。
             let _guard = inner
                 .tunnel_writer
@@ -388,13 +388,13 @@ impl ConfigStore {
             write_validated(
                 &inner.tunnel_path,
                 &config,
-                gaterust_tunnel::ServerConfig::load,
+                gaterust_tunnel::ServerConfig::read,
             )
         })
         .await
         .map_err(|error| ControlError::WriteRuntimeConfig(error.to_string()))??;
-        self.update_tunnel(Some(loaded.clone())).await;
-        Ok(loaded)
+        self.update_tunnel(Some(stored.clone())).await;
+        Ok(stored)
     }
 
     #[cfg(feature = "proxy")]
@@ -403,7 +403,7 @@ impl ConfigStore {
         F: FnOnce(&mut gaterust_proxy::ProxyConfig) -> Result<()> + Send + 'static,
     {
         let inner = Arc::clone(&self.inner);
-        let loaded = tokio::task::spawn_blocking(move || {
+        let stored = tokio::task::spawn_blocking(move || {
             // 文件锁仅存在于阻塞任务内，不跨异步等待持有。
             let _guard = inner
                 .proxy_writer
@@ -414,13 +414,13 @@ impl ConfigStore {
             write_validated(
                 &inner.proxy_path,
                 &config,
-                gaterust_proxy::ProxyConfig::load,
+                gaterust_proxy::ProxyConfig::read,
             )
         })
         .await
         .map_err(|error| ControlError::WriteRuntimeConfig(error.to_string()))??;
-        self.update_proxy(Some(loaded.clone())).await;
-        Ok(loaded)
+        self.update_proxy(Some(stored.clone())).await;
+        Ok(stored)
     }
 
     async fn publish(&self) {
@@ -547,7 +547,8 @@ fn dashboard_for(
 
 #[cfg(feature = "tunnel")]
 fn load_optional_tunnel(path: &Path) -> Result<Option<gaterust_tunnel::ServerConfig>> {
-    match gaterust_tunnel::ServerConfig::load(path) {
+    // 控制面保留路径原文，运行模块读取同一文件时再解析相对路径。
+    match gaterust_tunnel::ServerConfig::read(path) {
         Ok(config) => Ok(Some(config)),
         Err(gaterust_tunnel::TunnelError::ReadConfig { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
@@ -560,7 +561,8 @@ fn load_optional_tunnel(path: &Path) -> Result<Option<gaterust_tunnel::ServerCon
 
 #[cfg(feature = "proxy")]
 fn load_optional_proxy(path: &Path) -> Result<Option<gaterust_proxy::ProxyConfig>> {
-    match gaterust_proxy::ProxyConfig::load(path) {
+    // 控制面保留路径原文，运行模块读取同一文件时再解析相对路径。
+    match gaterust_proxy::ProxyConfig::read(path) {
         Ok(config) => Ok(Some(config)),
         Err(gaterust_proxy::ProxyError::ReadConfig { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
@@ -571,7 +573,7 @@ fn load_optional_proxy(path: &Path) -> Result<Option<gaterust_proxy::ProxyConfig
     }
 }
 
-fn write_validated<T, E, F>(path: &Path, config: &T, load: F) -> Result<T>
+fn write_validated<T, E, F>(path: &Path, config: &T, read: F) -> Result<T>
 where
     T: Serialize,
     E: std::fmt::Display,
@@ -607,7 +609,7 @@ where
         file.write_all(content.as_bytes())
             .and_then(|()| file.sync_all())
             .map_err(|error| ControlError::WriteRuntimeConfig(error.to_string()))?;
-        let loaded = load(&temporary)
+        let stored = read(&temporary)
             .map_err(|error| ControlError::WriteRuntimeConfig(error.to_string()))?;
         std::fs::rename(&temporary, path)
             .map_err(|error| ControlError::WriteRuntimeConfig(error.to_string()))?;
@@ -615,7 +617,7 @@ where
         File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| ControlError::WriteRuntimeConfig(error.to_string()))?;
-        Ok(loaded)
+        Ok(stored)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -657,13 +659,18 @@ mod tunnel_tests {
         let store = ConfigStore::new(&options).expect("创建配置存储");
         let quic = ServerQuicConfig {
             bind: "127.0.0.1:2333".parse().expect("测试地址有效"),
-            certificate: directory.path().join("server.pem"),
-            private_key: directory.path().join("server-key.pem"),
+            certificate: "config/../certs/server.pem".into(),
+            private_key: "config/../certs/server-key.pem".into(),
         };
         store
             .set_tunnel_quic(quic.clone())
             .await
             .expect("保存 QUIC 配置");
+        store.reload(ConfigKind::Tunnel).await;
+        assert_eq!(
+            store.snapshot().await.tunnel.expect("隧道配置应存在").quic,
+            quic
+        );
         store
             .create_group(GroupConfig {
                 name: "office".into(),
@@ -700,9 +707,18 @@ mod tunnel_tests {
         assert_eq!(updated.groups[0].name, "home");
         assert_eq!(updated.tunnels.len(), 1);
         assert_eq!(updated.tunnels[0].group, "home");
-        let loaded = ServerConfig::load(&path).expect("读取保存的配置");
-        assert_eq!(loaded.quic, quic);
-        assert_eq!(loaded.tunnels[0].group, "home");
+        let stored = ServerConfig::read(&path).expect("读取保存的配置");
+        assert_eq!(stored.quic, quic);
+        assert_eq!(stored.tunnels[0].group, "home");
+        let runtime = ServerConfig::load(&path).expect("加载运行时配置");
+        assert_eq!(
+            runtime.quic.certificate,
+            directory.path().join("config/../certs/server.pem")
+        );
+        assert_eq!(
+            runtime.quic.private_key,
+            directory.path().join("config/../certs/server-key.pem")
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -744,13 +760,18 @@ mod proxy_tests {
         let listener = ProxyListenerConfig {
             http_bind: "127.0.0.1:8080".parse().expect("测试地址有效"),
             https_bind: "127.0.0.1:8443".parse().expect("测试地址有效"),
-            cache_dir: directory.path().join("acme"),
+            cache_dir: "config/../data/acme".into(),
             max_connections: 64,
         };
         store
             .set_proxy_listener(listener.clone())
             .await
             .expect("保存代理监听");
+        store.reload(ConfigKind::Proxy).await;
+        assert_eq!(
+            store.snapshot().await.proxy.expect("代理配置应存在").proxy,
+            listener
+        );
         store
             .create_certificate(certificate("site"))
             .await
@@ -781,9 +802,14 @@ mod proxy_tests {
         assert_eq!(updated.proxy, listener);
         assert!(updated.certificates.is_empty());
         assert_eq!(updated.routes[0].certificate, None);
-        let loaded = ProxyConfig::load(&path).expect("读取保存的配置");
-        assert_eq!(loaded.proxy, listener);
-        assert_eq!(loaded.routes.len(), 1);
+        let stored = ProxyConfig::read(&path).expect("读取保存的配置");
+        assert_eq!(stored.proxy, listener);
+        assert_eq!(stored.routes.len(), 1);
+        let runtime = ProxyConfig::load(&path).expect("加载运行时配置");
+        assert_eq!(
+            runtime.proxy.cache_dir,
+            directory.path().join("config/../data/acme")
+        );
     }
 
     fn certificate(name: &str) -> CertificateConfig {

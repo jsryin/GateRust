@@ -81,12 +81,12 @@ pub struct RouteConfig {
 }
 
 impl ProxyConfig {
-    /// 读取并验证代理配置，相对缓存路径以配置文件目录为基准。
+    /// 读取并验证代理配置，保留配置中的相对路径。
     ///
     /// # Errors
     ///
     /// 文件不可读、TOML 格式错误或字段不满足约束时返回错误。
-    pub fn load(path: &Path) -> Result<Self> {
+    pub fn read(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path).map_err(|source| ProxyError::ReadConfig {
             path: path.to_owned(),
             source,
@@ -96,11 +96,21 @@ impl ProxyConfig {
                 path: path.to_owned(),
                 source,
             })?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// 读取并验证代理配置，相对缓存路径以配置文件目录为基准。
+    ///
+    /// # Errors
+    ///
+    /// 文件不可读、TOML 格式错误或字段不满足约束时返回错误。
+    pub fn load(path: &Path) -> Result<Self> {
+        let mut config = Self::read(path)?;
         if config.proxy.cache_dir.is_relative() {
             let parent = path.parent().unwrap_or_else(|| Path::new("."));
             config.proxy.cache_dir = parent.join(&config.proxy.cache_dir);
         }
-        config.validate()?;
         Ok(config)
     }
 

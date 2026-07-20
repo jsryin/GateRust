@@ -9,7 +9,7 @@ use std::{
 
 use rand::RngExt as _;
 use rand::distr::{Alphanumeric, SampleString as _};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use zeroize::Zeroize as _;
 
 use crate::{Result, TunnelError};
@@ -116,24 +116,26 @@ impl Drop for GroupSecret {
 }
 
 impl ServerConfig {
+    /// 读取并验证服务端配置，保留配置中的相对路径。
+    ///
+    /// # Errors
+    ///
+    /// 文件不可读、TOML 格式错误或字段不满足约束时返回错误。
+    pub fn read(path: &Path) -> Result<Self> {
+        let config: Self = parse_config(path)?;
+        config.validate()?;
+        Ok(config)
+    }
+
     /// 读取并验证服务端配置，相对路径以配置文件所在目录为基准。
     ///
     /// # Errors
     ///
     /// 文件不可读、TOML 格式错误或字段不满足约束时返回错误。
     pub fn load(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path).map_err(|source| TunnelError::ReadConfig {
-            path: path.to_owned(),
-            source,
-        })?;
-        let mut config: Self =
-            toml::from_str(&content).map_err(|source| TunnelError::ParseConfig {
-                path: path.to_owned(),
-                source,
-            })?;
+        let mut config = Self::read(path)?;
         resolve_path(path, &mut config.quic.certificate);
         resolve_path(path, &mut config.quic.private_key);
-        config.validate()?;
         Ok(config)
     }
 
@@ -289,7 +291,7 @@ impl ClientConfig {
     ///
     /// 文件不可读或 TOML 格式错误时返回错误。
     pub fn read(path: &Path) -> Result<Self> {
-        parse_client_config(path)
+        parse_config(path)
     }
 
     /// 读取并验证客户端配置，相对路径以配置文件所在目录为基准。
@@ -375,7 +377,7 @@ impl ClientConfig {
     }
 }
 
-fn parse_client_config(path: &Path) -> Result<ClientConfig> {
+fn parse_config<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path).map_err(|source| TunnelError::ReadConfig {
         path: path.to_owned(),
         source,
