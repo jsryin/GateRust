@@ -1,4 +1,4 @@
-import type { ClientServiceConfig } from '../../../shared/types';
+import type { ClientServiceConfig } from './client-types';
 
 export interface EditableService extends Omit<ClientServiceConfig, 'target'> {
   id: string;

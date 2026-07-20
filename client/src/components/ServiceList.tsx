@@ -1,6 +1,6 @@
 import { Plus, Trash2 } from 'lucide-react';
 import { memo, useCallback, useLayoutEffect, useRef } from 'react';
-import type { TunnelKind } from '../../../shared/types';
+import type { TunnelKind } from '../lib/client-types';
 import type { EditableService } from '../lib/types';
 
 type ServicesUpdater = (update: (services: EditableService[]) => EditableService[]) => void;

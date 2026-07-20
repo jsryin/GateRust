@@ -71,31 +71,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
             asset_arch: x86_64
-            asset_os: linux-musl
-            electron_arch: x64
-          - runner: ubuntu-latest
-            target: aarch64-unknown-linux-musl
+            asset_os: linux
+            bundle: appimage
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
             asset_arch: aarch64
-            asset_os: linux-musl
-            electron_arch: arm64
+            asset_os: linux
+            bundle: appimage
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             asset_arch: x86_64
             asset_os: windows
-            electron_arch: x64
-          - runner: macos-latest
+            bundle: nsis
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             asset_arch: x86_64
             asset_os: macos
-            electron_arch: x64
-          - runner: macos-latest
+            bundle: dmg
+          - runner: macos-15
             target: aarch64-apple-darwin
             asset_arch: aarch64
             asset_os: macos
-            electron_arch: arm64
+            bundle: dmg
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -115,45 +115,45 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: node -e "const fs=require('node:fs');const cargo=fs.readFileSync('Cargo.toml','utf8').match(/version = \"([^\"]+)\"/)[1];const desktop=require('./client/package.json').version;if ('v'+cargo!==process.env.TAG || desktop!==cargo) throw new Error('client versions do not match release tag')"
-      - name: Build static Linux client
+      - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
-        uses: houseabsolute/actions-rust-cross@21b0f18dc621b25bfae556ff2791fca4173121e8 # v1.0.8
-        with:
-          command: build
-          target: ${{ matrix.target }}
-          args: '--locked --release -p gaterust-client'
-      - name: Build client
-        if: runner.os != 'Linux'
-        run: cargo build --locked --release -p gaterust-client --target ${{ matrix.target }}
-      - name: Stage Unix backend
-        if: runner.os != 'Windows'
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: Install desktop dependencies
+        run: pnpm --dir client install --frozen-lockfile
+      - name: Build desktop client
+        run: pnpm --dir client exec tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundle }} -- --locked
+      - name: Stage Linux package
+        if: runner.os == 'Linux'
+        shell: bash
         env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
           TARGET: ${{ matrix.target }}
         run: |
           set -eu
-          mkdir -p client/resources/bin
-          install -m 0755 "target/$TARGET/release/gaterust-client" client/resources/bin/gaterust-client
-      - name: Stage Windows backend
-        if: runner.os == 'Windows'
-        env:
-          TARGET: ${{ matrix.target }}
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path client/resources/bin | Out-Null
-          Copy-Item "target/$env:TARGET/release/gaterust-client.exe" client/resources/bin/gaterust-client.exe
-      - name: Build desktop UI
-        run: pnpm --dir client install --frozen-lockfile && pnpm --dir client build
-      - name: Package Linux desktop client
-        if: runner.os == 'Linux'
-        run: pnpm --dir client exec electron-builder --linux AppImage --${{ matrix.electron_arch }} --publish never
-      - name: Package macOS desktop client
+          mkdir -p client/release
+          install -m 0755 target/$TARGET/release/bundle/appimage/*.AppImage "client/release/gaterust-client-$ASSET_ARCH-linux.AppImage"
+      - name: Stage macOS package
         if: runner.os == 'macOS'
+        shell: bash
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: pnpm --dir client exec electron-builder --mac zip --${{ matrix.electron_arch }} --publish never
-      - name: Package Windows desktop client
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          mkdir -p client/release
+          cp target/$TARGET/release/bundle/dmg/*.dmg "client/release/gaterust-client-$ASSET_ARCH-macos.dmg"
+      - name: Stage Windows package
         if: runner.os == 'Windows'
-        run: pnpm --dir client exec electron-builder --win portable --${{ matrix.electron_arch }} --publish never
+        shell: pwsh
+        env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          New-Item -ItemType Directory -Force -Path client/release | Out-Null
+          Copy-Item "target/$env:TARGET/release/bundle/nsis/*-setup.exe" "client/release/gaterust-client-$env:ASSET_ARCH-windows.exe"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gaterust-client-${{ matrix.asset_arch }}-${{ matrix.asset_os }}

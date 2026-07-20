@@ -39,20 +39,3 @@ export interface ClientStatus {
   device_id: string | null;
   retry_seconds: number | null;
 }
-
-export interface AppInfo {
-  version: string;
-}
-
-export type DesktopResult<T> = { ok: true; value: T } | { ok: false; error: string };
-
-export interface DesktopBridge {
-  getAppInfo: () => Promise<AppInfo>;
-  getConfig: () => Promise<ConfigResponse>;
-  saveConfig: (config: ClientConfig) => Promise<ConfigResponse>;
-  getStatus: () => Promise<ClientStatus>;
-  generateKey: () => Promise<string>;
-  chooseCertificate: () => Promise<string | null>;
-  setDirty: (dirty: boolean) => void;
-  quit: () => Promise<void>;
-}

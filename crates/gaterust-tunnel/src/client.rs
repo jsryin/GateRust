@@ -84,9 +84,14 @@ pub async fn run_client_with_status(
     status: watch::Sender<ClientStatus>,
 ) -> Result<()> {
     let config_path = config_path.as_ref().to_owned();
-    let mut config = ClientConfig::load(&config_path)?;
-    let mut identity = DeviceIdentity::load(&config_path)?;
     let mut watcher = ConfigWatcher::new(&config_path)?;
+    let Some(mut config) =
+        wait_for_initial_config(&config_path, &mut watcher, &shutdown, &status).await
+    else {
+        status.send_replace(ClientStatus::Stopped { reason: None });
+        return Ok(());
+    };
+    let mut identity = DeviceIdentity::load(&config_path)?;
     let mut retry = Duration::from_secs(1);
     let mut stop_reason = None;
 
@@ -146,6 +151,34 @@ pub async fn run_client_with_status(
     });
     tracing::info!("QUIC 隧道客户端已停止");
     Ok(())
+}
+
+async fn wait_for_initial_config(
+    config_path: &Path,
+    watcher: &mut ConfigWatcher,
+    shutdown: &CancellationToken,
+    status: &watch::Sender<ClientStatus>,
+) -> Option<ClientConfig> {
+    loop {
+        match ClientConfig::load(config_path) {
+            Ok(config) => return Some(config),
+            Err(error) => {
+                status.send_replace(ClientStatus::Unconfigured {
+                    reason: error.to_string(),
+                });
+            }
+        }
+
+        // 初始配置可能由桌面界面稍后补全，等待文件变化而不是快速重试。
+        tokio::select! {
+            () = shutdown.cancelled() => return None,
+            changed = watcher.changed() => {
+                if !changed {
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 enum ConnectionEnd {
@@ -574,6 +607,54 @@ fn is_administrator_disconnect(error: &quinn::ConnectionError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_initial_config_waits_for_update() {
+        let directory = tempfile::tempdir().expect("创建临时目录");
+        let path = directory.path().join("client.toml");
+        ClientConfig::ensure_exists(&path).expect("创建初始客户端配置");
+        let cancellation = CancellationToken::new();
+        let (status_sender, mut status) = watch::channel(ClientStatus::Starting);
+        let task_path = path.clone();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            run_client_with_status(task_path, task_cancellation, status_sender).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                status.changed().await.expect("状态通道保持打开");
+                if matches!(&*status.borrow(), ClientStatus::Unconfigured { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("初始配置无效时应等待更新");
+
+        let mut config = ClientConfig::read(&path).expect("读取初始配置");
+        config.server.address = "127.0.0.1:9".into();
+        config.server.name = Some("localhost".into());
+        config.save(&path).expect("保存有效配置");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                status.changed().await.expect("状态通道保持打开");
+                if matches!(
+                    &*status.borrow(),
+                    ClientStatus::Connecting { .. } | ClientStatus::Reconnecting { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("配置更新后应开始连接");
+
+        cancellation.cancel();
+        task.await
+            .expect("客户端任务正常结束")
+            .expect("客户端运行成功");
+    }
 
     #[tokio::test]
     async fn configuration_change_interrupts_connection_step() {

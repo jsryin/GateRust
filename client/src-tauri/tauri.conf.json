@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "GateRust Client",
+  "version": "../package.json",
+  "identifier": "io.github.jsryin.gaterust.client",
+  "mainBinaryName": "gaterust-client-desktop",
+  "build": {
+    "beforeDevCommand": "pnpm frontend:dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "pnpm frontend:build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+      "devCsp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "GateRust Client",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 820,
+        "minHeight": 620,
+        "visible": false,
+        "center": true,
+        "backgroundColor": "#f3f5f4"
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "shortDescription": "GateRust QUIC tunnel client",
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

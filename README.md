@@ -39,17 +39,31 @@ gaterust uninstall --all --yes
 
 配置位于 `/etc/gaterust`，运行数据位于 `/var/lib/gaterust`。`--init-tunnel` 生成的自签名证书位于 `/etc/gaterust/tunnel/server.pem`。
 
+## 桌面客户端
 
-可通过 `--config /path/to/client.toml` 指定配置文件。
-
-在 Linux 或 WSL2 使用系统 Wine 构建 Windows 便携版：
+安装前端依赖并启动开发环境：
 
 ```bash
-USE_SYSTEM_WINE=true pnpm --dir client exec electron-builder \
-  --win portable --x64 --publish never
+pnpm --dir client install --frozen-lockfile
+pnpm --dir client dev
 ```
 
-便携版输出到 `client/release/gaterust-client-x64-win.exe`。通过 `RUST_LOG` 调整日志级别。
+生成当前平台安装包：
+
+```bash
+pnpm --dir client build
+```
+
+生成可直接运行的 Windows .exe，不打安装包：
+```
+RC=llvm-rc-21 pnpm --dir client exec tauri build \
+    --runner cargo-xwin \
+    --target x86_64-pc-windows-msvc \
+    --no-bundle \
+    -- --locked
+```
+安装包输出位置：
+target/x86_64-pc-windows-msvc/release/bundle/nsis/GateRust Client_0.1.0_x64-setup.exe
 
 
 ## 本地测试

@@ -1,4 +1,4 @@
-import type { ClientStatus, ClientStatusState } from '../../../shared/types';
+import type { ClientStatus, ClientStatusState } from '../lib/client-types';
 
 interface StatusPaneProps {
   status: ClientStatus;
@@ -11,7 +11,7 @@ const labels: Record<ClientStatusState, string> = {
   connected: '已连接',
   reconnecting: '等待重连',
   stopped: '已停止',
-  offline: '后台已断开'
+  offline: '运行时已断开'
 };
 
 export function StatusPane({ status }: StatusPaneProps) {

@@ -8,11 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-axum.workspace = true
 clap.workspace = true
 gaterust-tunnel = { path = "../gaterust-tunnel" }
-serde.workspace = true
-subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

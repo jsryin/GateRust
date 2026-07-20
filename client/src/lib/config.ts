@@ -1,4 +1,4 @@
-import type { ClientConfig } from '../../../shared/types';
+import type { ClientConfig } from './client-types';
 import type { EditableClientConfig } from './types';
 
 function optional(value: string | null | undefined): string | null {

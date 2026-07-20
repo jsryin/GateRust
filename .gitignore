@@ -3,7 +3,7 @@
 **/*.rs.bk
 *.pdb
 
-# Svelte / Node.js build artifacts
+# Frontend / Node.js build artifacts
 **/node_modules/
 **/.svelte-kit/
 **/build/
@@ -11,9 +11,7 @@
 **/.vite/
 **/coverage/
 *.tsbuildinfo
-/client/out/
-/client/release/
-/client/resources/bin/gaterust-client*
+/client/src-tauri/gen/
 
 # Local environment and secrets
 .env

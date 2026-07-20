@@ -1,11 +1,7 @@
-mod api;
-mod app;
-mod error;
-mod paths;
-
 use std::path::PathBuf;
 
 use clap::Parser;
+use gaterust_client::prepare_config_path;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -27,18 +23,17 @@ async fn main() {
         return;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) => EnvFilter::new("info"),
+    };
+    if let Err(error) = tracing_subscriber::fmt().with_env_filter(filter).try_init() {
+        eprintln!("初始化日志失败: {error}");
+    }
     let result = async {
-        let config_path = paths::config_path(arguments.config)?;
-        let created = gaterust_tunnel::ClientConfig::ensure_exists(&config_path)?;
-        if created {
-            tracing::info!(path = %config_path.display(), "已创建客户端初始配置");
-        }
-        app::run(config_path).await
+        let config_path = prepare_config_path(arguments.config)?;
+        gaterust_tunnel::run_client(config_path).await?;
+        Ok::<_, gaterust_client::ClientError>(())
     }
     .await;
     if let Err(error) = result {

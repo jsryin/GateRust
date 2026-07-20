@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "client/src-tauri",
     "crates/gaterust-client",
     "crates/gaterust-control",
     "crates/gaterust-proxy",

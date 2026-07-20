@@ -1,7 +1,8 @@
 import { LoaderCircle, LogOut, RefreshCw, Save, ShieldCheck } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import type { ClientStatus, ConfigResponse } from '../../shared/types';
+import type { ClientStatus, ConfigResponse } from './lib/client-types';
+import { desktop } from './lib/desktop';
 import { ConnectionSettings } from './components/ConnectionSettings';
 import { ServiceList } from './components/ServiceList';
 import { StatusPane } from './components/StatusPane';
@@ -18,14 +19,15 @@ const startingStatus: ClientStatus = {
 
 const offlineStatus: ClientStatus = {
   state: 'offline',
-  message: '无法连接客户端后台',
+  message: '客户端运行时不可用',
   server: null,
   device_id: null,
   retry_seconds: null
 };
 
 function errorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error ? error.message : fallback;
+  if (error instanceof Error) return error.message;
+  return typeof error === 'string' ? error : fallback;
 }
 
 export function App() {
@@ -39,6 +41,7 @@ export function App() {
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<ClientStatus>(startingStatus);
   const [version, setVersion] = useState('');
+  const dirtyRef = useRef(false);
   const noticeTimer = useRef<number | undefined>(undefined);
 
   const preparedConfig = useMemo(() => (draft ? prepareConfig(draft) : null), [draft]);
@@ -62,7 +65,7 @@ export function App() {
 
   const refreshStatus = useCallback(async () => {
     try {
-      setStatus(await window.gaterust.getStatus());
+      setStatus(await desktop.getStatus());
     } catch {
       setStatus(offlineStatus);
     }
@@ -72,14 +75,14 @@ export function App() {
     setLoading(true);
     setFatalError('');
     try {
-      const [config, currentStatus, appInfo] = await Promise.all([
-        window.gaterust.getConfig(),
-        window.gaterust.getStatus(),
-        window.gaterust.getAppInfo()
+      const [config, currentStatus, version] = await Promise.all([
+        desktop.getConfig(),
+        desktop.getStatus(),
+        desktop.getVersion()
       ]);
       applyConfig(config);
       setStatus(currentStatus);
-      setVersion(appInfo.version);
+      setVersion(version);
     } catch (error) {
       setStatus(offlineStatus);
       setFatalError(errorMessage(error, '客户端配置加载失败'));
@@ -92,13 +95,33 @@ export function App() {
     void load();
     return () => {
       window.clearTimeout(noticeTimer.current);
-      window.gaterust.setDirty(false);
     };
   }, [load]);
 
   useEffect(() => {
-    window.gaterust.setDirty(dirty);
+    dirtyRef.current = dirty;
   }, [dirty]);
+
+  useEffect(() => {
+    let disposed = false;
+    let removeCloseListener: (() => void) | undefined;
+    void desktop
+      .onCloseRequested(() => dirtyRef.current)
+      .then((remove) => {
+        if (disposed) {
+          remove();
+        } else {
+          removeCloseListener = remove;
+        }
+      })
+      .catch((error: unknown) => {
+        showNotice(errorMessage(error, '无法监听窗口关闭事件'), 'error');
+      });
+    return () => {
+      disposed = true;
+      removeCloseListener?.();
+    };
+  }, [showNotice]);
 
   useEffect(() => {
     if (!pollingEnabled) return;
@@ -154,7 +177,7 @@ export function App() {
 
     setSaving(true);
     try {
-      applyConfig(await window.gaterust.saveConfig(preparedConfig));
+      applyConfig(await desktop.saveConfig(preparedConfig));
       showNotice('配置已保存，连接正在更新', 'success');
       await refreshStatus();
     } catch (error) {
@@ -168,7 +191,7 @@ export function App() {
     if (generating) return;
     setGenerating(true);
     try {
-      updateGroupKey(await window.gaterust.generateKey());
+      updateGroupKey(await desktop.generateKey());
     } catch (error) {
       showNotice(errorMessage(error, '生成密钥失败'), 'error');
     } finally {
@@ -178,7 +201,7 @@ export function App() {
 
   async function chooseCertificate(): Promise<void> {
     try {
-      const path = await window.gaterust.chooseCertificate();
+      const path = await desktop.chooseCertificate();
       if (path) {
         setDraft((current) =>
           current
@@ -188,6 +211,14 @@ export function App() {
       }
     } catch (error) {
       showNotice(errorMessage(error, '选择证书失败'), 'error');
+    }
+  }
+
+  async function quit(): Promise<void> {
+    try {
+      await desktop.quit(dirty);
+    } catch (error) {
+      showNotice(errorMessage(error, '退出客户端失败'), 'error');
     }
   }
 
@@ -210,7 +241,7 @@ export function App() {
           <button
             aria-label="退出客户端"
             className="icon-button quit-button"
-            onClick={() => void window.gaterust.quit()}
+            onClick={() => void quit()}
             title="退出客户端"
             type="button"
           >
