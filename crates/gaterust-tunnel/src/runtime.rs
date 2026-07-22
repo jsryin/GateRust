@@ -7,9 +7,10 @@ use std::{
 
 use quinn::{Connection, VarInt};
 use serde::Serialize;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 
 use crate::{
+    client::{ClientTunnel, ClientTunnelState},
     config::{ServerTunnelConfig, TunnelKind},
     protocol::ServiceDeclaration,
 };
@@ -17,9 +18,10 @@ use crate::{
 const MAX_ONLINE_CLIENTS: usize = 128;
 pub(crate) const ADMINISTRATOR_CLOSE_CODE: u32 = 12;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TunnelRuntime {
     state: Arc<RwLock<RuntimeState>>,
+    revision: watch::Sender<u64>,
 }
 
 #[derive(Serialize)]
@@ -41,7 +43,6 @@ pub struct RuntimeClient {
 pub struct RuntimeTunnel {
     pub name: String,
     pub owner_session_id: Option<u64>,
-    pub waiting_session_ids: Vec<u64>,
 }
 
 #[derive(Clone)]
@@ -73,6 +74,18 @@ struct SessionEntry {
 struct TunnelSpec {
     group: String,
     kind: TunnelKind,
+    bind: SocketAddr,
+    local_port: Option<u16>,
+}
+
+impl Default for TunnelRuntime {
+    fn default() -> Self {
+        let (revision, _) = watch::channel(0);
+        Self {
+            state: Arc::new(RwLock::new(RuntimeState::default())),
+            revision,
+        }
+    }
 }
 
 impl TunnelRuntime {
@@ -98,23 +111,10 @@ impl TunnelRuntime {
 
         let mut tunnels = state
             .tunnels
-            .iter()
-            .map(|(name, spec)| {
-                let owner_session_id = state.owners.get(name).copied();
-                let mut waiting_session_ids = state
-                    .sessions
-                    .iter()
-                    .filter_map(|(&id, session)| {
-                        (Some(id) != owner_session_id && eligible(session, name, spec))
-                            .then_some(id)
-                    })
-                    .collect::<Vec<_>>();
-                waiting_session_ids.sort_unstable();
-                RuntimeTunnel {
-                    name: name.clone(),
-                    owner_session_id,
-                    waiting_session_ids,
-                }
+            .keys()
+            .map(|name| RuntimeTunnel {
+                name: name.clone(),
+                owner_session_id: state.owners.get(name).copied(),
             })
             .collect::<Vec<_>>();
         tunnels.sort_unstable_by(|left, right| left.name.cmp(&right.name));
@@ -127,9 +127,10 @@ impl TunnelRuntime {
             let Some(session) = state.sessions.remove(&session_id) else {
                 return false;
             };
-            reconcile(&mut state);
+            release_session(&mut state, session_id);
             session.connection
         };
+        self.notify();
         connection.close(
             VarInt::from_u32(ADMINISTRATOR_CLOSE_CODE),
             b"disconnected by administrator",
@@ -147,11 +148,15 @@ impl TunnelRuntime {
                     TunnelSpec {
                         group: config.group.clone(),
                         kind: config.kind,
+                        bind: config.bind,
+                        local_port: config.client_local_port(),
                     },
                 )
             })
             .collect();
-        reconcile(&mut state);
+        retain_valid_owners(&mut state);
+        drop(state);
+        self.notify();
     }
 
     pub(crate) async fn register(
@@ -184,23 +189,32 @@ impl TunnelRuntime {
                 services: service_map(services),
             },
         );
-        reconcile(&mut state);
+        claim_available(&mut state, id);
+        drop(state);
+        self.notify();
         Ok(())
     }
 
     pub(crate) async fn update_services(&self, id: u64, services: Vec<ServiceDeclaration>) {
         let mut state = self.state.write().await;
-        if let Some(session) = state.sessions.get_mut(&id) {
-            session.services = service_map(services);
-            reconcile(&mut state);
-        }
+        let Some(session) = state.sessions.get_mut(&id) else {
+            return;
+        };
+        session.services = service_map(services);
+        retain_valid_owners(&mut state);
+        claim_available(&mut state, id);
+        drop(state);
+        self.notify();
     }
 
     pub(crate) async fn unregister(&self, id: u64) {
         let mut state = self.state.write().await;
-        if state.sessions.remove(&id).is_some() {
-            reconcile(&mut state);
+        if state.sessions.remove(&id).is_none() {
+            return;
         }
+        release_session(&mut state, id);
+        drop(state);
+        self.notify();
     }
 
     pub(crate) async fn find(&self, tunnel: &str) -> Option<ClientSession> {
@@ -210,34 +224,77 @@ impl TunnelRuntime {
             connection: session.connection.clone(),
         })
     }
+
+    pub(crate) async fn catalog(&self, session_id: u64) -> Vec<ClientTunnel> {
+        let state = self.state.read().await;
+        let Some(session) = state.sessions.get(&session_id) else {
+            return Vec::new();
+        };
+        let mut tunnels = state
+            .tunnels
+            .iter()
+            .filter(|(_, spec)| spec.group == session.group)
+            .map(|(name, spec)| {
+                let state = match state.owners.get(name) {
+                    None => ClientTunnelState::Idle,
+                    Some(owner) if *owner == session_id => ClientTunnelState::Connected,
+                    Some(_) => ClientTunnelState::Occupied,
+                };
+                ClientTunnel {
+                    name: name.clone(),
+                    kind: spec.kind,
+                    server_port: spec.bind.port(),
+                    local_port: spec.local_port,
+                    state,
+                }
+            })
+            .collect::<Vec<_>>();
+        tunnels.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        tunnels
+    }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.revision.subscribe()
+    }
+
+    fn notify(&self) {
+        self.revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
 }
 
-fn reconcile(state: &mut RuntimeState) {
-    let previous = std::mem::take(&mut state.owners);
-    for (name, id) in previous {
-        let Some(spec) = state.tunnels.get(&name) else {
-            continue;
+fn retain_valid_owners(state: &mut RuntimeState) {
+    let RuntimeState {
+        sessions,
+        tunnels,
+        owners,
+    } = state;
+    owners.retain(|name, id| {
+        let Some(spec) = tunnels.get(name) else {
+            return false;
         };
-        if state
-            .sessions
-            .get(&id)
-            .is_some_and(|session| eligible(session, &name, spec))
-        {
-            state.owners.insert(name, id);
-        }
-    }
-    for (name, spec) in &state.tunnels {
-        if state.owners.contains_key(name) {
-            continue;
-        }
-        if let Some(id) = state
-            .sessions
-            .iter()
-            .filter_map(|(&id, session)| eligible(session, name, spec).then_some(id))
-            .min()
-        {
-            state.owners.insert(name.clone(), id);
-        }
+        sessions
+            .get(id)
+            .is_some_and(|session| eligible(session, name, spec))
+    });
+}
+
+fn release_session(state: &mut RuntimeState, session_id: u64) {
+    state.owners.retain(|_, owner| *owner != session_id);
+}
+
+fn claim_available(state: &mut RuntimeState, session_id: u64) {
+    let Some(session) = state.sessions.get(&session_id) else {
+        return;
+    };
+    let available = state
+        .tunnels
+        .iter()
+        .filter(|&(name, spec)| !state.owners.contains_key(name) && eligible(session, name, spec))
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    for name in available {
+        state.owners.insert(name, session_id);
     }
 }
 

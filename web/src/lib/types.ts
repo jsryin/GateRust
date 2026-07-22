@@ -10,6 +10,7 @@ export interface TunnelConfig {
   group: string;
   kind: TunnelKind;
   bind: string;
+  local_port: number | null;
   limit_bps: number | null;
   max_connections: number;
   max_udp_sessions: number;
@@ -100,6 +101,5 @@ export interface TunnelRuntimeState {
   tunnels: {
     name: string;
     owner_session_id: number | null;
-    waiting_session_ids: number[];
   }[];
 }

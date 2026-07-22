@@ -15,6 +15,12 @@ interface ClientGeneratorProps {
   token: string;
 }
 
+function localTarget(bind: string, localPort: number | null): string {
+  const separator = bind.lastIndexOf(':');
+  const fallback = separator >= 0 ? bind.slice(separator + 1) : '8080';
+  return `127.0.0.1:${localPort ?? fallback}`;
+}
+
 export function ClientGenerator({ config, token }: ClientGeneratorProps) {
   const [group, setGroup] = useState(config?.groups[0]?.name ?? '');
   const [serverAddress, setServerAddress] = useState(
@@ -26,7 +32,7 @@ export function ClientGenerator({ config, token }: ClientGeneratorProps) {
     () => config?.tunnels.map((tunnel) => ({
       name: tunnel.name,
       kind: tunnel.kind,
-      target: tunnel.kind === 'socks5' ? null : '127.0.0.1:8080'
+      target: tunnel.kind === 'socks5' ? null : localTarget(tunnel.bind, tunnel.local_port)
     })) ?? []
   );
   const [result, setResult] = useState('');

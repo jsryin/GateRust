@@ -18,9 +18,14 @@ export interface ClientConfig {
   services: ClientServiceConfig[];
 }
 
-export interface ConfigResponse {
-  path: string;
-  config: ClientConfig;
+export type ClientTunnelState = 'idle' | 'connected' | 'occupied';
+
+export interface ClientTunnel {
+  name: string;
+  kind: TunnelKind;
+  server_port: number;
+  local_port: number | null;
+  state: ClientTunnelState;
 }
 
 export type ClientStatusState =
@@ -38,4 +43,5 @@ export interface ClientStatus {
   server: string | null;
   device_id: string | null;
   retry_seconds: number | null;
+  tunnels: ClientTunnel[];
 }

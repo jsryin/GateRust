@@ -636,7 +636,10 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
 
 #[cfg(all(test, feature = "tunnel"))]
 mod tunnel_tests {
-    use std::{num::NonZeroU64, str::FromStr as _};
+    use std::{
+        num::{NonZeroU16, NonZeroU64},
+        str::FromStr as _,
+    };
 
     use gaterust_tunnel::{
         GroupConfig, ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind,
@@ -684,6 +687,7 @@ mod tunnel_tests {
                 group: "office".into(),
                 kind: TunnelKind::Tcp,
                 bind: "127.0.0.1:22022".parse().expect("测试地址有效"),
+                local_port: NonZeroU16::new(22),
                 limit_bps: NonZeroU64::from_str("1024").ok(),
                 max_connections: 8,
                 max_udp_sessions: 8,

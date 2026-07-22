@@ -6,6 +6,8 @@ pub enum ClientError {
     ConfigDirectoryUnavailable,
     #[error("客户端运行时必须在 Tokio 上下文中启动")]
     RuntimeUnavailable,
+    #[error("{0}")]
+    InvalidOperation(String),
     #[error(transparent)]
     Tunnel(#[from] gaterust_tunnel::TunnelError),
     #[error("等待客户端运行时任务失败: {0}")]

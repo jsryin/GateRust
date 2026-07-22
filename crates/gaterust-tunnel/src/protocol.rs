@@ -3,10 +3,14 @@ use std::time::Duration;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{Result, TunnelError, config::TunnelKind};
+use crate::{
+    Result, TunnelError,
+    client::ClientTunnel,
+    config::{MAX_CLIENT_SERVICES, TunnelKind},
+};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
-pub(crate) const MAX_CONTROL_FRAME: usize = 64 * 1024;
+pub(crate) const PROTOCOL_VERSION: u16 = 3;
+pub(crate) const MAX_CONTROL_FRAME: usize = 256 * 1024;
 pub(crate) const MAX_DATAGRAM: usize = u16::MAX as usize;
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -31,11 +35,17 @@ pub(crate) enum AuthenticationStatus {
 pub(crate) struct ServerHello {
     pub status: AuthenticationStatus,
     pub message: String,
+    pub tunnels: Vec<ClientTunnel>,
 }
 
 #[derive(serde::Deserialize, Serialize)]
 pub(crate) enum ControlMessage {
     UpdateServices(Vec<ServiceDeclaration>),
+}
+
+#[derive(serde::Deserialize, Serialize)]
+pub(crate) enum ServerControlMessage {
+    TunnelSnapshot(Vec<ClientTunnel>),
 }
 
 #[derive(Clone, serde::Deserialize, Serialize)]
@@ -45,10 +55,10 @@ pub(crate) struct ServiceDeclaration {
 }
 
 pub(crate) fn validate_declarations(services: &[ServiceDeclaration]) -> Result<()> {
-    if services.len() > 256 {
-        return Err(TunnelError::Protocol(
-            "单个客户端最多声明 256 个服务".into(),
-        ));
+    if services.len() > MAX_CLIENT_SERVICES {
+        return Err(TunnelError::Protocol(format!(
+            "单个客户端最多声明 {MAX_CLIENT_SERVICES} 个服务"
+        )));
     }
     let mut names = std::collections::HashSet::with_capacity(services.len());
     for service in services {
@@ -86,7 +96,7 @@ where
     let payload = serde_json::to_vec(value)
         .map_err(|error| TunnelError::Protocol(format!("序列化控制帧失败: {error}")))?;
     if payload.len() > MAX_CONTROL_FRAME {
-        return Err(TunnelError::Protocol("控制帧超过 64 KiB".into()));
+        return Err(TunnelError::Protocol("控制帧超过 256 KiB".into()));
     }
     let length =
         u32::try_from(payload.len()).map_err(|_| TunnelError::Protocol("控制帧长度溢出".into()))?;
@@ -102,7 +112,7 @@ where
 {
     let length = reader.read_u32().await? as usize;
     if length > MAX_CONTROL_FRAME {
-        return Err(TunnelError::Protocol("控制帧超过 64 KiB".into()));
+        return Err(TunnelError::Protocol("控制帧超过 256 KiB".into()));
     }
     let mut payload = vec![0; length];
     reader.read_exact(&mut payload).await?;
@@ -132,4 +142,27 @@ where
     buffer.resize(length, 0);
     reader.read_exact(buffer).await?;
     Ok(length)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::ClientTunnelState;
+
+    #[test]
+    fn maximum_tunnel_snapshot_fits_control_frame() {
+        let tunnels = (0..1_024)
+            .map(|index| ClientTunnel {
+                name: format!("{index:064}"),
+                kind: TunnelKind::Tcp,
+                server_port: u16::MAX,
+                local_port: Some(u16::MAX),
+                state: ClientTunnelState::Connected,
+            })
+            .collect();
+        let message = ServerControlMessage::TunnelSnapshot(tunnels);
+        let payload = serde_json::to_vec(&message).expect("快照应可序列化");
+
+        assert!(payload.len() <= MAX_CONTROL_FRAME);
+    }
 }

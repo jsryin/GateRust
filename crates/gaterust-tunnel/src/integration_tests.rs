@@ -9,8 +9,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    TunnelRuntime, TunnelRuntimeSnapshot, check_server_config, run_client_with_shutdown,
-    run_server_with_runtime, run_server_with_shutdown,
+    ClientConfig, ClientTunnelState, TunnelRuntime, TunnelRuntimeSnapshot, check_server_config,
+    run_client_with_shutdown, run_server_with_runtime,
 };
 
 const TEST_KEY: &str = "12345678901234567890123456789012";
@@ -66,15 +66,28 @@ async fn forwards_tcp_udp_and_socks5() {
     );
 
     let cancellation = CancellationToken::new();
+    let runtime = TunnelRuntime::new();
     let server_path = directory.path().join("server.toml");
     let client_path = directory.path().join("client.toml");
     let server_cancel = cancellation.clone();
-    let server =
-        tokio::spawn(async move { run_server_with_shutdown(server_path, server_cancel).await });
+    let server_runtime = runtime.clone();
+    let server = tokio::spawn(async move {
+        run_server_with_runtime(server_path, server_runtime, server_cancel).await
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     let client_cancel = cancellation.clone();
     let client =
         tokio::spawn(async move { run_client_with_shutdown(client_path, client_cancel).await });
+
+    wait_for_runtime(&runtime, |snapshot| {
+        snapshot.clients.len() == 1
+            && snapshot
+                .tunnels
+                .iter()
+                .find(|tunnel| tunnel.name == "tcp-echo")
+                .is_some_and(|tunnel| tunnel.owner_session_id.is_some())
+    })
+    .await;
 
     assert_stream_echo(tcp_public, b"tcp-through-quic").await;
     let mut persistent = TcpStream::connect(tcp_public)
@@ -118,6 +131,21 @@ async fn forwards_tcp_udp_and_socks5() {
         socks_public,
         true,
     );
+    wait_for_runtime(&runtime, |snapshot| {
+        snapshot
+            .tunnels
+            .iter()
+            .find(|tunnel| tunnel.name == "tcp-echo")
+            .is_some_and(|tunnel| tunnel.owner_session_id.is_none())
+    })
+    .await;
+    write_client_config(
+        directory.path(),
+        quic,
+        tcp_target_address,
+        udp_target_address,
+        true,
+    );
     assert_stream_echo(tcp_public, b"after-server-add").await;
     drop(persistent);
 
@@ -133,7 +161,7 @@ async fn forwards_tcp_udp_and_socks5() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shares_key_and_hands_tunnel_to_waiting_client() {
+async fn occupied_tunnel_requires_a_new_selection_after_release() {
     let directory = tempfile::tempdir().expect("应能创建测试目录");
     write_certificate(directory.path());
     let quic = unused_udp_address();
@@ -154,6 +182,7 @@ name = "shared-tunnel"
 group = "shared"
 kind = "tcp"
 bind = "{public}"
+local_port = 9
 "#
     );
     std::fs::write(directory.path().join("server.toml"), server_config).expect("应能写服务端配置");
@@ -175,7 +204,7 @@ target = "127.0.0.1:9"
     let first_path = directory.path().join("first.toml");
     let second_path = directory.path().join("second.toml");
     std::fs::write(&first_path, &client_config).expect("应能写第一个客户端配置");
-    std::fs::write(&second_path, client_config).expect("应能写第二个客户端配置");
+    std::fs::write(&second_path, &client_config).expect("应能写第二个客户端配置");
 
     let cancellation = CancellationToken::new();
     let runtime = TunnelRuntime::new();
@@ -192,30 +221,59 @@ target = "127.0.0.1:9"
         tokio::spawn(async move { run_client_with_shutdown(first_path, first_cancel).await });
     wait_for_runtime(&runtime, |snapshot| snapshot.clients.len() == 1).await;
     let second_cancel = cancellation.clone();
+    let second_runtime_path = second_path.clone();
     let second =
-        tokio::spawn(async move { run_client_with_shutdown(second_path, second_cancel).await });
+        tokio::spawn(
+            async move { run_client_with_shutdown(second_runtime_path, second_cancel).await },
+        );
     let snapshot = wait_for_runtime(&runtime, |snapshot| {
         snapshot.clients.len() == 2
             && snapshot
                 .tunnels
                 .first()
-                .is_some_and(|tunnel| tunnel.waiting_session_ids.len() == 1)
+                .is_some_and(|tunnel| tunnel.owner_session_id.is_some())
     })
     .await;
     let tunnel = snapshot.tunnels.first().expect("应存在隧道状态");
     let owner = tunnel.owner_session_id.expect("应存在隧道所有者");
-    let waiting = tunnel.waiting_session_ids[0];
-    assert_ne!(owner, waiting);
+    let occupied_client = snapshot
+        .clients
+        .iter()
+        .find(|client| client.session_id != owner)
+        .expect("应存在未获得隧道的客户端")
+        .session_id;
+    let catalog = runtime.catalog(occupied_client).await;
+    assert_eq!(catalog[0].state, ClientTunnelState::Occupied);
+    assert_eq!(catalog[0].server_port, public.port());
+    assert_eq!(catalog[0].local_port, Some(9));
+
     assert!(runtime.disconnect(owner).await);
-    let promoted = wait_for_runtime(&runtime, |snapshot| {
+    wait_for_runtime(&runtime, |snapshot| {
         snapshot.clients.len() == 1
             && snapshot
                 .tunnels
                 .first()
-                .is_some_and(|tunnel| tunnel.owner_session_id == Some(waiting))
+                .is_some_and(|tunnel| tunnel.owner_session_id.is_none())
     })
     .await;
-    assert!(promoted.tunnels[0].waiting_session_ids.is_empty());
+    assert_eq!(
+        runtime.catalog(occupied_client).await[0].state,
+        ClientTunnelState::Idle
+    );
+
+    // 释放后不自动转交；重新保存相同选择代表客户端再次显式连接。
+    ClientConfig::read(&second_path)
+        .expect("应能读取第二个客户端配置")
+        .save(&second_path)
+        .expect("应能重新提交客户端选择");
+    let claimed = wait_for_runtime(&runtime, |snapshot| {
+        snapshot
+            .tunnels
+            .first()
+            .is_some_and(|tunnel| tunnel.owner_session_id == Some(occupied_client))
+    })
+    .await;
+    assert_eq!(claimed.clients.len(), 1);
 
     cancellation.cancel();
     assert_task_ok(server, "服务端").await;
@@ -405,7 +463,10 @@ async fn assert_stream_echo(address: SocketAddr, payload: &[u8]) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("TCP 隧道未在预期时间内就绪");
+    panic!(
+        "TCP 隧道未在预期时间内就绪: {}",
+        String::from_utf8_lossy(payload)
+    );
 }
 
 async fn wait_until_stream_unavailable(address: SocketAddr) {

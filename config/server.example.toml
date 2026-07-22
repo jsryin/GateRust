@@ -12,6 +12,7 @@ name = "ssh"
 group = "office"
 kind = "tcp"
 bind = "0.0.0.0:22022"
+local_port = 22
 limit_bps = 10485760
 max_connections = 128
 
@@ -20,6 +21,7 @@ name = "game-udp"
 group = "office"
 kind = "udp"
 bind = "0.0.0.0:27015"
+local_port = 27015
 limit_bps = 20971520
 max_udp_sessions = 512
 udp_idle_seconds = 60

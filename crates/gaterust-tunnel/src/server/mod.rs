@@ -29,7 +29,7 @@ use crate::{
     identity::validate_device_id,
     protocol::{
         AuthenticationStatus, ClientHello, ControlMessage, HANDSHAKE_TIMEOUT, PROTOCOL_VERSION,
-        ServerHello, read_frame, validate_declarations, write_frame,
+        ServerControlMessage, ServerHello, read_frame, validate_declarations, write_frame,
     },
     runtime::{RegisterError, TunnelRuntime},
     tls,
@@ -201,6 +201,7 @@ async fn authenticate(
     groups: Arc<RwLock<Vec<(String, GroupSecret)>>>,
     authentication_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
+    let mut changes = runtime.subscribe();
     let remote = connection.remote_address();
     let (mut send, mut receive) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
         .await
@@ -264,11 +265,14 @@ async fn authenticate(
             return Ok(());
         }
     }
+    // 先确认已观察到注册变更，再生成快照；后续变更不会在握手窗口内丢失。
+    changes.borrow_and_update();
     if let Err(error) = write_frame(
         &mut send,
         &ServerHello {
             status: AuthenticationStatus::Accepted,
             message: String::new(),
+            tunnels: runtime.catalog(id).await,
         },
     )
     .await
@@ -281,15 +285,28 @@ async fn authenticate(
     let device_id = hello.device_id;
     tracing::info!(group, %device_id, %remote, "内网客户端已上线");
     let result = loop {
-        match read_frame::<_, ControlMessage>(&mut receive).await {
-            Ok(ControlMessage::UpdateServices(services)) => {
-                if let Err(error) = validate_declarations(&services) {
+        tokio::select! {
+            message = read_frame::<_, ControlMessage>(&mut receive) => {
+                match message {
+                    Ok(ControlMessage::UpdateServices(services)) => {
+                        if let Err(error) = validate_declarations(&services) {
+                            break Err(error);
+                        }
+                        runtime.update_services(id, services).await;
+                        tracing::info!(group, %device_id, "客户端服务声明已更新");
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    break Err(TunnelError::Protocol("隧道状态通道已关闭".into()));
+                }
+                let snapshot = ServerControlMessage::TunnelSnapshot(runtime.catalog(id).await);
+                if let Err(error) = write_frame(&mut send, &snapshot).await {
                     break Err(error);
                 }
-                runtime.update_services(id, services).await;
-                tracing::info!(group, %device_id, "客户端服务声明已更新");
             }
-            Err(error) => break Err(error),
         }
     };
     runtime.unregister(id).await;
@@ -308,6 +325,7 @@ async fn reject_authentication(
         &ServerHello {
             status,
             message: message.into(),
+            tunnels: Vec::new(),
         },
     )
     .await?;
@@ -367,7 +385,11 @@ impl ListenerManager {
         let removed: Vec<_> = self
             .active
             .iter()
-            .filter(|(name, handle)| desired.get(*name) != Some(&handle.config))
+            .filter(|(name, handle)| {
+                desired
+                    .get(*name)
+                    .is_none_or(|config| !same_listener(&handle.config, config))
+            })
             .map(|(name, _)| name.clone())
             .collect();
         for name in removed {
@@ -378,6 +400,11 @@ impl ListenerManager {
                 let handle = start_listener(config.clone(), self.runtime.clone()).await?;
                 tracing::info!(tunnel = %config.name, kind = ?config.kind, address = %config.bind, "公网监听已启动");
                 self.active.insert(config.name.clone(), handle);
+            }
+        }
+        for config in configs {
+            if let Some(handle) = self.active.get_mut(&config.name) {
+                handle.config.clone_from(config);
             }
         }
         Ok(())
@@ -424,6 +451,22 @@ impl ListenerManager {
             }
         }
     }
+}
+
+fn same_listener(current: &ServerTunnelConfig, updated: &ServerTunnelConfig) -> bool {
+    current.name == updated.name
+        && current.kind == updated.kind
+        && current.bind == updated.bind
+        && current.limit_bps == updated.limit_bps
+        && match current.kind {
+            TunnelKind::Tcp | TunnelKind::Socks5 => {
+                current.max_connections == updated.max_connections
+            }
+            TunnelKind::Udp => {
+                current.max_udp_sessions == updated.max_udp_sessions
+                    && current.udp_idle_seconds == updated.udp_idle_seconds
+            }
+        }
 }
 
 impl Drop for ListenerManager {
@@ -486,5 +529,34 @@ async fn await_task(mut task: JoinHandle<()>, name: &str) {
             tracing::warn!(task = name, "等待后台任务退出超时");
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU16;
+
+    use super::*;
+
+    #[test]
+    fn runtime_metadata_change_keeps_listener() {
+        let current = ServerTunnelConfig {
+            name: "ssh".into(),
+            group: "office".into(),
+            kind: TunnelKind::Tcp,
+            bind: "127.0.0.1:22022".parse().expect("测试地址有效"),
+            local_port: NonZeroU16::new(22),
+            limit_bps: None,
+            max_connections: 8,
+            max_udp_sessions: 8,
+            udp_idle_seconds: 30,
+        };
+        let mut updated = current.clone();
+        updated.group = "home".into();
+        updated.local_port = NonZeroU16::new(2222);
+        assert!(same_listener(&current, &updated));
+
+        updated.max_connections += 1;
+        assert!(!same_listener(&current, &updated));
     }
 }

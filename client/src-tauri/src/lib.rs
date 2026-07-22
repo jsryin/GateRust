@@ -26,7 +26,6 @@ pub fn run() -> tauri::Result<()> {
                 focus_main_window(application);
             },
         ))
-        .plugin(tauri_plugin_dialog::init())
         .setup(|application| {
             let config_path = config_path_from_arguments();
             let runtime =
@@ -35,10 +34,11 @@ pub fn run() -> tauri::Result<()> {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::generate_key,
+            commands::connect_tunnels,
+            commands::disconnect_tunnels,
             commands::get_config,
             commands::get_status,
-            commands::save_config,
+            commands::login,
             commands::shutdown,
         ])
         .build(tauri::generate_context!())?;

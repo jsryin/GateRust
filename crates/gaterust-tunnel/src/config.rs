@@ -1,9 +1,9 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::OpenOptions,
     io::{ErrorKind, Write as _},
     net::SocketAddr,
-    num::NonZeroU64,
+    num::{NonZeroU16, NonZeroU64},
     path::{Path, PathBuf},
 };
 
@@ -19,6 +19,7 @@ const DEFAULT_MAX_UDP_SESSIONS: usize = 1_024;
 const DEFAULT_UDP_IDLE_SECONDS: u64 = 60;
 pub(crate) const MIN_GROUP_KEY_LENGTH: usize = 32;
 pub(crate) const MAX_GROUP_KEY_LENGTH: usize = 124;
+pub const MAX_CLIENT_SERVICES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -60,6 +61,8 @@ pub struct ServerTunnelConfig {
     pub group: String,
     pub kind: TunnelKind,
     pub bind: SocketAddr,
+    #[serde(default)]
+    pub local_port: Option<NonZeroU16>,
     pub limit_bps: Option<NonZeroU64>,
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
@@ -94,6 +97,17 @@ pub struct ClientServiceConfig {
     pub name: String,
     pub kind: TunnelKind,
     pub target: Option<String>,
+}
+
+impl ServerTunnelConfig {
+    pub(crate) fn client_local_port(&self) -> Option<u16> {
+        match self.kind {
+            TunnelKind::Tcp | TunnelKind::Udp => {
+                Some(self.local_port.map_or(self.bind.port(), NonZeroU16::get))
+            }
+            TunnelKind::Socks5 => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -176,6 +190,7 @@ impl ServerConfig {
         }
 
         let mut names = HashSet::new();
+        let mut tunnels_per_group = HashMap::new();
         let mut stream_binds = HashSet::new();
         let mut udp_binds = HashSet::new();
         for tunnel in &self.tunnels {
@@ -190,6 +205,28 @@ impl ServerConfig {
                 return Err(TunnelError::InvalidConfig(format!(
                     "隧道 {} 引用了不存在的分组 {}",
                     tunnel.name, tunnel.group
+                )));
+            }
+            let group_tunnels = tunnels_per_group
+                .entry(tunnel.group.as_str())
+                .or_insert(0_usize);
+            *group_tunnels += 1;
+            if *group_tunnels > MAX_CLIENT_SERVICES {
+                return Err(TunnelError::InvalidConfig(format!(
+                    "分组 {} 的隧道不能超过 {MAX_CLIENT_SERVICES} 个",
+                    tunnel.group
+                )));
+            }
+            if tunnel.bind.port() == 0 {
+                return Err(TunnelError::InvalidConfig(format!(
+                    "隧道 {} 的监听端口不能为 0",
+                    tunnel.name
+                )));
+            }
+            if tunnel.kind == TunnelKind::Socks5 && tunnel.local_port.is_some() {
+                return Err(TunnelError::InvalidConfig(format!(
+                    "SOCKS5 隧道 {} 不应配置 local_port",
+                    tunnel.name
                 )));
             }
             if tunnel.max_connections == 0 {
@@ -331,10 +368,10 @@ impl ClientConfig {
         }
         self.server_name()?;
 
-        if self.services.len() > 256 {
-            return Err(TunnelError::InvalidConfig(
-                "单个客户端最多声明 256 个服务".into(),
-            ));
+        if self.services.len() > MAX_CLIENT_SERVICES {
+            return Err(TunnelError::InvalidConfig(format!(
+                "单个客户端最多声明 {MAX_CLIENT_SERVICES} 个服务"
+            )));
         }
         let mut names = HashSet::new();
         for service in &self.services {
@@ -558,6 +595,62 @@ mod tests {
             tunnels: Vec::new(),
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_group_exceeding_client_tunnel_limit() {
+        let tunnels = (0..=MAX_CLIENT_SERVICES)
+            .map(|index| {
+                let offset = u16::try_from(index).expect("测试索引在 u16 范围内");
+                ServerTunnelConfig {
+                    name: format!("tunnel-{index}"),
+                    group: "office".into(),
+                    kind: TunnelKind::Tcp,
+                    bind: SocketAddr::from(([127, 0, 0, 1], 10_000 + offset)),
+                    local_port: None,
+                    limit_bps: None,
+                    max_connections: 8,
+                    max_udp_sessions: 8,
+                    udp_idle_seconds: 30,
+                }
+            })
+            .collect();
+        let config = ServerConfig {
+            quic: ServerQuicConfig {
+                bind: "127.0.0.1:2333".parse().expect("测试地址有效"),
+                certificate: "server.pem".into(),
+                private_key: "server-key.pem".into(),
+            },
+            groups: vec![GroupConfig {
+                name: "office".into(),
+                key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            }],
+            tunnels,
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn derives_legacy_local_port_from_tunnel_bind() {
+        let mut tunnel = ServerTunnelConfig {
+            name: "ssh".into(),
+            group: "office".into(),
+            kind: TunnelKind::Tcp,
+            bind: "0.0.0.0:22022".parse().expect("测试地址有效"),
+            local_port: None,
+            limit_bps: None,
+            max_connections: 8,
+            max_udp_sessions: 8,
+            udp_idle_seconds: 30,
+        };
+        assert_eq!(tunnel.client_local_port(), Some(22022));
+
+        tunnel.local_port = NonZeroU16::new(22);
+        assert_eq!(tunnel.client_local_port(), Some(22));
+
+        tunnel.kind = TunnelKind::Socks5;
+        assert_eq!(tunnel.client_local_port(), None);
     }
 
     #[test]

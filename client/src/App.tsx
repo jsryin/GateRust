@@ -1,28 +1,17 @@
-import { LoaderCircle, LogOut, RefreshCw, Save, ShieldCheck } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { FormEvent } from 'react';
-import type { ClientStatus, ConfigResponse } from './lib/client-types';
+import { CirclePower, LoaderCircle, LogOut, ShieldCheck } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { LoginForm } from './components/LoginForm';
+import { TunnelList } from './components/TunnelList';
+import type { ClientConfig, ClientStatus } from './lib/client-types';
 import { desktop } from './lib/desktop';
-import { ConnectionSettings } from './components/ConnectionSettings';
-import { ServiceList } from './components/ServiceList';
-import { StatusPane } from './components/StatusPane';
-import { createEditableConfig, prepareConfig } from './lib/config';
-import type { EditableClientConfig, EditableService, Notice, NoticeKind } from './lib/types';
 
 const startingStatus: ClientStatus = {
   state: 'starting',
   message: null,
   server: null,
   device_id: null,
-  retry_seconds: null
-};
-
-const offlineStatus: ClientStatus = {
-  state: 'offline',
-  message: '客户端运行时不可用',
-  server: null,
-  device_id: null,
-  retry_seconds: null
+  retry_seconds: null,
+  tunnels: []
 };
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -31,61 +20,50 @@ function errorMessage(error: unknown, fallback: string): string {
 }
 
 export function App() {
-  const [baseline, setBaseline] = useState('');
-  const [configPath, setConfigPath] = useState('');
-  const [draft, setDraft] = useState<EditableClientConfig | null>(null);
-  const [fatalError, setFatalError] = useState('');
-  const [generating, setGenerating] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [notice, setNotice] = useState<Notice | null>(null);
-  const [saving, setSaving] = useState(false);
+  const [address, setAddress] = useState('');
+  const [key, setKey] = useState('');
   const [status, setStatus] = useState<ClientStatus>(startingStatus);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [action, setAction] = useState<'connect' | 'disconnect' | null>(null);
+  const [error, setError] = useState('');
   const [version, setVersion] = useState('');
-  const dirtyRef = useRef(false);
-  const noticeTimer = useRef<number | undefined>(undefined);
+  const connectedIdentity = useRef('');
+  const knownTunnels = useRef<Set<string>>(new Set());
 
-  const preparedConfig = useMemo(() => (draft ? prepareConfig(draft) : null), [draft]);
-  const dirty = Boolean(
-    preparedConfig && baseline && JSON.stringify(preparedConfig) !== baseline
-  );
-  const pollingEnabled = Boolean(draft && !fatalError);
-
-  const applyConfig = useCallback((response: ConfigResponse) => {
-    const editable = createEditableConfig(response.config);
-    setBaseline(editable.baseline);
-    setConfigPath(response.path);
-    setDraft(editable.draft);
-  }, []);
-
-  const showNotice = useCallback((message: string, kind: NoticeKind) => {
-    window.clearTimeout(noticeTimer.current);
-    setNotice({ kind, message });
-    noticeTimer.current = window.setTimeout(() => setNotice(null), 4_000);
+  const applyConfig = useCallback((config: ClientConfig) => {
+    setAddress(config.server.address);
+    setKey(config.server.address ? config.key : '');
   }, []);
 
   const refreshStatus = useCallback(async () => {
     try {
       setStatus(await desktop.getStatus());
     } catch {
-      setStatus(offlineStatus);
+      setStatus((current) => ({
+        ...current,
+        state: 'offline',
+        message: '客户端运行时不可用',
+        tunnels: []
+      }));
     }
   }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
-    setFatalError('');
+    setError('');
     try {
-      const [config, currentStatus, version] = await Promise.all([
+      const [config, currentStatus, currentVersion] = await Promise.all([
         desktop.getConfig(),
         desktop.getStatus(),
         desktop.getVersion()
       ]);
       applyConfig(config);
       setStatus(currentStatus);
-      setVersion(version);
-    } catch (error) {
-      setStatus(offlineStatus);
-      setFatalError(errorMessage(error, '客户端配置加载失败'));
+      setVersion(currentVersion);
+    } catch (cause) {
+      setError(errorMessage(cause, '客户端启动失败'));
     } finally {
       setLoading(false);
     }
@@ -93,223 +71,182 @@ export function App() {
 
   useEffect(() => {
     void load();
-    return () => {
-      window.clearTimeout(noticeTimer.current);
-    };
   }, [load]);
 
   useEffect(() => {
-    dirtyRef.current = dirty;
-  }, [dirty]);
-
-  useEffect(() => {
     let disposed = false;
-    let removeCloseListener: (() => void) | undefined;
-    void desktop
-      .onCloseRequested(() => dirtyRef.current)
-      .then((remove) => {
-        if (disposed) {
-          remove();
-        } else {
-          removeCloseListener = remove;
-        }
-      })
-      .catch((error: unknown) => {
-        showNotice(errorMessage(error, '无法监听窗口关闭事件'), 'error');
-      });
-    return () => {
-      disposed = true;
-      removeCloseListener?.();
-    };
-  }, [showNotice]);
-
-  useEffect(() => {
-    if (!pollingEnabled) return;
-
-    let disposed = false;
-    let statusTimer: number | undefined;
-
-    // 递归定时器在上一次 IPC 完成后再调度，避免后台阻塞时堆积请求。
-    const schedule = () => {
-      window.clearTimeout(statusTimer);
-      if (disposed || document.hidden) return;
-      statusTimer = window.setTimeout(() => {
-        void refreshStatus().finally(schedule);
-      }, 2_000);
-    };
-
-    const handleVisibilityChange = () => {
-      window.clearTimeout(statusTimer);
-      if (!document.hidden) {
-        void refreshStatus().finally(schedule);
-      }
-    };
-
-    schedule();
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => {
-      disposed = true;
-      window.clearTimeout(statusTimer);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-    };
-  }, [pollingEnabled, refreshStatus]);
-
-  const updateGroupKey = useCallback((key: string) => {
-    setDraft((current) => (current ? { ...current, key } : current));
-  }, []);
-
-  const updateServer = useCallback((server: EditableClientConfig['server']) => {
-    setDraft((current) => (current ? { ...current, server } : current));
-  }, []);
-
-  const updateServices = useCallback(
-    (update: (services: EditableService[]) => EditableService[]) => {
-      setDraft((current) =>
-        current ? { ...current, services: update(current.services) } : current
-      );
-    },
-    []
-  );
-
-  async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
-    if (!preparedConfig || saving) return;
-
-    setSaving(true);
-    try {
-      applyConfig(await desktop.saveConfig(preparedConfig));
-      showNotice('配置已保存，连接正在更新', 'success');
+    let timer: number | undefined;
+    const poll = async () => {
       await refreshStatus();
-    } catch (error) {
-      showNotice(errorMessage(error, '保存配置失败'), 'error');
-    } finally {
-      setSaving(false);
-    }
-  }
+      if (!disposed && !document.hidden) timer = window.setTimeout(() => void poll(), 1_000);
+    };
+    const handleVisibility = () => {
+      window.clearTimeout(timer);
+      if (!document.hidden) void poll();
+    };
+    timer = window.setTimeout(() => void poll(), 1_000);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [refreshStatus]);
 
-  async function generateKey(): Promise<void> {
-    if (generating) return;
-    setGenerating(true);
-    try {
-      updateGroupKey(await desktop.generateKey());
-    } catch (error) {
-      showNotice(errorMessage(error, '生成密钥失败'), 'error');
-    } finally {
-      setGenerating(false);
-    }
-  }
-
-  async function chooseCertificate(): Promise<void> {
-    try {
-      const path = await desktop.chooseCertificate();
-      if (path) {
-        setDraft((current) =>
-          current
-            ? { ...current, server: { ...current.server, caCertificate: path } }
-            : current
-        );
+  useEffect(() => {
+    if (status.state !== 'connected' || !status.device_id) return;
+    const identity = `${status.server ?? ''}/${status.device_id}`;
+    const currentNames = new Set(status.tunnels.map((tunnel) => tunnel.name));
+    setSelected((current) => {
+      const next = connectedIdentity.current === identity ? new Set(current) : new Set<string>();
+      for (const tunnel of status.tunnels) {
+        if (
+          tunnel.state === 'connected' ||
+          (tunnel.state === 'idle' && !knownTunnels.current.has(tunnel.name))
+        ) {
+          next.add(tunnel.name);
+        }
+        if (tunnel.state === 'occupied') next.delete(tunnel.name);
       }
-    } catch (error) {
-      showNotice(errorMessage(error, '选择证书失败'), 'error');
+      for (const name of next) {
+        if (!currentNames.has(name)) next.delete(name);
+      }
+      return next;
+    });
+    connectedIdentity.current = identity;
+    knownTunnels.current = currentNames;
+  }, [status]);
+
+  async function login(): Promise<void> {
+    if (submitting) return;
+    setSubmitting(true);
+    setError('');
+    connectedIdentity.current = '';
+    knownTunnels.current = new Set();
+    try {
+      applyConfig(await desktop.login(address, key));
+      await refreshStatus();
+    } catch (cause) {
+      setError(errorMessage(cause, '登录失败'));
+    } finally {
+      setSubmitting(false);
     }
   }
 
-  async function quit(): Promise<void> {
+  async function connect(): Promise<void> {
+    if (action) return;
+    setAction('connect');
+    setError('');
     try {
-      await desktop.quit(dirty);
-    } catch (error) {
-      showNotice(errorMessage(error, '退出客户端失败'), 'error');
+      await desktop.connectTunnels([...selected]);
+      await refreshStatus();
+    } catch (cause) {
+      setError(errorMessage(cause, '连接隧道失败'));
+    } finally {
+      setAction(null);
     }
   }
+
+  async function disconnect(): Promise<void> {
+    if (action) return;
+    setAction('disconnect');
+    setError('');
+    try {
+      await desktop.disconnectTunnels();
+      await refreshStatus();
+    } catch (cause) {
+      setError(errorMessage(cause, '断开隧道失败'));
+    } finally {
+      setAction(null);
+    }
+  }
+
+  const connected = status.state === 'connected';
+  const selectedIdleCount = status.tunnels.filter(
+    (tunnel) => tunnel.state === 'idle' && selected.has(tunnel.name)
+  ).length;
+  const connectedCount = status.tunnels.filter((tunnel) => tunnel.state === 'connected').length;
 
   return (
     <div className="app-shell">
       <header className="app-header">
         <div className="brand">
-          <span className="brand-mark">
-            <ShieldCheck aria-hidden="true" size={21} strokeWidth={2} />
-          </span>
-          <span className="brand-name">
-            <strong>GateRust</strong>
-            <small>{version ? `Client v${version}` : 'Client'}</small>
-          </span>
+          <span className="brand-mark"><ShieldCheck aria-hidden="true" size={18} /></span>
+          <span><strong>GateRust</strong><small>Client {version && `v${version}`}</small></span>
         </div>
-
-        <StatusPane status={status} />
-
-        <div className="header-actions">
-          <button
-            aria-label="退出客户端"
-            className="icon-button quit-button"
-            onClick={() => void quit()}
-            title="退出客户端"
-            type="button"
-          >
-            <LogOut aria-hidden="true" size={18} strokeWidth={1.8} />
-          </button>
-          <button
-            className="primary-button"
-            disabled={!dirty || saving || loading}
-            form="config-form"
-            type="submit"
-          >
-            {saving ? (
-              <LoaderCircle aria-hidden="true" className="spin" size={16} />
-            ) : (
-              <Save aria-hidden="true" size={16} strokeWidth={2} />
-            )}
-            {saving ? '保存中' : '保存配置'}
-          </button>
+        <div className={`connection-state ${connected ? 'online' : ''}`}>
+          <i aria-hidden="true" />
+          <span>{connected ? '服务器已登录' : '未登录'}</span>
         </div>
+        <button
+          aria-label="退出客户端"
+          className="icon-button"
+          onClick={() => void desktop.quit().catch((cause: unknown) => {
+            setError(errorMessage(cause, '退出客户端失败'));
+          })}
+          title="退出客户端"
+          type="button"
+        >
+          <LogOut aria-hidden="true" size={17} />
+        </button>
       </header>
 
-      <main className="workspace">
-        <div className="workspace-inner">
-          <header className="page-heading">
-            <div>
-              <h1>连接配置</h1>
-              <p title={configPath}>{configPath || '正在读取配置路径'}</p>
-            </div>
-          </header>
-
-          {loading ? (
-            <div className="loading-state">
-              <LoaderCircle aria-hidden="true" className="spin" size={22} />
-              <span>正在启动客户端</span>
-            </div>
-          ) : fatalError ? (
-            <div className="fatal-state" role="alert">
-              <strong>无法加载客户端</strong>
-              <p>{fatalError}</p>
-              <button className="secondary-button" onClick={() => void load()} type="button">
-                <RefreshCw aria-hidden="true" size={16} />
-                重试
+      <main className={connected ? 'workspace' : 'workspace login-workspace'}>
+        {loading ? (
+          <div className="center-state"><LoaderCircle className="spin" size={22} /><span>正在启动</span></div>
+        ) : connected ? (
+          <section className="tunnel-view">
+            <div className="view-heading">
+              <div>
+                <h1>隧道</h1>
+                <p>{status.server}</p>
+              </div>
+              <button
+                className="secondary-button"
+                disabled={!connectedCount || action !== null}
+                onClick={() => void disconnect()}
+                type="button"
+              >
+                {action === 'disconnect' ? <LoaderCircle className="spin" size={15} /> : <CirclePower size={15} />}
+                断开全部
               </button>
             </div>
-          ) : draft ? (
-            <form id="config-form" onSubmit={(event) => void save(event)}>
-              <fieldset className="settings-surface" disabled={saving}>
-                <ConnectionSettings
-                  generating={generating}
-                  groupKey={draft.key}
-                  onChooseCertificate={chooseCertificate}
-                  onGenerateKey={generateKey}
-                  onGroupKeyChange={updateGroupKey}
-                  onServerChange={updateServer}
-                  server={draft.server}
-                />
-                <ServiceList onChange={updateServices} services={draft.services} />
-              </fieldset>
-            </form>
-          ) : null}
-        </div>
-      </main>
 
-      {notice && (
-        <div className={`toast ${notice.kind}`} role={notice.kind === 'error' ? 'alert' : 'status'}>
-          {notice.message}
-        </div>
-      )}
+            {error && <div className="notice error" role="alert">{error}</div>}
+            <TunnelList
+              onToggle={(name) => setSelected((current) => {
+                const next = new Set(current);
+                if (next.has(name)) next.delete(name); else next.add(name);
+                return next;
+              })}
+              selected={selected}
+              tunnels={status.tunnels}
+            />
+            <div className="action-bar">
+              <span>{selectedIdleCount ? `已选择 ${selectedIdleCount} 条空闲隧道` : `${connectedCount} 条已连接`}</span>
+              <button
+                className="primary-button"
+                disabled={!selected.size || !selectedIdleCount || action !== null}
+                onClick={() => void connect()}
+                type="button"
+              >
+                {action === 'connect' && <LoaderCircle className="spin" size={16} />}
+                连接
+              </button>
+            </div>
+          </section>
+        ) : (
+          <LoginForm
+            address={address}
+            error={error || (status.state === 'reconnecting' ? status.message ?? '' : '')}
+            keyValue={key}
+            onAddressChange={setAddress}
+            onKeyChange={setKey}
+            onSubmit={login}
+            pending={submitting || status.state === 'connecting'}
+          />
+        )}
+      </main>
     </div>
   );
 }

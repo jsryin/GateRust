@@ -58,6 +58,7 @@ function defaultTunnel(): TunnelConfig {
     group: '',
     kind: 'tcp',
     bind: '0.0.0.0:8080',
+    local_port: 8080,
     limit_bps: null,
     max_connections: 128,
     max_udp_sessions: 512,
@@ -225,6 +226,15 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
       setError('名称、分组和监听地址不能为空');
       return;
     }
+    if (
+      next.kind !== 'socks5' &&
+      next.local_port !== null &&
+      (!Number.isInteger(next.local_port) || next.local_port < 1 || next.local_port > 65535)
+    ) {
+      setError('本地端口必须为 1 到 65535 的整数');
+      return;
+    }
+    if (next.kind === 'socks5') next.local_port = null;
 
     await persistMutation(
       () => originalName ? updateTunnel(token, originalName, next) : createTunnel(token, next),
@@ -363,17 +373,18 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
               新建隧道
             </Button>
           )}
-          description="公网监听、协议类型和资源边界"
+          description="公网监听、本地端口、协议类型和资源边界"
           title="隧道"
         />
         {draft.tunnels.length ? (
-          <Table className="min-w-[1040px]">
+          <Table className="min-w-[1120px]">
             <TableHeader>
               <TableRow>
                 <TableHead>名称</TableHead>
                 <TableHead>协议</TableHead>
                 <TableHead>分组</TableHead>
                 <TableHead>监听</TableHead>
+                <TableHead>本地端口</TableHead>
                 <TableHead>客户端</TableHead>
                 <TableHead>限速</TableHead>
                 <TableHead className="text-right">操作</TableHead>
@@ -383,7 +394,6 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
               {draft.tunnels.map((item) => {
                 const state = runtimeByTunnel.get(item.name);
                 const owner = state?.owner_session_id == null ? undefined : clientsById.get(state.owner_session_id);
-                const waiting = state?.waiting_session_ids.map((id) => clientsById.get(id)?.device_id ?? `#${id}`) ?? [];
                 const releasedTunnels = owner ? tunnelsByOwner.get(owner.session_id) ?? [] : [];
 
                 return (
@@ -392,6 +402,9 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
                     <TableCell><Badge>{kindLabel[item.kind]}</Badge></TableCell>
                     <TableCell>{item.group}</TableCell>
                     <TableCell><code className="text-xs">{item.bind}</code></TableCell>
+                    <TableCell>
+                      {item.kind === 'socks5' ? '—' : item.local_port ?? '同监听端口'}
+                    </TableCell>
                     <TableCell>
                       <div>
                         {owner ? (
@@ -403,9 +416,6 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
                           </>
                         ) : (
                           <span className="text-[color:var(--fg-muted)]">未连接</span>
-                        )}
-                        {waiting.length > 0 && (
-                          <div className="txt-compact-xsmall text-[color:var(--fg-muted)]">等待：{waiting.join(', ')}</div>
                         )}
                       </div>
                     </TableCell>
@@ -494,7 +504,17 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
                       </Select>
                     </Field>
                     <Field label="协议">
-                      <Select onChange={(event) => setTunnel((current) => ({ ...current, kind: event.target.value as TunnelKind }))} value={tunnel.kind}>
+                      <Select
+                        onChange={(event) => {
+                          const kind = event.target.value as TunnelKind;
+                          setTunnel((current) => ({
+                            ...current,
+                            kind,
+                            local_port: kind === 'socks5' ? null : current.local_port ?? 8080
+                          }));
+                        }}
+                        value={tunnel.kind}
+                      >
                         <option value="tcp">TCP</option>
                         <option value="udp">UDP</option>
                         <option value="socks5">SOCKS5</option>
@@ -503,6 +523,21 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
                     <Field label="监听地址">
                       <Input onChange={(event) => setTunnel((current) => ({ ...current, bind: event.target.value }))} value={tunnel.bind} />
                     </Field>
+                    {tunnel.kind !== 'socks5' && (
+                      <Field label="本地端口">
+                        <Input
+                          max="65535"
+                          min="1"
+                          onChange={(event) => setTunnel((current) => ({
+                            ...current,
+                            local_port: event.target.value ? Number(event.target.value) : null
+                          }))}
+                          placeholder="留空则与监听端口相同"
+                          type="number"
+                          value={tunnel.local_port ?? ''}
+                        />
+                      </Field>
+                    )}
                     <Field label="限速（B/s）">
                       <Input min="1" onChange={(event) => setLimit(event.target.value)} placeholder="留空表示不限" type="number" value={limit} />
                     </Field>

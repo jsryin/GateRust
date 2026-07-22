@@ -14,10 +14,13 @@ mod server;
 mod tls;
 mod watcher;
 
-pub use client::{ClientStatus, run_client, run_client_with_shutdown, run_client_with_status};
+pub use client::{
+    ClientStatus, ClientTunnel, ClientTunnelState, run_client, run_client_with_shutdown,
+    run_client_with_status,
+};
 pub use config::{
-    ClientConfig, ClientServerConfig, ClientServiceConfig, GroupConfig, ServerConfig,
-    ServerQuicConfig, ServerTunnelConfig, TunnelKind, generate_group_key,
+    ClientConfig, ClientServerConfig, ClientServiceConfig, GroupConfig, MAX_CLIENT_SERVICES,
+    ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind, generate_group_key,
 };
 pub use error::{Result, TunnelError};
 pub use runtime::{RuntimeClient, RuntimeTunnel, TunnelRuntime, TunnelRuntimeSnapshot};
