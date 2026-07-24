@@ -124,7 +124,7 @@ export function App() {
       applyConfig(await desktop.login(address, key));
       await refreshStatus();
     } catch (cause) {
-      setError(errorMessage(cause, '登录失败'));
+      setError(errorMessage(cause, '获取连接配置失败'));
     } finally {
       setSubmitting(false);
     }

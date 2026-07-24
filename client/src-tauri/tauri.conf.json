@@ -19,13 +19,15 @@
       {
         "label": "main",
         "title": "GateRust Client",
-        "width": 680,
-        "height": 600,
-        "minWidth": 480,
-        "minHeight": 480,
+        "width": 390,
+        "height": 320,
+        "minWidth": 390,
+        "minHeight": 320,
+        "resizable": false,
+        "maximizable": false,
         "visible": false,
         "center": true,
-        "backgroundColor": "#eef1ef"
+        "backgroundColor": "#ffffff"
       }
     ]
   },

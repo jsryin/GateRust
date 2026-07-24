@@ -31,7 +31,7 @@ export function LoginForm({
   return (
     <form className="login-form" onSubmit={submit}>
       <header>
-        <h1>登录服务器</h1>
+        <h1>获取连接配置</h1>
       </header>
       <label>
         <span>服务器地址</span>
@@ -71,7 +71,7 @@ export function LoginForm({
       {error && <div className="notice error" role="alert">{error}</div>}
       <button className="primary-button login-button" disabled={pending} type="submit">
         {pending ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
-        {pending ? '登录中' : '登录'}
+        {pending ? '获取中' : '获取配置'}
       </button>
     </form>
   );
