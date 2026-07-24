@@ -8,13 +8,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+futures-util.workspace = true
+hmac.workspace = true
 notify.workspace = true
+pem.workspace = true
 quinn.workspace = true
 rand.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -22,11 +26,12 @@ tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
 webpki-roots.workspace = true
+x509-parser.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-rcgen = "0.14.8"
-tempfile = "3.27.0"
+rcgen.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

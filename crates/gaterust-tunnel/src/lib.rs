@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+mod bootstrap;
+mod certificate;
 mod client;
 mod config;
 mod error;
@@ -14,9 +16,10 @@ mod server;
 mod tls;
 mod watcher;
 
+pub use certificate::{DownloadedServerCertificate, server_name_from_pem};
 pub use client::{
-    ClientStatus, ClientTunnel, ClientTunnelState, run_client, run_client_with_shutdown,
-    run_client_with_status,
+    ClientStatus, ClientTunnel, ClientTunnelState, fetch_server_certificate, run_client,
+    run_client_with_shutdown, run_client_with_status, verify_client_credentials,
 };
 pub use config::{
     ClientConfig, ClientServerConfig, ClientServiceConfig, GroupConfig, MAX_CLIENT_SERVICES,

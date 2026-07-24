@@ -10,11 +10,16 @@ repository.workspace = true
 [dependencies]
 clap.workspace = true
 gaterust-tunnel = { path = "../gaterust-tunnel" }
+rand.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

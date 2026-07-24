@@ -9,8 +9,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ClientConfig, ClientTunnelState, TunnelRuntime, TunnelRuntimeSnapshot, check_server_config,
-    run_client_with_shutdown, run_server_with_runtime,
+    ClientConfig, ClientServerConfig, ClientTunnelState, TunnelError, TunnelRuntime,
+    TunnelRuntimeSnapshot, check_server_config, fetch_server_certificate, run_client_with_shutdown,
+    run_server_with_runtime, verify_client_credentials,
 };
 
 const TEST_KEY: &str = "12345678901234567890123456789012";
@@ -32,6 +33,58 @@ private_key = "server-key.pem"
     std::fs::remove_file(directory.path().join("server-key.pem")).expect("应能删除测试私钥");
     let error = check_server_config(&path).expect_err("缺少私钥应校验失败");
     assert!(error.to_string().contains("server-key.pem"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstraps_certificate_with_key_proof_and_checks_credentials() {
+    let directory = tempfile::tempdir().expect("应能创建测试目录");
+    write_certificate(directory.path());
+    let quic = unused_udp_address();
+    write_server_config(
+        directory.path(),
+        quic,
+        unused_tcp_address(),
+        unused_udp_address(),
+        unused_tcp_address(),
+        true,
+    );
+    let cancellation = CancellationToken::new();
+    let server_path = directory.path().join("server.toml");
+    let server_cancel = cancellation.clone();
+    let server = tokio::spawn(async move {
+        run_server_with_runtime(server_path, TunnelRuntime::new(), server_cancel).await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // localhost 同时返回 IPv4/IPv6 时，应由可用地址先完成证书引导。
+    let address = format!("localhost:{}", quic.port());
+    let downloaded = fetch_server_certificate(&address, TEST_KEY)
+        .await
+        .expect("正确密钥应下载证书");
+    assert_eq!(downloaded.server_name(), "localhost");
+    let certificate_path = directory.path().join("downloaded-server.pem");
+    std::fs::write(&certificate_path, downloaded.pem()).expect("保存下载的证书");
+    let config = ClientConfig {
+        key: TEST_KEY.into(),
+        server: ClientServerConfig {
+            address: address.clone(),
+            name: Some(downloaded.server_name().into()),
+            ca_certificate: Some(certificate_path),
+        },
+        services: Vec::new(),
+    };
+    let tunnels = verify_client_credentials(&config)
+        .await
+        .expect("下载证书后应通过正常认证");
+    assert_eq!(tunnels.len(), 3);
+
+    let error = fetch_server_certificate(&address, "00000000000000000000000000000000")
+        .await
+        .expect_err("错误密钥必须被拒绝");
+    assert!(matches!(error, TunnelError::Authentication(_)));
+
+    cancellation.cancel();
+    assert_task_ok(server, "服务端").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

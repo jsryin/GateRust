@@ -8,6 +8,8 @@ pub enum ClientError {
     RuntimeUnavailable,
     #[error("{0}")]
     InvalidOperation(String),
+    #[error("获取配置超过 60 秒，已停止本次获取")]
+    LoginTimeout,
     #[error(transparent)]
     Tunnel(#[from] gaterust_tunnel::TunnelError),
     #[error("等待客户端运行时任务失败: {0}")]

@@ -322,6 +322,18 @@ impl ClientConfig {
         Ok(true)
     }
 
+    /// 将客户端配置原子重置为等待桌面界面填写的初始状态。
+    ///
+    /// # Errors
+    ///
+    /// 无法序列化或写入初始配置时返回错误。
+    pub fn reset(path: &Path) -> Result<Self> {
+        let config = Self::initial();
+        let content = serialize_client_config(&config, path)?;
+        write_client_config(path, content.as_bytes())?;
+        Ok(config)
+    }
+
     /// 读取客户端配置，保留配置中的相对路径。
     ///
     /// # Errors
@@ -337,8 +349,17 @@ impl ClientConfig {
     ///
     /// 文件不可读、TOML 格式错误或字段不满足约束时返回错误。
     pub fn load(path: &Path) -> Result<Self> {
-        let mut config = Self::read(path)?;
-        config.validate()?;
+        Self::read(path)?.resolved(path)
+    }
+
+    /// 验证配置并以指定配置文件为基准解析相对路径。
+    ///
+    /// # Errors
+    ///
+    /// 配置字段不满足约束时返回错误。
+    pub fn resolved(&self, path: &Path) -> Result<Self> {
+        self.validate()?;
+        let mut config = self.clone();
         if let Some(certificate) = &mut config.server.ca_certificate {
             resolve_path(path, certificate);
         }
@@ -533,7 +554,7 @@ fn resolve_path(config_path: &Path, value: &mut PathBuf) {
     }
 }
 
-fn address_host(address: &str) -> Option<&str> {
+pub(crate) fn address_host(address: &str) -> Option<&str> {
     if let Some(bracketed) = address.strip_prefix('[') {
         return bracketed.split_once(']').map(|(host, _)| host);
     }
@@ -705,6 +726,19 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&path).expect("再次读取配置内容"),
             content
+        );
+
+        let mut configured = initial;
+        configured.server.address = "localhost:2333".into();
+        configured.save(&path).expect("保存有效配置");
+        let reset = ClientConfig::reset(&path).expect("重置客户端配置");
+        assert!(reset.server.address.is_empty());
+        assert!(
+            ClientConfig::read(&path)
+                .expect("读取重置配置")
+                .server
+                .address
+                .is_empty()
         );
     }
 

@@ -5,14 +5,21 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     Result, TunnelError,
+    bootstrap::{NONCE_LENGTH, PROOF_LENGTH},
     client::ClientTunnel,
     config::{MAX_CLIENT_SERVICES, TunnelKind},
 };
 
-pub(crate) const PROTOCOL_VERSION: u16 = 3;
+pub(crate) const PROTOCOL_VERSION: u16 = 4;
 pub(crate) const MAX_CONTROL_FRAME: usize = 256 * 1024;
 pub(crate) const MAX_DATAGRAM: usize = u16::MAX as usize;
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(serde::Deserialize, Serialize)]
+pub(crate) enum ClientHandshake {
+    Authenticate(ClientHello),
+    Bootstrap(CertificateBootstrapRequest),
+}
 
 #[derive(serde::Deserialize, Serialize)]
 pub(crate) struct ClientHello {
@@ -20,6 +27,13 @@ pub(crate) struct ClientHello {
     pub device_id: String,
     pub key: Vec<u8>,
     pub services: Vec<ServiceDeclaration>,
+}
+
+#[derive(serde::Deserialize, Serialize)]
+pub(crate) struct CertificateBootstrapRequest {
+    pub version: u16,
+    pub client_nonce: [u8; NONCE_LENGTH],
+    pub proof: [u8; PROOF_LENGTH],
 }
 
 #[derive(Clone, Copy, serde::Deserialize, Serialize)]
@@ -32,10 +46,27 @@ pub(crate) enum AuthenticationStatus {
 }
 
 #[derive(serde::Deserialize, Serialize)]
+pub(crate) enum ServerHandshake {
+    Authenticate(ServerHello),
+    Bootstrap(CertificateBootstrapResponse),
+}
+
+#[derive(serde::Deserialize, Serialize)]
 pub(crate) struct ServerHello {
     pub status: AuthenticationStatus,
     pub message: String,
     pub tunnels: Vec<ClientTunnel>,
+}
+
+#[derive(serde::Deserialize, Serialize)]
+pub(crate) enum CertificateBootstrapResponse {
+    Accepted {
+        server_nonce: [u8; NONCE_LENGTH],
+        proof: [u8; PROOF_LENGTH],
+    },
+    Rejected {
+        message: String,
+    },
 }
 
 #[derive(serde::Deserialize, Serialize)]

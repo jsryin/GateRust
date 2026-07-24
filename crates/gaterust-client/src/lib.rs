@@ -2,13 +2,14 @@
 
 mod error;
 mod paths;
+mod trust;
 
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 pub use error::{ClientError, Result};
 use gaterust_tunnel::{
     ClientConfig, ClientServiceConfig, ClientStatus, ClientTunnel, ClientTunnelState,
-    MAX_CLIENT_SERVICES, TunnelKind, run_client_with_status,
+    MAX_CLIENT_SERVICES, TunnelKind, run_client_with_status, verify_client_credentials,
 };
 use tokio::{
     sync::{Mutex, watch},
@@ -22,7 +23,10 @@ pub struct ClientRuntime {
     status: watch::Receiver<ClientStatus>,
     shutdown: CancellationToken,
     task: Mutex<Option<JoinHandle<gaterust_tunnel::Result<()>>>>,
+    login: Mutex<()>,
 }
+
+const LOGIN_TIMEOUT: Duration = Duration::from_mins(1);
 
 impl ClientRuntime {
     /// 初始化配置并启动隧道后台任务。
@@ -57,6 +61,7 @@ impl ClientRuntime {
             status,
             shutdown,
             task: Mutex::new(Some(task)),
+            login: Mutex::new(()),
         })
     }
 
@@ -93,22 +98,65 @@ impl ClientRuntime {
         .map_err(ClientError::from)
     }
 
-    /// 保存服务器凭据并触发登录，切换服务器时清除原有 TLS 覆盖项。
+    /// 验证服务器凭据，必要时下载证书，并在成功后保存配置。
     ///
     /// # Errors
     ///
-    /// 地址或密钥无效、配置不可读写时返回错误。
+    /// 地址或密钥无效、证书引导或认证失败、操作超时、配置不可读写时返回错误。
     pub async fn login(&self, address: String, key: String) -> Result<ClientConfig> {
+        self.login_with_timeout(address, key, LOGIN_TIMEOUT).await
+    }
+
+    async fn login_with_timeout(
+        &self,
+        address: String,
+        key: String,
+        timeout: Duration,
+    ) -> Result<ClientConfig> {
+        let candidate_address = address.trim().to_owned();
+        let candidate_key = key.clone();
+        let result = match tokio::time::timeout(timeout, self.login_inner(address, key)).await {
+            Ok(result) => result,
+            Err(_) => Err(ClientError::LoginTimeout),
+        };
+        if result.is_err() {
+            self.discard_unverified_candidate(&candidate_address, &candidate_key)
+                .await?;
+        }
+        result
+    }
+
+    async fn login_inner(&self, address: String, key: String) -> Result<ClientConfig> {
+        let _login = self.login.lock().await;
         let mut config = self.config().await?;
         let address = address.trim().to_owned();
-        if config.server.address != address {
+        let server_changed = config.server.address != address;
+        if server_changed {
             config.server.name = None;
             config.server.ca_certificate = None;
         }
         config.server.address = address;
         config.key = key;
         config.services.clear();
+        config.validate()?;
+
+        // 新凭据通过证书引导和正常 QUIC 认证后才落盘，超时不会触发后台自动重试。
+        trust::prepare(&mut config, self.config_path.as_ref(), server_changed).await?;
+        let runtime_config = config.resolved(self.config_path.as_ref())?;
+        verify_client_credentials(&runtime_config).await?;
         self.save_config(config).await
+    }
+
+    async fn discard_unverified_candidate(&self, address: &str, key: &str) -> Result<()> {
+        let config = self.config().await?;
+        if config.server.ca_certificate.is_none()
+            && config.server.address == address
+            && config.key == key
+        {
+            let path = Arc::clone(&self.config_path);
+            tokio::task::spawn_blocking(move || ClientConfig::reset(path.as_ref())).await??;
+        }
+        Ok(())
     }
 
     /// 将选择的空闲隧道映射到服务端指定的本地回环端口。
@@ -226,7 +274,11 @@ pub fn prepare_config_path(explicit_config_path: Option<PathBuf>) -> Result<Path
 
 #[cfg(test)]
 mod tests {
+    use rcgen::generate_simple_self_signed;
+
     use super::*;
+
+    const TEST_KEY: &str = "12345678901234567890123456789012";
 
     #[test]
     fn maps_server_tunnels_to_local_services() {
@@ -266,5 +318,130 @@ mod tests {
         }];
 
         assert!(services_for_selection(tunnels, vec!["ssh".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn login_timeout_does_not_persist_or_retry_candidate() {
+        let directory = tempfile::tempdir().expect("创建测试目录");
+        let config_path = directory.path().join("client.toml");
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("绑定无响应 UDP 端口");
+        let address = sink.local_addr().expect("读取 UDP 地址").to_string();
+        ClientConfig::ensure_exists(&config_path).expect("创建旧版客户端配置");
+        let mut legacy = ClientConfig::read(&config_path).expect("读取旧版客户端配置");
+        legacy.server.address = address.clone();
+        legacy.key = TEST_KEY.into();
+        legacy.save(&config_path).expect("保存旧版未认证配置");
+        let runtime = ClientRuntime::start(Some(config_path.clone())).expect("启动客户端运行时");
+
+        let result = runtime
+            .login_with_timeout(address, TEST_KEY.into(), Duration::from_millis(50))
+            .await;
+
+        assert!(matches!(result, Err(ClientError::LoginTimeout)));
+        let stored = ClientConfig::read(&config_path).expect("读取客户端配置");
+        assert!(stored.server.address.is_empty());
+        assert!(!directory.path().join("server.pem").exists());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(runtime.status(), ClientStatus::Unconfigured { .. }) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("旧版后台重试应停止");
+        runtime.shutdown().await.expect("停止客户端运行时");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn login_downloads_certificate_before_persisting_config() {
+        let directory = tempfile::tempdir().expect("创建测试目录");
+        let certificate =
+            generate_simple_self_signed(vec!["localhost".into()]).expect("生成测试证书");
+        std::fs::write(
+            directory.path().join("source-server.pem"),
+            certificate.cert.pem(),
+        )
+        .expect("保存服务端证书");
+        std::fs::write(
+            directory.path().join("server-key.pem"),
+            certificate.signing_key.serialize_pem(),
+        )
+        .expect("保存服务端私钥");
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("预留 QUIC 端口");
+        let address = socket.local_addr().expect("读取 QUIC 地址");
+        drop(socket);
+        let server_config = format!(
+            r#"
+[quic]
+bind = "{address}"
+certificate = "source-server.pem"
+private_key = "server-key.pem"
+
+[[groups]]
+name = "test"
+key = "{TEST_KEY}"
+"#
+        );
+        let server_path = directory.path().join("server.toml");
+        std::fs::write(&server_path, server_config).expect("保存服务端配置");
+        let cancellation = CancellationToken::new();
+        let server_cancel = cancellation.clone();
+        let server = tokio::spawn(async move {
+            gaterust_tunnel::run_server_with_shutdown(server_path, server_cancel).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config_path = directory.path().join("client.toml");
+        let runtime = ClientRuntime::start(Some(config_path.clone())).expect("启动客户端运行时");
+        let rejected = runtime
+            .login(
+                address.to_string(),
+                "00000000000000000000000000000000".into(),
+            )
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(ClientError::Tunnel(
+                gaterust_tunnel::TunnelError::Authentication(_)
+            ))
+        ));
+        assert!(!directory.path().join("server.pem").exists());
+        assert!(
+            ClientConfig::read(&config_path)
+                .expect("读取未认证配置")
+                .server
+                .address
+                .is_empty()
+        );
+
+        let config = runtime
+            .login(address.to_string(), TEST_KEY.into())
+            .await
+            .expect("获取连接配置");
+        assert_eq!(config.server.name.as_deref(), Some("localhost"));
+        assert_eq!(
+            config.server.ca_certificate.as_deref(),
+            Some(std::path::Path::new("server.pem"))
+        );
+        assert!(directory.path().join("server.pem").is_file());
+        ClientConfig::load(&config_path).expect("下载的证书应能加载");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(runtime.status(), ClientStatus::Connected { .. }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("客户端应使用下载证书完成连接");
+
+        runtime.shutdown().await.expect("停止客户端运行时");
+        cancellation.cancel();
+        server
+            .await
+            .expect("服务端任务正常结束")
+            .expect("服务端正常退出");
     }
 }

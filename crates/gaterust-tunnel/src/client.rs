@@ -1,8 +1,16 @@
 use std::{
-    collections::HashMap, future::Future, net::SocketAddr, path::Path, sync::Arc, time::Duration,
+    collections::{HashMap, HashSet},
+    future::Future,
+    net::SocketAddr,
+    path::Path,
+    sync::Arc,
+    time::Duration,
 };
 
+use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use quinn::{Connection, VarInt};
+use rand::RngExt as _;
+use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpStream, UdpSocket},
@@ -12,13 +20,17 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Result, TunnelError,
-    config::{ClientConfig, ClientServiceConfig, TunnelKind},
+    Result, TunnelError, bootstrap,
+    certificate::DownloadedServerCertificate,
+    config::{
+        ClientConfig, ClientServerConfig, ClientServiceConfig, TunnelKind, validate_group_key,
+    },
     identity::DeviceIdentity,
     protocol::{
-        AuthenticationStatus, ClientHello, ControlMessage, HANDSHAKE_TIMEOUT, MAX_DATAGRAM,
-        OpenRequest, OpenResponse, PROTOCOL_VERSION, ServerControlMessage, ServerHello,
-        ServiceDeclaration, read_datagram, read_frame, write_datagram, write_frame,
+        AuthenticationStatus, CertificateBootstrapRequest, CertificateBootstrapResponse,
+        ClientHandshake, ClientHello, ControlMessage, HANDSHAKE_TIMEOUT, MAX_DATAGRAM, OpenRequest,
+        OpenResponse, PROTOCOL_VERSION, ServerControlMessage, ServerHandshake, ServiceDeclaration,
+        read_datagram, read_frame, write_datagram, write_frame,
     },
     rate_limit::RateLimiter,
     relay::{self, QuinnStream},
@@ -29,6 +41,8 @@ use crate::{
 
 const CLOSE_RECONFIGURE: VarInt = VarInt::from_u32(10);
 const CLOSE_SHUTDOWN: VarInt = VarInt::from_u32(11);
+const CLOSE_CREDENTIAL_CHECK: VarInt = VarInt::from_u32(13);
+const MAX_RESOLVED_ADDRESSES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +83,64 @@ pub enum ClientStatus {
     Stopped {
         reason: Option<String>,
     },
+}
+
+/// 使用分组密钥证明下载并认证服务端证书。
+///
+/// 引导 TLS 连接不会发送原始分组密钥；只有服务端返回绑定当前证书的有效密钥证明时，
+/// 证书才会交给调用方保存。
+///
+/// # Errors
+///
+/// 地址或密钥无效、所有解析地址均连接失败、服务端拒绝密钥或证明无效时返回错误。
+pub async fn fetch_server_certificate(
+    address: &str,
+    key: &str,
+) -> Result<DownloadedServerCertificate> {
+    validate_group_key(key)?;
+    let config = ClientConfig {
+        key: key.to_owned(),
+        server: ClientServerConfig {
+            address: address.to_owned(),
+            name: None,
+            ca_certificate: None,
+        },
+        services: Vec::new(),
+    };
+    config.validate()?;
+    let server_name = config.server_name()?.to_owned();
+    let client_config = tls::bootstrap_client_config()?;
+    let addresses = resolve_addresses(address).await?;
+    try_addresses(addresses, |server_address| {
+        bootstrap_at_address(
+            server_address,
+            client_config.clone(),
+            &server_name,
+            address,
+            key,
+        )
+    })
+    .await
+}
+
+/// 建立一次受信任的 QUIC 连接并验证分组密钥，成功后立即释放探测会话。
+///
+/// # Errors
+///
+/// 配置、TLS、网络或分组认证失败时返回错误。
+pub async fn verify_client_credentials(config: &ClientConfig) -> Result<Vec<ClientTunnel>> {
+    config.validate()?;
+    let (endpoint, connection) = connect_server(config).await?;
+    let device_id = format!("credential-check-{:016x}", rand::rng().random::<u64>());
+    let result = authenticate(&connection, config, &device_id).await;
+    connection.close(CLOSE_CREDENTIAL_CHECK, b"credential check complete");
+    endpoint.wait_idle().await;
+    match result? {
+        AuthenticationResult::Accepted { tunnels, .. } => Ok(tunnels),
+        AuthenticationResult::DeviceIdConflict => {
+            Err(TunnelError::Protocol("临时认证设备 ID 冲突".into()))
+        }
+    }
 }
 
 /// 运行隧道客户端，监听配置变化并在连接断开后自动重试。
@@ -126,7 +198,7 @@ pub async fn run_client_with_status(
     let mut retry = Duration::from_secs(1);
     let mut stop_reason = None;
 
-    while !shutdown.is_cancelled() {
+    'running: while !shutdown.is_cancelled() {
         status.send_replace(ClientStatus::Connecting {
             server: config.server.address.clone(),
         });
@@ -150,19 +222,43 @@ pub async fn run_client_with_status(
                     retry_seconds: retry.as_secs(),
                 });
                 tracing::warn!(%error, delay_seconds = retry.as_secs(), "隧道连接断开，稍后重试");
-                tokio::select! {
-                    () = shutdown.cancelled() => break,
-                    () = tokio::time::sleep(retry) => {}
+                let became_unconfigured = tokio::select! {
+                    () = shutdown.cancelled() => break 'running,
+                    () = tokio::time::sleep(retry) => false,
                     changed = watcher.changed() => {
-                        if changed {
-                            match ClientConfig::load(&config_path) {
-                                Ok(updated) => config = updated,
-                                Err(error) => tracing::error!(%error, "新客户端配置无效，继续使用当前配置"),
+                        if !changed {
+                            break 'running;
+                        }
+                        match ClientConfig::load(&config_path) {
+                            Ok(updated) => {
+                                config = updated;
+                                false
                             }
+                            Err(_) => true,
                         }
                     }
+                };
+                if became_unconfigured {
+                    let Some(updated) =
+                        wait_for_initial_config(&config_path, &mut watcher, &shutdown, &status)
+                            .await
+                    else {
+                        break;
+                    };
+                    config = updated;
+                    retry = Duration::from_secs(1);
+                    continue;
                 }
                 retry = (retry * 2).min(Duration::from_secs(30));
+            }
+            ConnectionEnd::Unconfigured => {
+                let Some(updated) =
+                    wait_for_initial_config(&config_path, &mut watcher, &shutdown, &status).await
+                else {
+                    break;
+                };
+                config = updated;
+                retry = Duration::from_secs(1);
             }
             ConnectionEnd::DeviceIdConflict => {
                 identity.resolve_conflict()?;
@@ -214,6 +310,7 @@ async fn wait_for_initial_config(
 
 enum ConnectionEnd {
     Reconfigure(ClientConfig),
+    Unconfigured,
     Disconnected(TunnelError),
     DeviceIdConflict,
     AdministratorDisconnected,
@@ -223,6 +320,7 @@ enum ConnectionEnd {
 enum ConnectionStep<T> {
     Completed(T),
     Reconfigure(ClientConfig),
+    Unconfigured,
     Shutdown,
     WatcherClosed,
 }
@@ -235,42 +333,17 @@ async fn connect_and_run(
     shutdown: &CancellationToken,
     status: &watch::Sender<ClientStatus>,
 ) -> ConnectionEnd {
-    let server_address = match wait_for_connection_step(
-        resolve_one(&config.server.address),
-        config_path,
-        watcher,
-        shutdown,
-    )
-    .await
-    {
-        ConnectionStep::Completed(Ok(address)) => address,
-        ConnectionStep::Completed(Err(error)) => return ConnectionEnd::Disconnected(error),
-        ConnectionStep::Reconfigure(updated) => return ConnectionEnd::Reconfigure(updated),
-        ConnectionStep::Shutdown => return ConnectionEnd::Shutdown,
-        ConnectionStep::WatcherClosed => return config_watcher_closed(),
-    };
-    let endpoint =
-        match tls::client_endpoint(server_address, config.server.ca_certificate.as_deref()) {
-            Ok(endpoint) => endpoint,
-            Err(error) => return ConnectionEnd::Disconnected(error),
+    let (endpoint, connection) =
+        match wait_for_connection_step(connect_server(&config), config_path, watcher, shutdown)
+            .await
+        {
+            ConnectionStep::Completed(Ok(connected)) => connected,
+            ConnectionStep::Completed(Err(error)) => return ConnectionEnd::Disconnected(error),
+            ConnectionStep::Reconfigure(updated) => return ConnectionEnd::Reconfigure(updated),
+            ConnectionStep::Unconfigured => return ConnectionEnd::Unconfigured,
+            ConnectionStep::Shutdown => return ConnectionEnd::Shutdown,
+            ConnectionStep::WatcherClosed => return config_watcher_closed(),
         };
-    let server_name = match config.server_name() {
-        Ok(name) => name.to_owned(),
-        Err(error) => return ConnectionEnd::Disconnected(error),
-    };
-    let connecting = match endpoint.connect(server_address, &server_name) {
-        Ok(connecting) => connecting,
-        Err(error) => return ConnectionEnd::Disconnected(error.into()),
-    };
-    let connection = match wait_for_connection_step(connecting, config_path, watcher, shutdown)
-        .await
-    {
-        ConnectionStep::Completed(Ok(connection)) => connection,
-        ConnectionStep::Completed(Err(error)) => return ConnectionEnd::Disconnected(error.into()),
-        ConnectionStep::Reconfigure(updated) => return ConnectionEnd::Reconfigure(updated),
-        ConnectionStep::Shutdown => return ConnectionEnd::Shutdown,
-        ConnectionStep::WatcherClosed => return config_watcher_closed(),
-    };
     let authentication = match wait_for_connection_step(
         authenticate(&connection, &config, identity.as_str()),
         config_path,
@@ -284,6 +357,11 @@ async fn connect_and_run(
             endpoint.close(CLOSE_RECONFIGURE, b"client configuration changed");
             endpoint.wait_idle().await;
             return ConnectionEnd::Reconfigure(updated);
+        }
+        ConnectionStep::Unconfigured => {
+            endpoint.close(CLOSE_RECONFIGURE, b"client configuration removed");
+            endpoint.wait_idle().await;
+            return ConnectionEnd::Unconfigured;
         }
         ConnectionStep::Shutdown => {
             endpoint.close(CLOSE_SHUTDOWN, b"client shutting down");
@@ -340,7 +418,7 @@ async fn connect_and_run(
     )
     .await;
     let close = match &result {
-        ConnectionEnd::Reconfigure(_) => CLOSE_RECONFIGURE,
+        ConnectionEnd::Reconfigure(_) | ConnectionEnd::Unconfigured => CLOSE_RECONFIGURE,
         _ => CLOSE_SHUTDOWN,
     };
     endpoint.close(close, b"client connection ending");
@@ -355,20 +433,16 @@ async fn wait_for_connection_step<T>(
     shutdown: &CancellationToken,
 ) -> ConnectionStep<T> {
     tokio::pin!(future);
-    loop {
-        tokio::select! {
-            result = &mut future => return ConnectionStep::Completed(result),
-            () = shutdown.cancelled() => return ConnectionStep::Shutdown,
-            changed = watcher.changed() => {
-                if !changed {
-                    return ConnectionStep::WatcherClosed;
-                }
-                match ClientConfig::load(config_path) {
-                    Ok(updated) => return ConnectionStep::Reconfigure(updated),
-                    Err(error) => {
-                        tracing::error!(%error, "新客户端配置无效，继续使用当前配置");
-                    }
-                }
+    tokio::select! {
+        result = &mut future => ConnectionStep::Completed(result),
+        () = shutdown.cancelled() => ConnectionStep::Shutdown,
+        changed = watcher.changed() => {
+            if !changed {
+                return ConnectionStep::WatcherClosed;
+            }
+            match ClientConfig::load(config_path) {
+                Ok(updated) => ConnectionStep::Reconfigure(updated),
+                Err(_) => ConnectionStep::Unconfigured,
             }
         }
     }
@@ -397,17 +471,23 @@ async fn authenticate(
         .map_err(|_| TunnelError::Timeout("打开认证流"))??;
     write_frame(
         &mut send,
-        &ClientHello {
+        &ClientHandshake::Authenticate(ClientHello {
             version: PROTOCOL_VERSION,
             device_id: device_id.into(),
             key: config.key.as_bytes().to_vec(),
             services: declarations(&config.services),
-        },
+        }),
     )
     .await?;
-    let response: ServerHello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut receive))
-        .await
-        .map_err(|_| TunnelError::Timeout("等待认证结果"))??;
+    let response: ServerHandshake =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut receive))
+            .await
+            .map_err(|_| TunnelError::Timeout("等待认证结果"))??;
+    let ServerHandshake::Authenticate(response) = response else {
+        return Err(TunnelError::Protocol(
+            "服务端返回了错误的认证响应类型".into(),
+        ));
+    };
     match response.status {
         AuthenticationStatus::Accepted => Ok(AuthenticationResult::Accepted {
             send,
@@ -416,7 +496,7 @@ async fn authenticate(
         }),
         AuthenticationStatus::DeviceIdConflict => Ok(AuthenticationResult::DeviceIdConflict),
         AuthenticationStatus::Rejected | AuthenticationStatus::ServerBusy => {
-            Err(TunnelError::Protocol(response.message))
+            Err(TunnelError::Authentication(response.message))
         }
     }
 }
@@ -472,12 +552,8 @@ async fn run_connected(
                 if !changed {
                     break ConnectionEnd::Disconnected(TunnelError::Protocol("配置监听器已关闭".into()));
                 }
-                let updated = match ClientConfig::load(config_path) {
-                    Ok(updated) => updated,
-                    Err(error) => {
-                        tracing::error!(%error, "新客户端配置无效，继续使用当前配置");
-                        continue;
-                    }
+                let Ok(updated) = ClientConfig::load(config_path) else {
+                    break ConnectionEnd::Unconfigured;
                 };
                 if connection_identity_changed(config, &updated) {
                     break ConnectionEnd::Reconfigure(updated);
@@ -646,11 +722,144 @@ async fn write_rejection(send: &mut quinn::SendStream, message: &str) -> Result<
     .await
 }
 
-async fn resolve_one(target: &str) -> Result<SocketAddr> {
-    tokio::net::lookup_host(target)
+async fn bootstrap_at_address(
+    server_address: SocketAddr,
+    client_config: quinn::ClientConfig,
+    server_name: &str,
+    configured_address: &str,
+    key: &str,
+) -> Result<DownloadedServerCertificate> {
+    let endpoint = tls::client_endpoint(server_address, client_config)?;
+    let connection = endpoint.connect(server_address, server_name)?.await?;
+    let certificates = peer_certificates(&connection)?;
+    let certificate = certificates
+        .first()
+        .ok_or_else(|| TunnelError::Tls("服务端未提供叶证书".into()))?;
+    let client_nonce = bootstrap::random_nonce();
+    let proof = bootstrap::client_proof(
+        key.as_bytes(),
+        PROTOCOL_VERSION,
+        &client_nonce,
+        certificate.as_ref(),
+    )?;
+    let (mut send, mut receive) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.open_bi())
+        .await
+        .map_err(|_| TunnelError::Timeout("打开证书引导流"))??;
+    write_frame(
+        &mut send,
+        &ClientHandshake::Bootstrap(CertificateBootstrapRequest {
+            version: PROTOCOL_VERSION,
+            client_nonce,
+            proof,
+        }),
+    )
+    .await?;
+    let response: ServerHandshake =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut receive))
+            .await
+            .map_err(|_| TunnelError::Timeout("等待证书引导结果"))??;
+    let ServerHandshake::Bootstrap(response) = response else {
+        return Err(TunnelError::Protocol(
+            "服务端返回了错误的证书引导响应类型".into(),
+        ));
+    };
+    match response {
+        CertificateBootstrapResponse::Accepted {
+            server_nonce,
+            proof,
+        } if bootstrap::verify_server_proof(
+            key.as_bytes(),
+            PROTOCOL_VERSION,
+            &client_nonce,
+            &server_nonce,
+            certificate.as_ref(),
+            &proof,
+        ) => {}
+        CertificateBootstrapResponse::Accepted { .. } => {
+            return Err(TunnelError::Authentication("服务端证书密钥证明无效".into()));
+        }
+        CertificateBootstrapResponse::Rejected { message } => {
+            return Err(TunnelError::Authentication(message));
+        }
+    }
+    let downloaded = DownloadedServerCertificate::from_chain(&certificates, configured_address)?;
+    connection.close(CLOSE_CREDENTIAL_CHECK, b"certificate received");
+    endpoint.wait_idle().await;
+    Ok(downloaded)
+}
+
+fn peer_certificates(connection: &Connection) -> Result<Vec<CertificateDer<'static>>> {
+    let identity = connection
+        .peer_identity()
+        .ok_or_else(|| TunnelError::Tls("QUIC 连接缺少服务端证书身份".into()))?;
+    identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map(|certificates| *certificates)
+        .map_err(|_| TunnelError::Tls("无法读取 QUIC 服务端证书链".into()))
+}
+
+async fn connect_server(config: &ClientConfig) -> Result<(quinn::Endpoint, Connection)> {
+    let addresses = resolve_addresses(&config.server.address).await?;
+    let server_name = config.server_name()?.to_owned();
+    let client_config = tls::client_config(config.server.ca_certificate.as_deref())?;
+    try_addresses(addresses, |server_address| {
+        connect_at_address(server_address, server_name.clone(), client_config.clone())
+    })
+    .await
+}
+
+async fn connect_at_address(
+    server_address: SocketAddr,
+    server_name: String,
+    client_config: quinn::ClientConfig,
+) -> Result<(quinn::Endpoint, Connection)> {
+    let endpoint = tls::client_endpoint(server_address, client_config)?;
+    let connection = endpoint.connect(server_address, &server_name)?.await?;
+    Ok((endpoint, connection))
+}
+
+async fn resolve_addresses(target: &str) -> Result<Vec<SocketAddr>> {
+    let mut unique = HashSet::new();
+    let addresses = tokio::net::lookup_host(target)
         .await?
+        .filter(|address| unique.insert(*address))
+        .take(MAX_RESOLVED_ADDRESSES)
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        Err(TunnelError::InvalidConfig(format!(
+            "目标地址无法解析: {target}"
+        )))
+    } else {
+        Ok(addresses)
+    }
+}
+
+async fn resolve_one(target: &str) -> Result<SocketAddr> {
+    resolve_addresses(target)
+        .await?
+        .into_iter()
         .next()
         .ok_or_else(|| TunnelError::InvalidConfig(format!("目标地址无法解析: {target}")))
+}
+
+async fn try_addresses<T, F, Fut>(addresses: Vec<SocketAddr>, operation: F) -> Result<T>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut attempts = addresses
+        .into_iter()
+        .map(operation)
+        .collect::<FuturesUnordered<_>>();
+    let mut last_error = None;
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error @ TunnelError::Authentication(_)) => return Err(error),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| TunnelError::InvalidConfig("没有可用的服务器地址".into())))
 }
 
 fn declarations(services: &[ClientServiceConfig]) -> Vec<ServiceDeclaration> {
@@ -766,6 +975,7 @@ mod tests {
                 assert_eq!(config.server.address, "127.0.0.1:24444");
             }
             ConnectionStep::Completed(())
+            | ConnectionStep::Unconfigured
             | ConnectionStep::Shutdown
             | ConnectionStep::WatcherClosed => panic!("连接步骤返回了非预期状态"),
         }

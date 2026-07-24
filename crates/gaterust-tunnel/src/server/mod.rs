@@ -21,15 +21,16 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Result, TunnelError,
+    Result, TunnelError, bootstrap,
     config::{
         GroupSecret, ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind,
         validate_group_key,
     },
     identity::validate_device_id,
     protocol::{
-        AuthenticationStatus, ClientHello, ControlMessage, HANDSHAKE_TIMEOUT, PROTOCOL_VERSION,
-        ServerControlMessage, ServerHello, read_frame, validate_declarations, write_frame,
+        AuthenticationStatus, CertificateBootstrapRequest, CertificateBootstrapResponse,
+        ClientHandshake, ControlMessage, HANDSHAKE_TIMEOUT, PROTOCOL_VERSION, ServerControlMessage,
+        ServerHandshake, ServerHello, read_frame, validate_declarations, write_frame,
     },
     runtime::{RegisterError, TunnelRuntime},
     tls,
@@ -84,7 +85,8 @@ pub async fn run_server_with_runtime(
     let config_path = config_path.as_ref().to_owned();
     let initial = ServerConfig::load(&config_path)?;
     let mut watcher = ConfigWatcher::new(&config_path)?;
-    let endpoint = tls::server_endpoint(&initial.quic)?;
+    let (endpoint, certificate) = tls::server_endpoint(&initial.quic)?;
+    let certificate = Arc::new(certificate);
     let local_address = endpoint.local_addr()?;
     let groups = Arc::new(RwLock::new(initial.credentials()));
     let mut listeners = ListenerManager::new(runtime.clone());
@@ -93,6 +95,7 @@ pub async fn run_server_with_runtime(
         endpoint.clone(),
         runtime,
         Arc::clone(&groups),
+        certificate,
         cancellation.child_token(),
     ));
     let immutable = initial.quic;
@@ -149,6 +152,7 @@ async fn accept_connections(
     endpoint: Endpoint,
     runtime: TunnelRuntime,
     groups: Arc<RwLock<Vec<(String, GroupSecret)>>>,
+    certificate: Arc<rustls::pki_types::CertificateDer<'static>>,
     cancellation: CancellationToken,
 ) {
     let ids = Arc::new(AtomicU64::new(1));
@@ -166,11 +170,12 @@ async fn accept_connections(
                     };
                     let runtime = runtime.clone();
                     let groups = Arc::clone(&groups);
+                    let certificate = Arc::clone(&certificate);
                     let id = ids.fetch_add(1, Ordering::Relaxed);
                     tasks.spawn(async move {
                         match incoming.await {
                             Ok(connection) => {
-                                if let Err(error) = authenticate(connection, id, runtime, groups, permit).await {
+                                if let Err(error) = authenticate(connection, id, runtime, groups, certificate, permit).await {
                                     tracing::warn!(%error, "QUIC 客户端认证或控制通道结束");
                                 }
                             }
@@ -199,6 +204,7 @@ async fn authenticate(
     id: u64,
     runtime: TunnelRuntime,
     groups: Arc<RwLock<Vec<(String, GroupSecret)>>>,
+    certificate: Arc<rustls::pki_types::CertificateDer<'static>>,
     authentication_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let mut changes = runtime.subscribe();
@@ -206,9 +212,24 @@ async fn authenticate(
     let (mut send, mut receive) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
         .await
         .map_err(|_| TunnelError::Timeout("等待认证流"))??;
-    let hello: ClientHello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut receive))
-        .await
-        .map_err(|_| TunnelError::Timeout("读取认证信息"))??;
+    let handshake: ClientHandshake =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut receive))
+            .await
+            .map_err(|_| TunnelError::Timeout("读取认证信息"))??;
+    let hello = match handshake {
+        ClientHandshake::Authenticate(hello) => hello,
+        ClientHandshake::Bootstrap(request) => {
+            return bootstrap_certificate(
+                &connection,
+                &mut send,
+                request,
+                &groups,
+                certificate.as_ref(),
+                authentication_permit,
+            )
+            .await;
+        }
+    };
     let valid_key =
         std::str::from_utf8(&hello.key).is_ok_and(|key| validate_group_key(key).is_ok());
     let valid_hello = hello.version == PROTOCOL_VERSION
@@ -269,11 +290,11 @@ async fn authenticate(
     changes.borrow_and_update();
     if let Err(error) = write_frame(
         &mut send,
-        &ServerHello {
+        &ServerHandshake::Authenticate(ServerHello {
             status: AuthenticationStatus::Accepted,
             message: String::new(),
             tunnels: runtime.catalog(id).await,
-        },
+        }),
     )
     .await
     {
@@ -314,6 +335,63 @@ async fn authenticate(
     result
 }
 
+async fn bootstrap_certificate(
+    connection: &quinn::Connection,
+    send: &mut quinn::SendStream,
+    request: CertificateBootstrapRequest,
+    groups: &RwLock<Vec<(String, GroupSecret)>>,
+    certificate: &rustls::pki_types::CertificateDer<'_>,
+    _authentication_permit: OwnedSemaphorePermit,
+) -> Result<()> {
+    let accepted = if request.version == PROTOCOL_VERSION {
+        let groups = groups.read().await;
+        groups.iter().find_map(|(_, secret)| {
+            bootstrap::verify_client_proof(
+                secret.as_bytes(),
+                request.version,
+                &request.client_nonce,
+                certificate.as_ref(),
+                &request.proof,
+            )
+            .then(|| {
+                let server_nonce = bootstrap::random_nonce();
+                bootstrap::server_proof(
+                    secret.as_bytes(),
+                    request.version,
+                    &request.client_nonce,
+                    &server_nonce,
+                    certificate.as_ref(),
+                )
+                .map(|proof| CertificateBootstrapResponse::Accepted {
+                    server_nonce,
+                    proof,
+                })
+            })
+        })
+    } else {
+        None
+    };
+    let (response, valid) = match accepted.transpose()? {
+        Some(response) => (response, true),
+        None => (
+            CertificateBootstrapResponse::Rejected {
+                message: "密钥验证失败".into(),
+            },
+            false,
+        ),
+    };
+    write_frame(send, &ServerHandshake::Bootstrap(response)).await?;
+    send.finish()
+        .map_err(|error| TunnelError::Protocol(format!("结束证书引导响应流失败: {error}")))?;
+    let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, send.stopped()).await;
+    connection.close(VarInt::from_u32(4), b"certificate bootstrap complete");
+    if valid {
+        Ok(())
+    } else {
+        Err(TunnelError::Protocol("证书引导密钥验证失败".into()))
+    }
+}
+
 async fn reject_authentication(
     connection: &quinn::Connection,
     send: &mut quinn::SendStream,
@@ -322,11 +400,11 @@ async fn reject_authentication(
 ) -> Result<()> {
     write_frame(
         send,
-        &ServerHello {
+        &ServerHandshake::Authenticate(ServerHello {
             status,
             message: message.into(),
             tunnels: Vec::new(),
-        },
+        }),
     )
     .await?;
     send.finish()

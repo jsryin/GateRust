@@ -35,6 +35,8 @@ pub enum TunnelError {
     Tls(String),
     #[error("协议错误: {0}")]
     Protocol(String),
+    #[error("认证失败: {0}")]
+    Authentication(String),
     #[error("操作超时: {0}")]
     Timeout(&'static str),
     #[error("文件监听失败: {0}")]
