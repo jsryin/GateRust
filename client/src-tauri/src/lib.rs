@@ -34,6 +34,7 @@ pub fn run() -> tauri::Result<()> {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::cancel_login,
             commands::connect_tunnels,
             commands::disconnect_tunnels,
             commands::get_config,

@@ -10,6 +10,8 @@ pub enum ClientError {
     InvalidOperation(String),
     #[error("获取配置超过 60 秒，已停止本次获取")]
     LoginTimeout,
+    #[error("已取消获取连接配置")]
+    LoginCancelled,
     #[error(transparent)]
     Tunnel(#[from] gaterust_tunnel::TunnelError),
     #[error("等待客户端运行时任务失败: {0}")]

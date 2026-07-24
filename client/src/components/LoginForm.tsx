@@ -1,12 +1,15 @@
-import { Eye, EyeOff, LoaderCircle, LogIn } from 'lucide-react';
+import { Eye, EyeOff, LoaderCircle, LogIn, X } from 'lucide-react';
 import { useState } from 'react';
 import type { FormEvent } from 'react';
 
 interface LoginFormProps {
   address: string;
+  cancellable: boolean;
+  cancelling: boolean;
   error: string;
   keyValue: string;
   onAddressChange: (value: string) => void;
+  onCancel: () => Promise<void>;
   onKeyChange: (value: string) => void;
   onSubmit: () => Promise<void>;
   pending: boolean;
@@ -14,9 +17,12 @@ interface LoginFormProps {
 
 export function LoginForm({
   address,
+  cancellable,
+  cancelling,
   error,
   keyValue,
   onAddressChange,
+  onCancel,
   onKeyChange,
   onSubmit,
   pending
@@ -37,6 +43,7 @@ export function LoginForm({
         <span>服务器地址</span>
         <input
           autoFocus
+          disabled={pending}
           onChange={(event) => onAddressChange(event.target.value)}
           placeholder="tunnel.example.com:2333"
           required
@@ -49,6 +56,7 @@ export function LoginForm({
         <span className="key-field">
           <input
             autoComplete="off"
+            disabled={pending}
             maxLength={124}
             minLength={32}
             onChange={(event) => onKeyChange(event.target.value)}
@@ -69,10 +77,23 @@ export function LoginForm({
         </span>
       </label>
       {error && <div className="notice error" role="alert">{error}</div>}
-      <button className="primary-button login-button" disabled={pending} type="submit">
-        {pending ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
-        {pending ? '获取中' : '获取配置'}
-      </button>
+      <div className="login-actions">
+        <button className="primary-button" disabled={pending} type="submit">
+          {pending ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
+          {pending ? '获取中' : '获取配置'}
+        </button>
+        {cancellable && (
+          <button
+            className="secondary-button"
+            disabled={cancelling}
+            onClick={() => void onCancel()}
+            type="button"
+          >
+            {cancelling ? <LoaderCircle className="spin" size={16} /> : <X size={16} />}
+            {cancelling ? '取消中' : '取消获取'}
+          </button>
+        )}
+      </div>
     </form>
   );
 }

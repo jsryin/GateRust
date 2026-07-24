@@ -6,8 +6,10 @@ use std::{
 
 use gaterust_tunnel::{ClientConfig, TunnelError, fetch_server_certificate, server_name_from_pem};
 use rand::RngExt as _;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-use crate::Result;
+use crate::{Result, run_login_step};
 
 const SERVER_CERTIFICATE_NAME: &str = "server.pem";
 
@@ -15,6 +17,8 @@ pub(crate) async fn prepare(
     config: &mut ClientConfig,
     config_path: &Path,
     force_download: bool,
+    cancellation: &CancellationToken,
+    deadline: Instant,
 ) -> Result<()> {
     if !force_download && let Some(configured) = config.server.ca_certificate.as_deref() {
         let configured = if configured.is_relative() {
@@ -54,7 +58,12 @@ pub(crate) async fn prepare(
         return Ok(());
     }
 
-    let certificate = fetch_server_certificate(&config.server.address, &config.key).await?;
+    let certificate = run_login_step(
+        fetch_server_certificate(&config.server.address, &config.key),
+        cancellation,
+        deadline,
+    )
+    .await?;
     let server_name = certificate.server_name().to_owned();
     let pem = certificate.pem().as_bytes().to_vec();
     tokio::task::spawn_blocking(move || write_certificate(&certificate_path, &pem)).await??;

@@ -33,6 +33,12 @@ pub(crate) async fn login(
 }
 
 #[tauri::command]
+pub(crate) async fn cancel_login(runtime: State<'_, ClientRuntime>) -> CommandResult<()> {
+    runtime.cancel_login().await;
+    Ok(())
+}
+
+#[tauri::command]
 pub(crate) async fn connect_tunnels(
     runtime: State<'_, ClientRuntime>,
     names: Vec<String>,

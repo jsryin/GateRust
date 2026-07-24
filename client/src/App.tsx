@@ -14,6 +14,8 @@ const startingStatus: ClientStatus = {
   tunnels: []
 };
 
+const loginCancelledMessage = '已取消获取连接配置';
+
 function errorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error) return error.message;
   return typeof error === 'string' ? error : fallback;
@@ -26,10 +28,12 @@ export function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [action, setAction] = useState<'connect' | 'disconnect' | null>(null);
   const [error, setError] = useState('');
   const connectedIdentity = useRef('');
   const knownTunnels = useRef<Set<string>>(new Set());
+  const loginCancellationRequested = useRef(false);
 
   const applyConfig = useCallback((config: ClientConfig) => {
     setAddress(config.server.address);
@@ -116,6 +120,7 @@ export function App() {
 
   async function login(): Promise<void> {
     if (submitting) return;
+    loginCancellationRequested.current = false;
     setSubmitting(true);
     setError('');
     connectedIdentity.current = '';
@@ -124,9 +129,27 @@ export function App() {
       applyConfig(await desktop.login(address, key));
       await refreshStatus();
     } catch (cause) {
-      setError(errorMessage(cause, '获取连接配置失败'));
+      const message = errorMessage(cause, '获取连接配置失败');
+      if (!loginCancellationRequested.current || message !== loginCancelledMessage) {
+        setError(message);
+      }
     } finally {
       setSubmitting(false);
+      setCancelling(false);
+    }
+  }
+
+  async function cancelLogin(): Promise<void> {
+    if (!submitting || cancelling) return;
+    loginCancellationRequested.current = true;
+    setCancelling(true);
+    setError('');
+    try {
+      await desktop.cancelLogin();
+    } catch (cause) {
+      loginCancellationRequested.current = false;
+      setCancelling(false);
+      setError(errorMessage(cause, '取消获取连接配置失败'));
     }
   }
 
@@ -216,8 +239,11 @@ export function App() {
             error={error || (status.state === 'reconnecting' ? status.message ?? '' : '')}
             keyValue={key}
             onAddressChange={setAddress}
+            onCancel={cancelLogin}
             onKeyChange={setKey}
             onSubmit={login}
+            cancellable={submitting}
+            cancelling={cancelling}
             pending={submitting || status.state === 'connecting'}
           />
         )}

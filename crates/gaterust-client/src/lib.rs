@@ -4,7 +4,7 @@ mod error;
 mod paths;
 mod trust;
 
-use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashSet, future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 pub use error::{ClientError, Result};
 use gaterust_tunnel::{
@@ -14,6 +14,7 @@ use gaterust_tunnel::{
 use tokio::{
     sync::{Mutex, watch},
     task::JoinHandle,
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -23,7 +24,22 @@ pub struct ClientRuntime {
     status: watch::Receiver<ClientStatus>,
     shutdown: CancellationToken,
     task: Mutex<Option<JoinHandle<gaterust_tunnel::Result<()>>>>,
-    login: Mutex<()>,
+    login: Mutex<Option<LoginOperation>>,
+}
+
+#[derive(Clone)]
+struct LoginOperation {
+    cancellation: CancellationToken,
+    completed: CancellationToken,
+}
+
+impl LoginOperation {
+    fn new() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            completed: CancellationToken::new(),
+        }
+    }
 }
 
 const LOGIN_TIMEOUT: Duration = Duration::from_mins(1);
@@ -61,7 +77,7 @@ impl ClientRuntime {
             status,
             shutdown,
             task: Mutex::new(Some(task)),
-            login: Mutex::new(()),
+            login: Mutex::new(None),
         })
     }
 
@@ -113,19 +129,49 @@ impl ClientRuntime {
         key: String,
         timeout: Duration,
     ) -> Result<ClientConfig> {
-        let result = match tokio::time::timeout(timeout, self.login_inner(address, key)).await {
-            Ok(result) => result,
-            Err(_) => Err(ClientError::LoginTimeout),
+        let operation = self.begin_login().await?;
+        let deadline = Instant::now() + timeout;
+        let result = self
+            .login_inner(address, key, &operation.cancellation, deadline)
+            .await;
+        let result = if result.is_err() {
+            self.reset_after_failed_login()
+                .await
+                .map_or_else(Err, |()| result)
+        } else {
+            result
         };
-        if result.is_err() {
-            self.reset_after_failed_login().await?;
-        }
+        self.finish_login(&operation).await;
         result
     }
 
-    async fn login_inner(&self, address: String, key: String) -> Result<ClientConfig> {
-        let _login = self.login.lock().await;
+    async fn begin_login(&self) -> Result<LoginOperation> {
+        let mut active = self.login.lock().await;
+        if active.is_some() {
+            return Err(ClientError::InvalidOperation(
+                "正在获取连接配置，请稍候".into(),
+            ));
+        }
+        let operation = LoginOperation::new();
+        *active = Some(operation.clone());
+        Ok(operation)
+    }
+
+    async fn finish_login(&self, operation: &LoginOperation) {
+        self.login.lock().await.take();
+        operation.completed.cancel();
+    }
+
+    async fn login_inner(
+        &self,
+        address: String,
+        key: String,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<ClientConfig> {
+        check_login_state(cancellation, deadline)?;
         let mut config = self.config().await?;
+        check_login_state(cancellation, deadline)?;
         let address = address.trim().to_owned();
         let server_changed = config.server.address != address;
         if server_changed {
@@ -138,16 +184,41 @@ impl ClientRuntime {
         config.validate()?;
 
         // 新凭据通过证书引导和正常 QUIC 认证后才落盘，超时不会触发后台自动重试。
-        trust::prepare(&mut config, self.config_path.as_ref(), server_changed).await?;
+        trust::prepare(
+            &mut config,
+            self.config_path.as_ref(),
+            server_changed,
+            cancellation,
+            deadline,
+        )
+        .await?;
+        check_login_state(cancellation, deadline)?;
         let runtime_config = config.resolved(self.config_path.as_ref())?;
-        verify_client_credentials(&runtime_config).await?;
-        self.save_config(config).await
+        run_login_step(
+            verify_client_credentials(&runtime_config),
+            cancellation,
+            deadline,
+        )
+        .await?;
+        check_login_state(cancellation, deadline)?;
+        let config = self.save_config(config).await?;
+        check_login_state(cancellation, deadline)?;
+        Ok(config)
     }
 
     async fn reset_after_failed_login(&self) -> Result<()> {
         let path = Arc::clone(&self.config_path);
         tokio::task::spawn_blocking(move || ClientConfig::reset(path.as_ref())).await??;
         Ok(())
+    }
+
+    /// 取消并等待当前连接配置获取结束；没有在途任务时直接返回。
+    pub async fn cancel_login(&self) {
+        let operation = self.login.lock().await.clone();
+        if let Some(operation) = operation {
+            operation.cancellation.cancel();
+            operation.completed.cancelled().await;
+        }
     }
 
     /// 将选择的空闲隧道映射到服务端指定的本地回环端口。
@@ -189,12 +260,43 @@ impl ClientRuntime {
     ///
     /// 后台任务异常退出或隧道清理失败时返回错误。
     pub async fn shutdown(&self) -> Result<()> {
+        self.cancel_login().await;
         self.shutdown.cancel();
         let task = self.task.lock().await.take();
         if let Some(task) = task {
             task.await??;
         }
         Ok(())
+    }
+}
+
+fn check_login_state(cancellation: &CancellationToken, deadline: Instant) -> Result<()> {
+    if cancellation.is_cancelled() {
+        Err(ClientError::LoginCancelled)
+    } else if Instant::now() >= deadline {
+        Err(ClientError::LoginTimeout)
+    } else {
+        Ok(())
+    }
+}
+
+async fn run_login_step<T, E>(
+    future: impl Future<Output = std::result::Result<T, E>>,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<T>
+where
+    ClientError: From<E>,
+{
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(ClientError::LoginCancelled),
+        result = tokio::time::timeout_at(deadline, future) => {
+            match result {
+                Ok(result) => result.map_err(ClientError::from),
+                Err(_) => Err(ClientError::LoginTimeout),
+            }
+        }
     }
 }
 
@@ -346,6 +448,51 @@ mod tests {
         })
         .await
         .expect("后台重试应停止");
+        runtime.shutdown().await.expect("停止客户端运行时");
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_active_login() {
+        let directory = tempfile::tempdir().expect("创建测试目录");
+        let config_path = directory.path().join("client.toml");
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("绑定无响应 UDP 端口");
+        let address = sink.local_addr().expect("读取 UDP 地址").to_string();
+        let runtime =
+            Arc::new(ClientRuntime::start(Some(config_path.clone())).expect("启动客户端运行时"));
+        let login_runtime = Arc::clone(&runtime);
+        let login_address = address.clone();
+        let login =
+            tokio::spawn(async move { login_runtime.login(login_address, TEST_KEY.into()).await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.login.lock().await.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("获取任务应进入运行状态");
+        let duplicate = runtime.login(address, TEST_KEY.into()).await;
+        assert!(matches!(duplicate, Err(ClientError::InvalidOperation(_))));
+
+        runtime.cancel_login().await;
+        assert!(matches!(
+            login.await.expect("获取任务正常结束"),
+            Err(ClientError::LoginCancelled)
+        ));
+        assert!(runtime.login.lock().await.is_none());
+        assert!(
+            ClientConfig::read(&config_path)
+                .expect("读取取消后的配置")
+                .server
+                .address
+                .is_empty()
+        );
+
         runtime.shutdown().await.expect("停止客户端运行时");
     }
 
