@@ -113,15 +113,12 @@ impl ClientRuntime {
         key: String,
         timeout: Duration,
     ) -> Result<ClientConfig> {
-        let candidate_address = address.trim().to_owned();
-        let candidate_key = key.clone();
         let result = match tokio::time::timeout(timeout, self.login_inner(address, key)).await {
             Ok(result) => result,
             Err(_) => Err(ClientError::LoginTimeout),
         };
         if result.is_err() {
-            self.discard_unverified_candidate(&candidate_address, &candidate_key)
-                .await?;
+            self.reset_after_failed_login().await?;
         }
         result
     }
@@ -147,15 +144,9 @@ impl ClientRuntime {
         self.save_config(config).await
     }
 
-    async fn discard_unverified_candidate(&self, address: &str, key: &str) -> Result<()> {
-        let config = self.config().await?;
-        if config.server.ca_certificate.is_none()
-            && config.server.address == address
-            && config.key == key
-        {
-            let path = Arc::clone(&self.config_path);
-            tokio::task::spawn_blocking(move || ClientConfig::reset(path.as_ref())).await??;
-        }
+    async fn reset_after_failed_login(&self) -> Result<()> {
+        let path = Arc::clone(&self.config_path);
+        tokio::task::spawn_blocking(move || ClientConfig::reset(path.as_ref())).await??;
         Ok(())
     }
 
@@ -321,18 +312,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_timeout_does_not_persist_or_retry_candidate() {
+    async fn failed_login_stops_retrying_existing_config() {
         let directory = tempfile::tempdir().expect("创建测试目录");
         let config_path = directory.path().join("client.toml");
         let sink = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("绑定无响应 UDP 端口");
         let address = sink.local_addr().expect("读取 UDP 地址").to_string();
-        ClientConfig::ensure_exists(&config_path).expect("创建旧版客户端配置");
-        let mut legacy = ClientConfig::read(&config_path).expect("读取旧版客户端配置");
-        legacy.server.address = address.clone();
-        legacy.key = TEST_KEY.into();
-        legacy.save(&config_path).expect("保存旧版未认证配置");
+        let certificate =
+            generate_simple_self_signed(vec!["localhost".into()]).expect("生成测试证书");
+        std::fs::write(directory.path().join("server.pem"), certificate.cert.pem())
+            .expect("保存服务端证书");
+        ClientConfig::ensure_exists(&config_path).expect("创建客户端配置");
+        let mut existing = ClientConfig::read(&config_path).expect("读取客户端配置");
+        existing.server.address = address.clone();
+        existing.server.name = Some("localhost".into());
+        existing.server.ca_certificate = Some(PathBuf::from("server.pem"));
+        existing.key = TEST_KEY.into();
+        existing.save(&config_path).expect("保存现有客户端配置");
         let runtime = ClientRuntime::start(Some(config_path.clone())).expect("启动客户端运行时");
 
         let result = runtime
@@ -342,14 +339,13 @@ mod tests {
         assert!(matches!(result, Err(ClientError::LoginTimeout)));
         let stored = ClientConfig::read(&config_path).expect("读取客户端配置");
         assert!(stored.server.address.is_empty());
-        assert!(!directory.path().join("server.pem").exists());
         tokio::time::timeout(Duration::from_secs(1), async {
             while !matches!(runtime.status(), ClientStatus::Unconfigured { .. }) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("旧版后台重试应停止");
+        .expect("后台重试应停止");
         runtime.shutdown().await.expect("停止客户端运行时");
     }
 
