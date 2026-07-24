@@ -1,4 +1,4 @@
-import { CirclePower, LoaderCircle, LogOut, ShieldCheck } from 'lucide-react';
+import { CirclePower, LoaderCircle } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { LoginForm } from './components/LoginForm';
 import { TunnelList } from './components/TunnelList';
@@ -28,7 +28,6 @@ export function App() {
   const [submitting, setSubmitting] = useState(false);
   const [action, setAction] = useState<'connect' | 'disconnect' | null>(null);
   const [error, setError] = useState('');
-  const [version, setVersion] = useState('');
   const connectedIdentity = useRef('');
   const knownTunnels = useRef<Set<string>>(new Set());
 
@@ -54,14 +53,12 @@ export function App() {
     setLoading(true);
     setError('');
     try {
-      const [config, currentStatus, currentVersion] = await Promise.all([
+      const [config, currentStatus] = await Promise.all([
         desktop.getConfig(),
-        desktop.getStatus(),
-        desktop.getVersion()
+        desktop.getStatus()
       ]);
       applyConfig(config);
       setStatus(currentStatus);
-      setVersion(currentVersion);
     } catch (cause) {
       setError(errorMessage(cause, '客户端启动失败'));
     } finally {
@@ -169,28 +166,6 @@ export function App() {
 
   return (
     <div className="app-shell">
-      <header className="app-header">
-        <div className="brand">
-          <span className="brand-mark"><ShieldCheck aria-hidden="true" size={18} /></span>
-          <span><strong>GateRust</strong><small>Client {version && `v${version}`}</small></span>
-        </div>
-        <div className={`connection-state ${connected ? 'online' : ''}`}>
-          <i aria-hidden="true" />
-          <span>{connected ? '服务器已登录' : '未登录'}</span>
-        </div>
-        <button
-          aria-label="退出客户端"
-          className="icon-button"
-          onClick={() => void desktop.quit().catch((cause: unknown) => {
-            setError(errorMessage(cause, '退出客户端失败'));
-          })}
-          title="退出客户端"
-          type="button"
-        >
-          <LogOut aria-hidden="true" size={17} />
-        </button>
-      </header>
-
       <main className={connected ? 'workspace' : 'workspace login-workspace'}>
         {loading ? (
           <div className="center-state"><LoaderCircle className="spin" size={22} /><span>正在启动</span></div>
