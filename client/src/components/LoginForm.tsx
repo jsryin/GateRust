@@ -2,32 +2,33 @@ import { Eye, EyeOff, LoaderCircle, LogIn, X } from 'lucide-react';
 import { useState } from 'react';
 import type { FormEvent } from 'react';
 
+type LoginFormState = 'idle' | 'fetching' | 'cancelling' | 'connecting';
+
 interface LoginFormProps {
   address: string;
-  cancellable: boolean;
-  cancelling: boolean;
   error: string;
   keyValue: string;
   onAddressChange: (value: string) => void;
   onCancel: () => Promise<void>;
   onKeyChange: (value: string) => void;
   onSubmit: () => Promise<void>;
-  pending: boolean;
+  state: LoginFormState;
 }
 
 export function LoginForm({
   address,
-  cancellable,
-  cancelling,
   error,
   keyValue,
   onAddressChange,
   onCancel,
   onKeyChange,
   onSubmit,
-  pending
+  state
 }: LoginFormProps) {
   const [keyVisible, setKeyVisible] = useState(false);
+  const fetching = state === 'fetching' || state === 'cancelling';
+  const pending = state !== 'idle';
+  const primaryLabel = state === 'idle' ? '获取配置' : state === 'connecting' ? '连接中' : '获取中';
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -80,17 +81,17 @@ export function LoginForm({
       <div className="login-actions">
         <button className="primary-button" disabled={pending} type="submit">
           {pending ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
-          {pending ? '获取中' : '获取配置'}
+          {primaryLabel}
         </button>
-        {cancellable && (
+        {fetching && (
           <button
             className="secondary-button"
-            disabled={cancelling}
+            disabled={state === 'cancelling'}
             onClick={() => void onCancel()}
             type="button"
           >
-            {cancelling ? <LoaderCircle className="spin" size={16} /> : <X size={16} />}
-            {cancelling ? '取消中' : '取消获取'}
+            {state === 'cancelling' ? <LoaderCircle className="spin" size={16} /> : <X size={16} />}
+            {state === 'cancelling' ? '取消中' : '取消获取'}
           </button>
         )}
       </div>

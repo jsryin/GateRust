@@ -242,9 +242,15 @@ export function App() {
             onCancel={cancelLogin}
             onKeyChange={setKey}
             onSubmit={login}
-            cancellable={submitting}
-            cancelling={cancelling}
-            pending={submitting || status.state === 'connecting'}
+            state={
+              cancelling
+                ? 'cancelling'
+                : submitting
+                  ? 'fetching'
+                  : status.state === 'connecting'
+                    ? 'connecting'
+                    : 'idle'
+            }
           />
         )}
       </main>
