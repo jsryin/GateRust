@@ -1,5 +1,7 @@
 mod browser_data;
+mod build_identity;
 mod commands;
+mod instance;
 
 use std::{
     ffi::OsString,
@@ -22,18 +24,15 @@ use tracing_subscriber::EnvFilter;
 pub fn run() -> tauri::Result<()> {
     initialize_logging();
     let application = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(
-            |application, _arguments, _directory| {
-                focus_main_window(application);
-            },
-        ))
         .setup(|application| {
-            browser_data::migrate(application);
+            let instance = instance::PrimaryInstance::acquire(application)?;
+            let browser_data_directory = browser_data::prepare(application)?;
             let config_path = config_path_from_arguments();
             let runtime =
                 tauri::async_runtime::block_on(async { ClientRuntime::start(config_path) })?;
             application.manage(runtime);
-            create_main_window(application)?;
+            create_main_window(application, browser_data_directory)?;
+            instance.start(application)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -59,6 +58,9 @@ pub fn run() -> tauri::Result<()> {
         api.prevent_exit();
         let application = application.clone();
         tauri::async_runtime::spawn(async move {
+            if let Some(monitor) = application.try_state::<instance::InstanceMonitor>() {
+                monitor.shutdown();
+            }
             if let Some(runtime) = application.try_state::<ClientRuntime>()
                 && let Err(error) = runtime.shutdown().await
             {
@@ -70,7 +72,10 @@ pub fn run() -> tauri::Result<()> {
     Ok(())
 }
 
-fn create_main_window(application: &tauri::App) -> tauri::Result<()> {
+fn create_main_window(
+    application: &tauri::App,
+    browser_data_directory: Option<PathBuf>,
+) -> tauri::Result<()> {
     let config = application
         .config()
         .app
@@ -82,8 +87,11 @@ fn create_main_window(application: &tauri::App) -> tauri::Result<()> {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "缺少 main 窗口配置")
         })?;
     let builder = WebviewWindowBuilder::from_config(application, &config)?;
-    #[cfg(any(target_os = "linux", windows))]
-    let builder = builder.data_directory(browser_data::directory(application)?);
+    let builder = if let Some(directory) = browser_data_directory {
+        builder.data_directory(directory)
+    } else {
+        builder
+    };
     builder.build()?;
     Ok(())
 }
@@ -108,27 +116,6 @@ fn config_path_from_iter(arguments: impl IntoIterator<Item = OsString>) -> Optio
         }
     }
     None
-}
-
-fn focus_main_window(application: &tauri::AppHandle) {
-    let Some(window) = application.get_webview_window("main") else {
-        return;
-    };
-    match window.is_minimized() {
-        Ok(true) => {
-            if let Err(error) = window.unminimize() {
-                tracing::warn!(%error, "恢复客户端窗口失败");
-            }
-        }
-        Ok(false) => {}
-        Err(error) => tracing::warn!(%error, "读取客户端窗口状态失败"),
-    }
-    if let Err(error) = window.show() {
-        tracing::warn!(%error, "显示客户端窗口失败");
-    }
-    if let Err(error) = window.set_focus() {
-        tracing::warn!(%error, "聚焦客户端窗口失败");
-    }
 }
 
 fn initialize_logging() {
