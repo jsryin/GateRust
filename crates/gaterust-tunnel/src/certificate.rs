@@ -22,6 +22,7 @@ impl DownloadedServerCertificate {
         if certificates.is_empty() || certificates.len() > MAX_CERTIFICATE_CHAIN_LENGTH {
             return Err(TunnelError::Protocol("服务端证书链数量无效".into()));
         }
+        validate_server_leaf(certificates[0].as_ref())?;
         let server_name = server_name_from_der(certificates[0].as_ref(), address)?;
         let blocks = certificates
             .iter()
@@ -54,7 +55,20 @@ pub fn server_name_from_pem(content: &[u8], address: &str) -> Result<String> {
         .next()
         .transpose()?
         .ok_or_else(|| TunnelError::Tls("server.pem 不包含证书".into()))?;
+    validate_server_leaf(certificate.as_ref())?;
     server_name_from_der(certificate.as_ref(), address)
+}
+
+pub(crate) fn validate_server_leaf(certificate: &[u8]) -> Result<()> {
+    let (_, certificate) = parse_x509_certificate(certificate)
+        .map_err(|_| TunnelError::Tls("解析服务端叶证书失败".into()))?;
+    let basic_constraints = certificate
+        .basic_constraints()
+        .map_err(|_| TunnelError::Tls("解析服务端证书 Basic Constraints 失败".into()))?;
+    if basic_constraints.is_some_and(|extension| extension.value.ca) {
+        return Err(TunnelError::ServerCertificateIsCa);
+    }
+    Ok(())
 }
 
 fn server_name_from_der(certificate: &[u8], address: &str) -> Result<String> {
@@ -130,7 +144,7 @@ fn ip_from_san(raw: &[u8]) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
-    use rcgen::generate_simple_self_signed;
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, generate_simple_self_signed};
 
     use super::*;
 
@@ -149,5 +163,20 @@ mod tests {
             server_name_from_pem(pem.as_bytes(), "127.0.0.1:2333").expect("选择证书名称"),
             "localhost"
         );
+    }
+
+    #[test]
+    fn rejects_ca_certificate_as_server_leaf() {
+        let mut params =
+            CertificateParams::new(vec!["localhost".into()]).expect("创建测试证书参数");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let signing_key = KeyPair::generate().expect("生成测试密钥");
+        let certificate = params.self_signed(&signing_key).expect("生成测试 CA 证书");
+        let chain = [certificate.der().clone()];
+
+        let error = DownloadedServerCertificate::from_chain(&chain, "localhost:2333")
+            .expect_err("CA 证书不能作为服务端叶证书保存");
+
+        assert!(matches!(error, TunnelError::ServerCertificateIsCa));
     }
 }

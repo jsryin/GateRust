@@ -39,6 +39,33 @@ gaterust uninstall --all --yes
 
 配置位于 `/etc/gaterust`，运行数据位于 `/var/lib/gaterust`。`--init-tunnel` 生成的自签名证书位于 `/etc/gaterust/tunnel/server.pem`。
 
+旧版本的 `--init-tunnel` 可能生成 `Basic Constraints CA:TRUE` 的证书，新版本会在服务端启动前拒绝将其作为叶证书。可先用以下命令确认：
+
+```bash
+sudo openssl x509 -in /etc/gaterust/tunnel/server.pem -noout -ext basicConstraints
+```
+
+如果输出包含 `CA:TRUE`，请备份并生成新的服务端叶证书：
+
+```bash
+sudo cp -a /etc/gaterust/tunnel/server.pem /etc/gaterust/tunnel/server.pem.ca-true.bak
+sudo cp -a /etc/gaterust/tunnel/server-key.pem /etc/gaterust/tunnel/server-key.pem.ca-true.bak
+sudo openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 3650 \
+  -subj '/CN=gaterust.local' \
+  -addext 'subjectAltName=DNS:gaterust.local' \
+  -addext 'basicConstraints=critical,CA:FALSE' \
+  -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+  -addext 'extendedKeyUsage=serverAuth' \
+  -keyout /etc/gaterust/tunnel/server-key.pem.new \
+  -out /etc/gaterust/tunnel/server.pem.new
+sudo systemctl stop gaterust.service
+sudo install -o root -g gaterust -m 0640 /etc/gaterust/tunnel/server.pem.new /etc/gaterust/tunnel/server.pem
+sudo install -o root -g gaterust -m 0640 /etc/gaterust/tunnel/server-key.pem.new /etc/gaterust/tunnel/server-key.pem
+sudo systemctl start gaterust.service
+```
+
+升级后的桌面客户端检测到本地受管证书为 `CA:TRUE` 时，会重新执行分组密钥证明并安全替换该证书。
+
 ## 桌面客户端
 
 首次点击“获取配置”时，如果客户端配置目录没有可用的 `server.pem`，客户端会通过分组密钥双向证明验证服务端，并将证书保存为 `server.pem` 后重新建立受信任连接。获取期间可主动取消，整个过程最多持续 60 秒；取消、超时或密钥错误时不会保存候选配置，也不会在后台继续获取。证书引导协议要求客户端与服务端同时升级到相同版本。

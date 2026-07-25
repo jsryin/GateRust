@@ -7,7 +7,7 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
 };
 
-use crate::{Result, TunnelError, config::ServerQuicConfig};
+use crate::{Result, TunnelError, certificate::validate_server_leaf, config::ServerQuicConfig};
 
 pub(crate) fn server_endpoint(
     config: &ServerQuicConfig,
@@ -29,6 +29,7 @@ fn build_server_config(
         .first()
         .cloned()
         .ok_or_else(|| TunnelError::Tls("服务端证书文件不包含叶证书".into()))?;
+    validate_server_leaf(certificate.as_ref())?;
     let private_key = read_private_key(&config.private_key)?;
     let mut server = ServerConfig::with_single_cert(certificates, private_key)
         .map_err(|error| TunnelError::Tls(error.to_string()))?;

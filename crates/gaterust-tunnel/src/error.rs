@@ -33,6 +33,8 @@ pub enum TunnelError {
     QuinnRead(#[from] quinn::ReadExactError),
     #[error("TLS 配置失败: {0}")]
     Tls(String),
+    #[error("TLS 配置失败: 服务端证书链首证书不能是 CA 证书（Basic Constraints CA:TRUE）")]
+    ServerCertificateIsCa,
     #[error("协议错误: {0}")]
     Protocol(String),
     #[error("认证失败: {0}")]

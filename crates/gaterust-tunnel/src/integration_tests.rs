@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::Path, time::Duration};
 
-use rcgen::generate_simple_self_signed;
+use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, generate_simple_self_signed};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -33,6 +33,24 @@ private_key = "server-key.pem"
     std::fs::remove_file(directory.path().join("server-key.pem")).expect("应能删除测试私钥");
     let error = check_server_config(&path).expect_err("缺少私钥应校验失败");
     assert!(error.to_string().contains("server-key.pem"));
+}
+
+#[test]
+fn rejects_ca_certificate_before_server_startup() {
+    let directory = tempfile::tempdir().expect("应能创建测试目录");
+    write_ca_certificate(directory.path());
+    let config = r#"
+[quic]
+bind = "127.0.0.1:2333"
+certificate = "server.pem"
+private_key = "server-key.pem"
+"#;
+    let path = directory.path().join("server.toml");
+    std::fs::write(&path, config).expect("应能写服务端配置");
+
+    let error = check_server_config(&path).expect_err("CA 证书不能作为服务端叶证书");
+
+    assert!(matches!(error, TunnelError::ServerCertificateIsCa));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -358,6 +376,22 @@ fn write_certificate(directory: &Path) {
     std::fs::write(
         directory.join("server-key.pem"),
         certified.signing_key.serialize_pem(),
+    )
+    .expect("应能写入测试私钥");
+}
+
+fn write_ca_certificate(directory: &Path) {
+    let mut params =
+        CertificateParams::new(vec!["localhost".into()]).expect("应能创建测试证书参数");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let signing_key = KeyPair::generate().expect("应能生成测试密钥");
+    let certificate = params
+        .self_signed(&signing_key)
+        .expect("应能生成测试 CA 证书");
+    std::fs::write(directory.join("server.pem"), certificate.pem()).expect("应能写入测试证书");
+    std::fs::write(
+        directory.join("server-key.pem"),
+        signing_key.serialize_pem(),
     )
     .expect("应能写入测试私钥");
 }

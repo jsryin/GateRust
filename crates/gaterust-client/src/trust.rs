@@ -20,6 +20,7 @@ pub(crate) async fn prepare(
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<()> {
+    let certificate_path = config_parent(config_path).join(SERVER_CERTIFICATE_NAME);
     if !force_download && let Some(configured) = config.server.ca_certificate.as_deref() {
         let configured = if configured.is_relative() {
             config_parent(config_path).join(configured)
@@ -32,11 +33,11 @@ pub(crate) async fn prepare(
                 path: configured.clone(),
                 source,
             })?
+            && configured != certificate_path
         {
             return Ok(());
         }
     }
-    let certificate_path = config_parent(config_path).join(SERVER_CERTIFICATE_NAME);
     if !force_download
         && certificate_path
             .try_exists()
@@ -53,9 +54,20 @@ pub(crate) async fn prepare(
             })
         })
         .await??;
-        config.server.name = Some(server_name_from_pem(&content, &config.server.address)?);
-        config.server.ca_certificate = Some(PathBuf::from(SERVER_CERTIFICATE_NAME));
-        return Ok(());
+        match server_name_from_pem(&content, &config.server.address) {
+            Ok(server_name) => {
+                config.server.name = Some(server_name);
+                config.server.ca_certificate = Some(PathBuf::from(SERVER_CERTIFICATE_NAME));
+                return Ok(());
+            }
+            Err(TunnelError::ServerCertificateIsCa) => {
+                tracing::warn!(
+                    path = %certificate_path.display(),
+                    "受管服务端证书错误标记为 CA，正在重新执行证书引导"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
 
     let certificate = run_login_step(

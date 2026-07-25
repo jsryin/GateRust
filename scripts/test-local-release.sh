@@ -215,7 +215,8 @@ verify_install() {
     local state modules expected_state service_environment service_environment_attributes
     local proxy_config expected_proxy_config
     local attempt tunnel_mode proxy_mode tunnel_config_attributes tunnel_certificate_attributes
-    local tunnel_private_key_attributes proxy_config_attributes proxy_http_status
+    local tunnel_private_key_attributes tunnel_basic_constraints
+    local proxy_config_attributes proxy_http_status
     as_root test -x /usr/local/bin/gaterust-server || die "服务端二进制未安装"
     as_root test -x /usr/local/sbin/gaterust || die "管理脚本未安装"
     as_root test -f /etc/systemd/system/gaterust.service || die "systemd unit 未安装"
@@ -264,6 +265,14 @@ verify_install() {
             die "Proxy 配置权限不正确：$proxy_config_attributes"
         as_root openssl x509 -in "$TUNNEL_CERTIFICATE" -noout -checkhost gaterust.local >/dev/null ||
             die "QUIC 证书不包含 gaterust.local"
+        tunnel_basic_constraints=$(
+            as_root openssl x509 -in "$TUNNEL_CERTIFICATE" -noout -ext basicConstraints
+        )
+        [[ "$tunnel_basic_constraints" == *"CA:FALSE"* ]] ||
+            die "QUIC 服务端证书的 Basic Constraints 不是 CA:FALSE"
+        as_root openssl verify -CAfile "$TUNNEL_CERTIFICATE" -purpose sslserver \
+            -verify_hostname gaterust.local "$TUNNEL_CERTIFICATE" >/dev/null ||
+            die "QUIC 证书不能用于 TLS 服务端认证"
         as_root /usr/local/bin/gaterust-server check-config \
             --enable-tunnel --tunnel-config "$TUNNEL_CONFIG" ||
             die "QUIC 自动初始化配置校验失败"

@@ -390,7 +390,7 @@ pub fn prepare_config_path(explicit_config_path: Option<PathBuf>) -> Result<Path
 
 #[cfg(test)]
 mod tests {
-    use rcgen::generate_simple_self_signed;
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, generate_simple_self_signed};
 
     use super::*;
 
@@ -602,6 +602,23 @@ key = "{TEST_KEY}"
         })
         .await
         .expect("客户端应使用下载证书完成连接");
+
+        let mut ca_params =
+            CertificateParams::new(vec!["localhost".into()]).expect("创建旧证书参数");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().expect("生成旧证书密钥");
+        let ca_certificate = ca_params.self_signed(&ca_key).expect("生成旧 CA 证书");
+        std::fs::write(directory.path().join("server.pem"), ca_certificate.pem())
+            .expect("写入旧 CA 证书");
+
+        runtime
+            .login(address.to_string(), TEST_KEY.into())
+            .await
+            .expect("应重新引导并替换旧 CA 证书");
+        let downloaded =
+            std::fs::read(directory.path().join("server.pem")).expect("读取替换后的服务端证书");
+        gaterust_tunnel::server_name_from_pem(&downloaded, &address.to_string())
+            .expect("替换后的证书应为服务端叶证书");
 
         runtime.shutdown().await.expect("停止客户端运行时");
         cancellation.cancel();

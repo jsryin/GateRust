@@ -484,7 +484,7 @@ perform_install() {
     fi
     if [ -n "${GENERATED_TUNNEL_CERTIFICATE:-}" ]; then
         say "QUIC TLS 已自动初始化（自签名证书，服务器名称：gaterust.local）"
-        say "QUIC CA 证书：/etc/gaterust/tunnel/server.pem"
+        say "QUIC 服务端证书：/etc/gaterust/tunnel/server.pem"
         warn "客户端需要信任该证书，并将 TLS 服务器名称设置为 gaterust.local"
     fi
     if [ -n "${GENERATED_PROXY_CONFIG:-}" ]; then
@@ -619,6 +619,9 @@ generate_tunnel_config() {
         openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 3650 \
             -subj '/CN=gaterust.local' \
             -addext 'subjectAltName=DNS:gaterust.local' \
+            -addext 'basicConstraints=critical,CA:FALSE' \
+            -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+            -addext 'extendedKeyUsage=serverAuth' \
             -keyout "$GENERATED_TUNNEL_PRIVATE_KEY" \
             -out "$GENERATED_TUNNEL_CERTIFICATE" >/dev/null 2>&1 || exit 1
         write_tunnel_config "$GENERATED_TUNNEL_CONFIG" \
