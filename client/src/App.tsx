@@ -1,6 +1,7 @@
 import { CirclePower, LoaderCircle } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { LoginForm } from './components/LoginForm';
+import { TunnelActions } from './components/TunnelActions';
 import { TunnelList } from './components/TunnelList';
 import type { ClientConfig, ClientStatus } from './lib/client-types';
 import { desktop } from './lib/desktop';
@@ -99,20 +100,30 @@ export function App() {
     const identity = `${status.server ?? ''}/${status.device_id}`;
     const currentNames = new Set(status.tunnels.map((tunnel) => tunnel.name));
     setSelected((current) => {
-      const next = connectedIdentity.current === identity ? new Set(current) : new Set<string>();
+      const sameIdentity = connectedIdentity.current === identity;
+      const next = sameIdentity ? new Set(current) : new Set<string>();
+      let changed = !sameIdentity && current.size > 0;
       for (const tunnel of status.tunnels) {
         if (
           tunnel.state === 'connected' ||
           (tunnel.state === 'idle' && !knownTunnels.current.has(tunnel.name))
         ) {
-          next.add(tunnel.name);
+          if (!next.has(tunnel.name)) {
+            next.add(tunnel.name);
+            changed = true;
+          }
         }
-        if (tunnel.state === 'occupied') next.delete(tunnel.name);
+        if (tunnel.state === 'occupied' && next.delete(tunnel.name)) {
+          changed = true;
+        }
       }
       for (const name of next) {
-        if (!currentNames.has(name)) next.delete(name);
+        if (!currentNames.has(name)) {
+          next.delete(name);
+          changed = true;
+        }
       }
-      return next;
+      return changed ? next : current;
     });
     connectedIdentity.current = identity;
     knownTunnels.current = currentNames;
@@ -158,7 +169,7 @@ export function App() {
     setAction('connect');
     setError('');
     try {
-      await desktop.connectTunnels([...selected]);
+      await desktop.connectTunnels(tunnelSelection.selectedIdleNames);
       await refreshStatus();
     } catch (cause) {
       setError(errorMessage(cause, '连接隧道失败'));
@@ -182,10 +193,34 @@ export function App() {
   }
 
   const connected = status.state === 'connected';
-  const selectedIdleCount = status.tunnels.filter(
-    (tunnel) => tunnel.state === 'idle' && selected.has(tunnel.name)
-  ).length;
-  const connectedCount = status.tunnels.filter((tunnel) => tunnel.state === 'connected').length;
+  const tunnelSelection = useMemo(() => {
+    const idleNames: string[] = [];
+    const selectedIdleNames: string[] = [];
+    let connectedCount = 0;
+
+    for (const tunnel of status.tunnels) {
+      if (tunnel.state === 'idle') {
+        idleNames.push(tunnel.name);
+        if (selected.has(tunnel.name)) selectedIdleNames.push(tunnel.name);
+      } else if (tunnel.state === 'connected') {
+        connectedCount += 1;
+      }
+    }
+
+    return { connectedCount, idleNames, selectedIdleNames };
+  }, [selected, status.tunnels]);
+
+  function toggleAllIdle(): void {
+    setSelected((current) => {
+      // 全选仅增删当前空闲项，已连接和被占用项始终保持原状态。
+      const selectAll = tunnelSelection.idleNames.some((name) => !current.has(name));
+      const next = new Set(current);
+      for (const name of tunnelSelection.idleNames) {
+        if (selectAll) next.add(name); else next.delete(name);
+      }
+      return next;
+    });
+  }
 
   return (
     <div className="app-shell">
@@ -201,12 +236,12 @@ export function App() {
               </div>
               <button
                 className="secondary-button"
-                disabled={!connectedCount || action !== null}
+                disabled={!tunnelSelection.connectedCount || action !== null}
                 onClick={() => void disconnect()}
                 type="button"
               >
                 {action === 'disconnect' ? <LoaderCircle className="spin" size={15} /> : <CirclePower size={15} />}
-                断开全部
+                断开
               </button>
             </div>
 
@@ -220,18 +255,15 @@ export function App() {
               selected={selected}
               tunnels={status.tunnels}
             />
-            <div className="action-bar">
-              <span>{selectedIdleCount ? `已选择 ${selectedIdleCount} 条空闲隧道` : `${connectedCount} 条已连接`}</span>
-              <button
-                className="primary-button"
-                disabled={!selected.size || !selectedIdleCount || action !== null}
-                onClick={() => void connect()}
-                type="button"
-              >
-                {action === 'connect' && <LoaderCircle className="spin" size={16} />}
-                连接
-              </button>
-            </div>
+            <TunnelActions
+              action={action}
+              connectedCount={tunnelSelection.connectedCount}
+              idleCount={tunnelSelection.idleNames.length}
+              onConnect={connect}
+              onDisconnect={disconnect}
+              onToggleAll={toggleAllIdle}
+              selectedIdleCount={tunnelSelection.selectedIdleNames.length}
+            />
           </section>
         ) : (
           <LoginForm

@@ -44,6 +44,7 @@ button:disabled {
 .action-bar,
 .primary-button,
 .secondary-button,
+.danger-button,
 .tunnel-name,
 .state-badge {
   display: flex;
@@ -145,7 +146,8 @@ input::placeholder {
 }
 
 .primary-button,
-.secondary-button {
+.secondary-button,
+.danger-button {
   min-height: 36px;
   justify-content: center;
   gap: 7px;
@@ -173,6 +175,16 @@ input::placeholder {
 
 .secondary-button:not(:disabled):hover {
   background: #f2f5f4;
+}
+
+.danger-button {
+  color: #fff;
+  background: #b42318;
+  border: 1px solid #951d14;
+}
+
+.danger-button:not(:disabled):hover {
+  background: #971f16;
 }
 
 .login-actions {
@@ -374,12 +386,46 @@ input::placeholder {
   gap: 12px;
 }
 
-.action-bar > span {
-  color: #77827d;
-  font-size: 10px;
+.action-selection,
+.select-all {
+  display: flex;
+  align-items: center;
 }
 
-.action-bar .primary-button {
+.action-selection {
+  min-width: 0;
+  gap: 12px;
+}
+
+.select-all {
+  flex: 0 0 auto;
+  gap: 6px;
+  color: #46514d;
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.select-all.disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.select-all input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: #176f61;
+}
+
+.action-status {
+  color: #77827d;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.action-bar .primary-button,
+.action-bar .danger-button {
   min-width: 96px;
 }
 
