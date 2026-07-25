@@ -12,6 +12,8 @@ pub enum ClientError {
     LoginTimeout,
     #[error("已取消获取连接配置")]
     LoginCancelled,
+    #[error("客户端运行时未在退出期限内停止")]
+    ShutdownTimeout,
     #[error(transparent)]
     Tunnel(#[from] gaterust_tunnel::TunnelError),
     #[error("等待客户端运行时任务失败: {0}")]

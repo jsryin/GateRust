@@ -43,6 +43,7 @@ impl LoginOperation {
 }
 
 const LOGIN_TIMEOUT: Duration = Duration::from_mins(1);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl ClientRuntime {
     /// 初始化配置并启动隧道后台任务。
@@ -258,15 +259,37 @@ impl ClientRuntime {
     ///
     /// # Errors
     ///
-    /// 后台任务异常退出或隧道清理失败时返回错误。
+    /// 后台任务异常退出、隧道清理失败或超过退出期限时返回错误。
     pub async fn shutdown(&self) -> Result<()> {
-        self.cancel_login().await;
+        self.shutdown_with_timeout(SHUTDOWN_TIMEOUT).await
+    }
+
+    async fn shutdown_with_timeout(&self, grace_period: Duration) -> Result<()> {
         self.shutdown.cancel();
-        let task = self.task.lock().await.take();
-        if let Some(task) = task {
-            task.await??;
+        let login = self.login.lock().await.clone();
+        if let Some(operation) = &login {
+            operation.cancellation.cancel();
         }
-        Ok(())
+        let mut task = self.task.lock().await.take();
+
+        let graceful_shutdown = async {
+            if let Some(operation) = login {
+                operation.completed.cancelled().await;
+            }
+            if let Some(task) = task.as_mut() {
+                task.await??;
+            }
+            Ok(())
+        };
+        if let Ok(result) = tokio::time::timeout(grace_period, graceful_shutdown).await {
+            result
+        } else {
+            // 退出期限耗尽后必须终止后台任务，避免窗口关闭但进程继续驻留。
+            if let Some(task) = task {
+                task.abort();
+            }
+            Err(ClientError::ShutdownTimeout)
+        }
     }
 }
 
@@ -586,5 +609,44 @@ key = "{TEST_KEY}"
             .await
             .expect("服务端任务正常结束")
             .expect("服务端正常退出");
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_runtime_task_after_deadline() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("创建临时目录");
+        let (_status_sender, status) = watch::channel(ClientStatus::Starting);
+        let (dropped_sender, dropped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _signal = DropSignal(Some(dropped_sender));
+            std::future::pending::<gaterust_tunnel::Result<()>>().await
+        });
+        let runtime = ClientRuntime {
+            config_path: Arc::new(directory.path().join("client.toml")),
+            status,
+            shutdown: CancellationToken::new(),
+            task: Mutex::new(Some(task)),
+            login: Mutex::new(None),
+        };
+
+        let result = runtime
+            .shutdown_with_timeout(Duration::from_millis(10))
+            .await;
+
+        assert!(matches!(result, Err(ClientError::ShutdownTimeout)));
+        tokio::time::timeout(Duration::from_secs(1), dropped)
+            .await
+            .expect("中止任务应及时释放 future")
+            .expect("中止任务应发送释放信号");
+        runtime.shutdown().await.expect("重复关闭应直接完成");
     }
 }

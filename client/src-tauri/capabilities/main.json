@@ -4,8 +4,6 @@
   "description": "GateRust 客户端主窗口的最小权限集",
   "windows": ["main"],
   "permissions": [
-    "core:app:allow-version",
-    "core:window:allow-destroy",
     "core:window:allow-show"
   ]
 }

@@ -19,6 +19,8 @@
       {
         "label": "main",
         "title": "GateRust Client",
+        "create": false,
+        "incognito": true,
         "width": 390,
         "height": 320,
         "minWidth": 390,

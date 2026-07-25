@@ -65,14 +65,6 @@ pub(crate) fn get_status(runtime: State<'_, ClientRuntime>) -> StatusResponse {
     StatusResponse::from(runtime.status())
 }
 
-#[tauri::command]
-pub(crate) async fn shutdown(runtime: State<'_, ClientRuntime>) -> CommandResult<()> {
-    if let Err(error) = runtime.shutdown().await {
-        tracing::error!(%error, "等待客户端运行时退出失败");
-    }
-    Ok(())
-}
-
 impl From<ClientStatus> for StatusResponse {
     fn from(status: ClientStatus) -> Self {
         match status {

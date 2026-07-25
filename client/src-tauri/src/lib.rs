@@ -1,3 +1,4 @@
+mod browser_data;
 mod commands;
 
 use std::{
@@ -10,7 +11,7 @@ use std::{
 };
 
 use gaterust_client::ClientRuntime;
-use tauri::{Manager as _, RunEvent};
+use tauri::{Manager as _, RunEvent, WebviewWindowBuilder};
 use tracing_subscriber::EnvFilter;
 
 /// 启动 `GateRust` 桌面客户端并管理隧道运行时生命周期。
@@ -27,10 +28,12 @@ pub fn run() -> tauri::Result<()> {
             },
         ))
         .setup(|application| {
+            browser_data::migrate(application);
             let config_path = config_path_from_arguments();
             let runtime =
                 tauri::async_runtime::block_on(async { ClientRuntime::start(config_path) })?;
             application.manage(runtime);
+            create_main_window(application)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -40,7 +43,6 @@ pub fn run() -> tauri::Result<()> {
             commands::get_config,
             commands::get_status,
             commands::login,
-            commands::shutdown,
         ])
         .build(tauri::generate_context!())?;
 
@@ -65,6 +67,24 @@ pub fn run() -> tauri::Result<()> {
             application.exit(0);
         });
     });
+    Ok(())
+}
+
+fn create_main_window(application: &tauri::App) -> tauri::Result<()> {
+    let config = application
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|config| config.label == "main")
+        .cloned()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "缺少 main 窗口配置")
+        })?;
+    let builder = WebviewWindowBuilder::from_config(application, &config)?;
+    #[cfg(any(target_os = "linux", windows))]
+    let builder = builder.data_directory(browser_data::directory(application)?);
+    builder.build()?;
     Ok(())
 }
 
