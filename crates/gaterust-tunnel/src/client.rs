@@ -40,6 +40,8 @@ use crate::{
 };
 
 const MAX_RESOLVED_ADDRESSES: usize = 8;
+const CONFIG_RELOAD_GRACE: Duration = Duration::from_millis(100);
+const CONFIG_RELOAD_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -229,7 +231,7 @@ pub async fn run_client_with_status(
                         if !changed {
                             break 'running;
                         }
-                        match ClientConfig::load(&config_path) {
+                        match load_client_config_after_change(&config_path).await {
                             Ok(updated) => {
                                 config = updated;
                                 false
@@ -472,7 +474,7 @@ async fn wait_for_connection_step<T>(
             if !changed {
                 return ConnectionStep::WatcherClosed;
             }
-            match ClientConfig::load(config_path) {
+            match load_client_config_after_change(config_path).await {
                 Ok(updated) => ConnectionStep::Reconfigure(updated),
                 Err(_) => ConnectionStep::Unconfigured,
             }
@@ -482,6 +484,20 @@ async fn wait_for_connection_step<T>(
 
 fn config_watcher_closed() -> ConnectionEnd {
     ConnectionEnd::Disconnected(TunnelError::Protocol("配置监听器已关闭".into()))
+}
+
+async fn load_client_config_after_change(config_path: &Path) -> Result<ClientConfig> {
+    let deadline = tokio::time::Instant::now() + CONFIG_RELOAD_GRACE;
+    loop {
+        match ClientConfig::load(config_path) {
+            Ok(config) => return Ok(config),
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                // Windows 替换配置时会短暂删除旧文件，此时读取失败不代表配置已移除。
+                tokio::time::sleep(CONFIG_RELOAD_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 enum AuthenticationResult {
@@ -588,7 +604,7 @@ async fn run_connected(
                 if !changed {
                     break ConnectionEnd::Disconnected(TunnelError::Protocol("配置监听器已关闭".into()));
                 }
-                let Ok(updated) = ClientConfig::load(config_path) else {
+                let Ok(updated) = load_client_config_after_change(config_path).await else {
                     break ConnectionEnd::Unconfigured;
                 };
                 if connection_identity_changed(config, &updated) {
@@ -987,11 +1003,13 @@ mod tests {
         ClientConfig::ensure_exists(&path).expect("创建初始客户端配置");
         let mut watcher = ConfigWatcher::new(&path).expect("创建配置监听器");
         let update_path = path.clone();
+        let mut updated = ClientConfig::read(&path).expect("读取初始客户端配置");
         let update = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(25)).await;
-            let mut config = ClientConfig::read(&update_path).expect("读取初始客户端配置");
-            config.server.address = "127.0.0.1:24444".into();
-            config.save(&update_path).expect("保存更新后的客户端配置");
+            std::fs::remove_file(&update_path).expect("删除旧客户端配置");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            updated.server.address = "127.0.0.1:24444".into();
+            updated.save(&update_path).expect("保存更新后的客户端配置");
         });
         let cancellation = CancellationToken::new();
 

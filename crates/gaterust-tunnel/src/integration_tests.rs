@@ -147,10 +147,13 @@ async fn forwards_tcp_udp_and_socks5() {
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     let client_cancel = cancellation.clone();
+    let client_task_path = client_path.clone();
     let client =
-        tokio::spawn(async move { run_client_with_shutdown(client_path, client_cancel).await });
+        tokio::spawn(
+            async move { run_client_with_shutdown(client_task_path, client_cancel).await },
+        );
 
-    wait_for_runtime(&runtime, |snapshot| {
+    let initial = wait_for_runtime(&runtime, |snapshot| {
         snapshot.clients.len() == 1
             && snapshot
                 .tunnels
@@ -159,6 +162,7 @@ async fn forwards_tcp_udp_and_socks5() {
                 .is_some_and(|tunnel| tunnel.owner_session_id.is_some())
     })
     .await;
+    let session_id = initial.clients[0].session_id;
 
     assert_stream_echo(tcp_public, b"tcp-through-quic").await;
     let mut persistent = TcpStream::connect(tcp_public)
@@ -166,12 +170,42 @@ async fn forwards_tcp_udp_and_socks5() {
         .expect("应能建立持久 TCP 隧道");
     exchange(&mut persistent, b"before-reload").await;
 
+    let mut runtime_changes = runtime.subscribe();
+    runtime_changes.borrow_and_update();
+    let client_config = std::fs::read(&client_path).expect("应能暂存客户端配置");
+    std::fs::remove_file(&client_path).expect("应能模拟 Windows 配置替换空窗");
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    std::fs::write(&client_path, client_config).expect("应能完成客户端配置替换");
+    tokio::time::timeout(Duration::from_secs(2), runtime_changes.changed())
+        .await
+        .expect("服务端应收到合并后的配置更新")
+        .expect("运行时状态通道保持打开");
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.clients.len(), 1);
+    assert_eq!(snapshot.clients[0].session_id, session_id);
+    exchange(&mut persistent, b"after-config-replace").await;
+
+    runtime_changes.borrow_and_update();
     write_client_config(
         directory.path(),
         quic,
         tcp_target_address,
         udp_target_address,
         false,
+    );
+    tokio::time::timeout(Duration::from_secs(2), runtime_changes.changed())
+        .await
+        .expect("服务端应收到后续客户端配置更新")
+        .expect("运行时状态通道保持打开");
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.clients.len(), 1);
+    assert_eq!(snapshot.clients[0].session_id, session_id);
+    assert!(
+        snapshot
+            .tunnels
+            .iter()
+            .find(|tunnel| tunnel.name == "tcp-echo")
+            .is_some_and(|tunnel| tunnel.owner_session_id.is_none())
     );
     wait_until_stream_unavailable(tcp_public).await;
     exchange(&mut persistent, b"after-client-remove").await;
