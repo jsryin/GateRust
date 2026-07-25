@@ -8,7 +8,7 @@ use std::{
 };
 
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
-use quinn::{Connection, VarInt};
+use quinn::Connection;
 use rand::RngExt as _;
 use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     Result, TunnelError, bootstrap,
     certificate::DownloadedServerCertificate,
+    close::{ApplicationCloseCode, connection_error_or},
     config::{
         ClientConfig, ClientServerConfig, ClientServiceConfig, TunnelKind, validate_group_key,
     },
@@ -34,14 +35,10 @@ use crate::{
     },
     rate_limit::RateLimiter,
     relay::{self, QuinnStream},
-    runtime::ADMINISTRATOR_CLOSE_CODE,
     tls,
     watcher::ConfigWatcher,
 };
 
-const CLOSE_RECONFIGURE: VarInt = VarInt::from_u32(10);
-const CLOSE_SHUTDOWN: VarInt = VarInt::from_u32(11);
-const CLOSE_CREDENTIAL_CHECK: VarInt = VarInt::from_u32(13);
 const MAX_RESOLVED_ADDRESSES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -133,7 +130,10 @@ pub async fn verify_client_credentials(config: &ClientConfig) -> Result<Vec<Clie
     let (endpoint, connection) = connect_server(config).await?;
     let device_id = format!("credential-check-{:016x}", rand::rng().random::<u64>());
     let result = authenticate(&connection, config, &device_id).await;
-    connection.close(CLOSE_CREDENTIAL_CHECK, b"credential check complete");
+    connection.close(
+        ApplicationCloseCode::CredentialCheckComplete.value(),
+        b"credential check complete",
+    );
     endpoint.wait_idle().await;
     match result? {
         AuthenticationResult::Accepted { tunnels, .. } => Ok(tunnels),
@@ -354,22 +354,34 @@ async fn connect_and_run(
     {
         ConnectionStep::Completed(result) => result,
         ConnectionStep::Reconfigure(updated) => {
-            endpoint.close(CLOSE_RECONFIGURE, b"client configuration changed");
+            endpoint.close(
+                ApplicationCloseCode::ClientReconfigure.value(),
+                b"client configuration changed",
+            );
             endpoint.wait_idle().await;
             return ConnectionEnd::Reconfigure(updated);
         }
         ConnectionStep::Unconfigured => {
-            endpoint.close(CLOSE_RECONFIGURE, b"client configuration removed");
+            endpoint.close(
+                ApplicationCloseCode::ClientReconfigure.value(),
+                b"client configuration removed",
+            );
             endpoint.wait_idle().await;
             return ConnectionEnd::Unconfigured;
         }
         ConnectionStep::Shutdown => {
-            endpoint.close(CLOSE_SHUTDOWN, b"client shutting down");
+            endpoint.close(
+                ApplicationCloseCode::ClientShutdown.value(),
+                b"client shutting down",
+            );
             endpoint.wait_idle().await;
             return ConnectionEnd::Shutdown;
         }
         ConnectionStep::WatcherClosed => {
-            endpoint.close(CLOSE_SHUTDOWN, b"configuration watcher closed");
+            endpoint.close(
+                ApplicationCloseCode::ClientConnectionError.value(),
+                b"configuration watcher closed",
+            );
             endpoint.wait_idle().await;
             return config_watcher_closed();
         }
@@ -381,12 +393,18 @@ async fn connect_and_run(
             tunnels,
         }) => (send, receive, tunnels),
         Ok(AuthenticationResult::DeviceIdConflict) => {
-            endpoint.close(CLOSE_SHUTDOWN, b"device id conflict");
+            endpoint.close(
+                ApplicationCloseCode::ClientShutdown.value(),
+                b"device id conflict",
+            );
             endpoint.wait_idle().await;
             return ConnectionEnd::DeviceIdConflict;
         }
         Err(error) => {
-            endpoint.close(CLOSE_SHUTDOWN, b"authentication failed");
+            endpoint.close(
+                ApplicationCloseCode::ClientConnectionError.value(),
+                b"authentication failed",
+            );
             return ConnectionEnd::Disconnected(error);
         }
     };
@@ -417,11 +435,25 @@ async fn connect_and_run(
         },
     )
     .await;
-    let close = match &result {
-        ConnectionEnd::Reconfigure(_) | ConnectionEnd::Unconfigured => CLOSE_RECONFIGURE,
-        _ => CLOSE_SHUTDOWN,
+    let (close, reason) = match &result {
+        ConnectionEnd::Reconfigure(_) | ConnectionEnd::Unconfigured => (
+            ApplicationCloseCode::ClientReconfigure,
+            b"client configuration changed".as_slice(),
+        ),
+        ConnectionEnd::Shutdown | ConnectionEnd::AdministratorDisconnected => (
+            ApplicationCloseCode::ClientShutdown,
+            b"client shutting down".as_slice(),
+        ),
+        ConnectionEnd::Disconnected(_) => (
+            ApplicationCloseCode::ClientConnectionError,
+            b"client connection failed".as_slice(),
+        ),
+        ConnectionEnd::DeviceIdConflict => (
+            ApplicationCloseCode::ClientShutdown,
+            b"device id conflict".as_slice(),
+        ),
     };
-    endpoint.close(close, b"client connection ending");
+    endpoint.close(close.value(), reason);
     endpoint.wait_idle().await;
     result
 }
@@ -478,11 +510,13 @@ async fn authenticate(
             services: declarations(&config.services),
         }),
     )
-    .await?;
+    .await
+    .map_err(|error| connection_error_or(connection, error))?;
     let response: ServerHandshake =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut receive))
             .await
-            .map_err(|_| TunnelError::Timeout("等待认证结果"))??;
+            .map_err(|_| TunnelError::Timeout("等待认证结果"))?
+            .map_err(|error| connection_error_or(connection, error))?;
     let ServerHandshake::Authenticate(response) = response else {
         return Err(TunnelError::Protocol(
             "服务端返回了错误的认证响应类型".into(),
@@ -545,7 +579,9 @@ async fn run_connected(
                             tunnels,
                         });
                     }
-                    Err(error) => break ConnectionEnd::Disconnected(error),
+                    Err(error) => {
+                        break ConnectionEnd::Disconnected(connection_error_or(connection, error));
+                    }
                 }
             }
             changed = watcher.changed() => {
@@ -566,7 +602,7 @@ async fn run_connected(
                 )
                 .await
                 {
-                    break ConnectionEnd::Disconnected(error);
+                    break ConnectionEnd::Disconnected(connection_error_or(connection, error));
                 }
                 if services_changed {
                     *services.write().await = service_map(&updated.services);
@@ -753,11 +789,13 @@ async fn bootstrap_at_address(
             proof,
         }),
     )
-    .await?;
+    .await
+    .map_err(|error| connection_error_or(&connection, error))?;
     let response: ServerHandshake =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut receive))
             .await
-            .map_err(|_| TunnelError::Timeout("等待证书引导结果"))??;
+            .map_err(|_| TunnelError::Timeout("等待证书引导结果"))?
+            .map_err(|error| connection_error_or(&connection, error))?;
     let ServerHandshake::Bootstrap(response) = response else {
         return Err(TunnelError::Protocol(
             "服务端返回了错误的证书引导响应类型".into(),
@@ -783,7 +821,10 @@ async fn bootstrap_at_address(
         }
     }
     let downloaded = DownloadedServerCertificate::from_chain(&certificates, configured_address)?;
-    connection.close(CLOSE_CREDENTIAL_CHECK, b"certificate received");
+    connection.close(
+        ApplicationCloseCode::CredentialCheckComplete.value(),
+        b"certificate received",
+    );
     endpoint.wait_idle().await;
     Ok(downloaded)
 }
@@ -884,11 +925,7 @@ fn connection_identity_changed(current: &ClientConfig, updated: &ClientConfig) -
 }
 
 fn is_administrator_disconnect(error: &quinn::ConnectionError) -> bool {
-    matches!(
-        error,
-        quinn::ConnectionError::ApplicationClosed(close)
-            if close.error_code == VarInt::from_u32(ADMINISTRATOR_CLOSE_CODE)
-    )
+    ApplicationCloseCode::AdministratorDisconnect.matches_error(error)
 }
 
 #[cfg(test)]

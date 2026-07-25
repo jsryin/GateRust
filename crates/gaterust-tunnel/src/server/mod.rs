@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use quinn::{Endpoint, VarInt};
+use quinn::{ConnectionError, Endpoint};
 use subtle::ConstantTimeEq as _;
 use tokio::{
     sync::{OwnedSemaphorePermit, RwLock, Semaphore, oneshot},
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Result, TunnelError, bootstrap,
+    close::{ApplicationCloseCode, connection_error_or},
     config::{
         GroupSecret, ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind,
         validate_group_key,
@@ -37,7 +38,6 @@ use crate::{
     watcher::ConfigWatcher,
 };
 
-const CLOSE_SHUTDOWN: VarInt = VarInt::from_u32(2);
 const MAX_PENDING_AUTHENTICATIONS: usize = 32;
 
 /// 运行隧道服务端，并按配置变化增删公网监听。
@@ -114,7 +114,10 @@ pub async fn run_server_with_runtime(
     }
 
     cancellation.cancel();
-    endpoint.close(CLOSE_SHUTDOWN, b"server shutdown");
+    endpoint.close(
+        ApplicationCloseCode::ServerShutdown.value(),
+        b"server shutdown",
+    );
     listeners.shutdown().await;
     await_task(accept_task, "QUIC 接入任务").await;
     endpoint.wait_idle().await;
@@ -176,7 +179,7 @@ async fn accept_connections(
                         match incoming.await {
                             Ok(connection) => {
                                 if let Err(error) = authenticate(connection, id, runtime, groups, certificate, permit).await {
-                                    tracing::warn!(%error, "QUIC 客户端认证或控制通道结束");
+                                    tracing::warn!(%error, "QUIC 客户端认证失败");
                                 }
                             }
                             Err(error) => tracing::debug!(%error, "QUIC 握手失败"),
@@ -215,7 +218,8 @@ async fn authenticate(
     let handshake: ClientHandshake =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut receive))
             .await
-            .map_err(|_| TunnelError::Timeout("读取认证信息"))??;
+            .map_err(|_| TunnelError::Timeout("读取认证信息"))?
+            .map_err(|error| connection_error_or(&connection, error))?;
     let hello = match handshake {
         ClientHandshake::Authenticate(hello) => hello,
         ClientHandshake::Bootstrap(request) => {
@@ -299,40 +303,85 @@ async fn authenticate(
     .await
     {
         runtime.unregister(id).await;
-        return Err(error);
+        return Err(connection_error_or(&connection, error));
     }
     drop(authentication_permit);
 
     let device_id = hello.device_id;
-    tracing::info!(group, %device_id, %remote, "内网客户端已上线");
+    tracing::info!(session_id = id, group, %device_id, %remote, "内网客户端已上线");
     let result = loop {
         tokio::select! {
+            error = connection.closed() => break SessionEnd::Connection(error),
             message = read_frame::<_, ControlMessage>(&mut receive) => {
                 match message {
                     Ok(ControlMessage::UpdateServices(services)) => {
                         if let Err(error) = validate_declarations(&services) {
-                            break Err(error);
+                            break SessionEnd::Control(error);
                         }
                         runtime.update_services(id, services).await;
                         tracing::info!(group, %device_id, "客户端服务声明已更新");
                     }
-                    Err(error) => break Err(error),
+                    Err(error) => break session_end(&connection, error),
                 }
             }
             changed = changes.changed() => {
                 if changed.is_err() {
-                    break Err(TunnelError::Protocol("隧道状态通道已关闭".into()));
+                    break SessionEnd::Control(TunnelError::Protocol("隧道状态通道已关闭".into()));
                 }
                 let snapshot = ServerControlMessage::TunnelSnapshot(runtime.catalog(id).await);
                 if let Err(error) = write_frame(&mut send, &snapshot).await {
-                    break Err(error);
+                    break session_end(&connection, error);
                 }
             }
         }
     };
+    if matches!(result, SessionEnd::Control(_)) {
+        connection.close(
+            ApplicationCloseCode::ServerConnectionError.value(),
+            b"server control channel failed",
+        );
+    }
     runtime.unregister(id).await;
-    tracing::info!(group, %device_id, %remote, "内网客户端已下线");
-    result
+    log_session_end(id, &group, &device_id, remote, &result);
+    Ok(())
+}
+
+enum SessionEnd {
+    Connection(ConnectionError),
+    Control(TunnelError),
+}
+
+fn session_end(connection: &quinn::Connection, fallback: TunnelError) -> SessionEnd {
+    connection
+        .close_reason()
+        .map_or(SessionEnd::Control(fallback), SessionEnd::Connection)
+}
+
+fn log_session_end(
+    session_id: u64,
+    group: &str,
+    device_id: &str,
+    remote: std::net::SocketAddr,
+    end: &SessionEnd,
+) {
+    match end {
+        SessionEnd::Connection(error) if is_expected_client_close(error) => {
+            tracing::info!(session_id, group, device_id, %remote, %error, "内网客户端已下线");
+        }
+        SessionEnd::Connection(error) => {
+            tracing::warn!(session_id, group, device_id, %remote, %error, "内网客户端连接异常结束");
+        }
+        SessionEnd::Control(error) => {
+            tracing::warn!(session_id, group, device_id, %remote, %error, "内网客户端控制通道异常结束");
+        }
+    }
+}
+
+fn is_expected_client_close(error: &ConnectionError) -> bool {
+    matches!(error, ConnectionError::LocallyClosed)
+        || ApplicationCloseCode::ClientReconfigure.matches_error(error)
+        || ApplicationCloseCode::ClientShutdown.matches_error(error)
+        || ApplicationCloseCode::CredentialCheckComplete.matches_error(error)
 }
 
 async fn bootstrap_certificate(
@@ -380,11 +429,16 @@ async fn bootstrap_certificate(
             false,
         ),
     };
-    write_frame(send, &ServerHandshake::Bootstrap(response)).await?;
+    write_frame(send, &ServerHandshake::Bootstrap(response))
+        .await
+        .map_err(|error| connection_error_or(connection, error))?;
     send.finish()
         .map_err(|error| TunnelError::Protocol(format!("结束证书引导响应流失败: {error}")))?;
     let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, send.stopped()).await;
-    connection.close(VarInt::from_u32(4), b"certificate bootstrap complete");
+    connection.close(
+        ApplicationCloseCode::CertificateBootstrapComplete.value(),
+        b"certificate bootstrap complete",
+    );
     if valid {
         Ok(())
     } else {
@@ -406,11 +460,15 @@ async fn reject_authentication(
             tunnels: Vec::new(),
         }),
     )
-    .await?;
+    .await
+    .map_err(|error| connection_error_or(connection, error))?;
     send.finish()
         .map_err(|error| TunnelError::Protocol(format!("结束认证响应流失败: {error}")))?;
     let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, send.stopped()).await;
-    connection.close(VarInt::from_u32(3), b"authentication failed");
+    connection.close(
+        ApplicationCloseCode::AuthenticationFailed.value(),
+        b"authentication failed",
+    );
     Ok(())
 }
 
@@ -614,6 +672,8 @@ async fn await_task(mut task: JoinHandle<()>, name: &str) {
 mod tests {
     use std::num::NonZeroU16;
 
+    use quinn::ApplicationClose;
+
     use super::*;
 
     #[test]
@@ -636,5 +696,28 @@ mod tests {
 
         updated.max_connections += 1;
         assert!(!same_listener(&current, &updated));
+    }
+
+    #[test]
+    fn classifies_only_normal_client_session_closes_as_expected() {
+        for code in [
+            ApplicationCloseCode::ClientReconfigure,
+            ApplicationCloseCode::ClientShutdown,
+            ApplicationCloseCode::CredentialCheckComplete,
+        ] {
+            let error = ConnectionError::ApplicationClosed(ApplicationClose {
+                error_code: code.value(),
+                reason: "normal".into(),
+            });
+            assert!(is_expected_client_close(&error));
+        }
+
+        let client_error = ConnectionError::ApplicationClosed(ApplicationClose {
+            error_code: ApplicationCloseCode::ClientConnectionError.value(),
+            reason: "failed".into(),
+        });
+        assert!(!is_expected_client_close(&client_error));
+        assert!(!is_expected_client_close(&ConnectionError::TimedOut));
+        assert!(is_expected_client_close(&ConnectionError::LocallyClosed));
     }
 }

@@ -5,6 +5,7 @@ use std::path::Path;
 mod bootstrap;
 mod certificate;
 mod client;
+mod close;
 mod config;
 mod error;
 mod identity;

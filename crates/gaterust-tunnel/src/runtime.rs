@@ -5,18 +5,18 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use quinn::{Connection, VarInt};
+use quinn::Connection;
 use serde::Serialize;
 use tokio::sync::{RwLock, watch};
 
 use crate::{
     client::{ClientTunnel, ClientTunnelState},
+    close::ApplicationCloseCode,
     config::{ServerTunnelConfig, TunnelKind},
     protocol::ServiceDeclaration,
 };
 
 const MAX_ONLINE_CLIENTS: usize = 128;
-pub(crate) const ADMINISTRATOR_CLOSE_CODE: u32 = 12;
 
 #[derive(Clone)]
 pub struct TunnelRuntime {
@@ -132,7 +132,7 @@ impl TunnelRuntime {
         };
         self.notify();
         connection.close(
-            VarInt::from_u32(ADMINISTRATOR_CLOSE_CODE),
+            ApplicationCloseCode::AdministratorDisconnect.value(),
             b"disconnected by administrator",
         );
         true
