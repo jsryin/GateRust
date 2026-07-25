@@ -1,4 +1,4 @@
-import { Eye, EyeOff, LoaderCircle, LogIn, X } from 'lucide-react';
+import { ArrowLeft, Eye, EyeOff, LoaderCircle, LogIn, X } from 'lucide-react';
 import { useState } from 'react';
 import type { FormEvent } from 'react';
 
@@ -9,6 +9,7 @@ interface LoginFormProps {
   error: string;
   keyValue: string;
   onAddressChange: (value: string) => void;
+  onBack?: () => void;
   onCancel: () => Promise<void>;
   onKeyChange: (value: string) => void;
   onSubmit: () => Promise<void>;
@@ -20,6 +21,7 @@ export function LoginForm({
   error,
   keyValue,
   onAddressChange,
+  onBack,
   onCancel,
   onKeyChange,
   onSubmit,
@@ -38,6 +40,18 @@ export function LoginForm({
   return (
     <form className="login-form" onSubmit={submit}>
       <header>
+        {onBack && (
+          <button
+            aria-label="返回隧道列表"
+            className="login-back-button"
+            disabled={pending}
+            onClick={onBack}
+            title="返回隧道列表"
+            type="button"
+          >
+            <ArrowLeft size={17} />
+          </button>
+        )}
         <h1>获取连接配置</h1>
       </header>
       <label>

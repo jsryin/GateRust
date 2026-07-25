@@ -1,4 +1,4 @@
-import { CirclePower, LoaderCircle } from 'lucide-react';
+import { LoaderCircle } from 'lucide-react';
 import { useEffect, useRef } from 'react';
 
 type TunnelAction = 'connect' | 'disconnect' | null;
@@ -49,7 +49,7 @@ export function TunnelActions({
           <span>全选</span>
         </label>
         <span className="action-status">
-          {selectedIdleCount ? `已选择 ${selectedIdleCount} 条空闲隧道` : `${connectedCount} 条已连接`}
+          {selectedIdleCount ? `已选 ${selectedIdleCount} 条` : `${connectedCount} 条已连接`}
         </span>
       </div>
       <button
@@ -58,11 +58,7 @@ export function TunnelActions({
         onClick={() => void handleAction()}
         type="button"
       >
-        {action ? (
-          <LoaderCircle className="spin" size={16} />
-        ) : disconnectMode ? (
-          <CirclePower size={16} />
-        ) : null}
+        {action && <LoaderCircle className="spin" size={16} />}
         {disconnectMode ? '断开' : '连接'}
       </button>
     </div>

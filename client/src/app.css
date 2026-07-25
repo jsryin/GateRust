@@ -84,8 +84,36 @@ button:disabled {
 }
 
 .login-form header {
+  position: relative;
+  min-height: 34px;
   margin-bottom: 2px;
+  display: grid;
+  place-items: center;
   text-align: center;
+}
+
+.login-back-button,
+.edit-config-button {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: #68736f;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+}
+
+.login-back-button:not(:disabled):hover,
+.edit-config-button:not(:disabled):hover {
+  color: #1e2925;
+  background: #eef2f0;
+}
+
+.login-back-button {
+  position: absolute;
+  left: 0;
+  width: 34px;
+  height: 34px;
 }
 
 .login-form h1,
@@ -245,14 +273,29 @@ input::placeholder {
   min-width: 0;
 }
 
+.server-address {
+  min-width: 0;
+  margin-top: 2px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
 .view-heading p {
-  margin: 4px 0 0;
+  min-width: 0;
+  margin: 0;
   overflow: hidden;
   color: #7b8681;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.edit-config-button {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
 }
 
 .tunnel-table {

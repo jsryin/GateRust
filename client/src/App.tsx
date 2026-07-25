@@ -1,4 +1,4 @@
-import { CirclePower, LoaderCircle } from 'lucide-react';
+import { LoaderCircle, Pencil } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { LoginForm } from './components/LoginForm';
 import { TunnelActions } from './components/TunnelActions';
@@ -30,11 +30,13 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [editingConfig, setEditingConfig] = useState(false);
   const [action, setAction] = useState<'connect' | 'disconnect' | null>(null);
   const [error, setError] = useState('');
   const connectedIdentity = useRef('');
   const knownTunnels = useRef<Set<string>>(new Set());
   const loginCancellationRequested = useRef(false);
+  const configBeforeEdit = useRef<{ address: string; key: string } | null>(null);
 
   const applyConfig = useCallback((config: ClientConfig) => {
     setAddress(config.server.address);
@@ -139,6 +141,8 @@ export function App() {
     try {
       applyConfig(await desktop.login(address, key));
       await refreshStatus();
+      configBeforeEdit.current = null;
+      setEditingConfig(false);
     } catch (cause) {
       const message = errorMessage(cause, '获取连接配置失败');
       if (!loginCancellationRequested.current || message !== loginCancelledMessage) {
@@ -193,6 +197,7 @@ export function App() {
   }
 
   const connected = status.state === 'connected';
+  const showTunnelView = connected && !editingConfig;
   const tunnelSelection = useMemo(() => {
     const idleNames: string[] = [];
     const selectedIdleNames: string[] = [];
@@ -222,27 +227,47 @@ export function App() {
     });
   }
 
+  function editConfig(): void {
+    configBeforeEdit.current = { address, key };
+    setError('');
+    setEditingConfig(true);
+  }
+
+  function cancelConfigEdit(): void {
+    const previous = configBeforeEdit.current;
+    if (previous) {
+      setAddress(previous.address);
+      setKey(previous.key);
+    }
+    configBeforeEdit.current = null;
+    setError('');
+    setEditingConfig(false);
+  }
+
   return (
     <div className="app-shell">
-      <main className={connected ? 'workspace' : 'workspace login-workspace'}>
+      <main className={showTunnelView ? 'workspace' : 'workspace login-workspace'}>
         {loading ? (
           <div className="center-state"><LoaderCircle className="spin" size={22} /><span>正在启动</span></div>
-        ) : connected ? (
+        ) : showTunnelView ? (
           <section className="tunnel-view">
             <div className="view-heading">
               <div>
                 <h1>隧道</h1>
-                <p>{status.server}</p>
+                <div className="server-address">
+                  <p>{status.server}</p>
+                  <button
+                    aria-label="修改连接配置"
+                    className="edit-config-button"
+                    disabled={action !== null}
+                    onClick={editConfig}
+                    title="修改连接配置"
+                    type="button"
+                  >
+                    <Pencil size={13} />
+                  </button>
+                </div>
               </div>
-              <button
-                className="secondary-button"
-                disabled={!tunnelSelection.connectedCount || action !== null}
-                onClick={() => void disconnect()}
-                type="button"
-              >
-                {action === 'disconnect' ? <LoaderCircle className="spin" size={15} /> : <CirclePower size={15} />}
-                断开
-              </button>
             </div>
 
             {error && <div className="notice error" role="alert">{error}</div>}
@@ -271,6 +296,7 @@ export function App() {
             error={error || (status.state === 'reconnecting' ? status.message ?? '' : '')}
             keyValue={key}
             onAddressChange={setAddress}
+            onBack={editingConfig ? cancelConfigEdit : undefined}
             onCancel={cancelLogin}
             onKeyChange={setKey}
             onSubmit={login}
