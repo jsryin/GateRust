@@ -13,6 +13,7 @@ mod identity;
 mod protocol;
 mod rate_limit;
 mod relay;
+mod resource;
 mod runtime;
 mod server;
 mod tls;
@@ -30,7 +31,9 @@ pub use config::{
     ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind, generate_group_key,
 };
 pub use error::{Result, TunnelError};
-pub use runtime::{RuntimeClient, RuntimeTunnel, TunnelRuntime, TunnelRuntimeSnapshot};
+pub use runtime::{
+    RuntimeClient, RuntimeTunnel, TunnelConfigStatus, TunnelRuntime, TunnelRuntimeSnapshot,
+};
 pub use server::{run_server, run_server_with_runtime, run_server_with_shutdown};
 
 /// 校验服务端配置及其 TLS 证书和私钥。

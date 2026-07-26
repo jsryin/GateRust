@@ -15,6 +15,7 @@ pub(crate) enum ApplicationCloseCode {
     AdministratorDisconnect = 12,
     CredentialCheckComplete = 13,
     ClientConnectionError = 14,
+    CredentialsRevoked = 15,
 }
 
 impl ApplicationCloseCode {
@@ -58,6 +59,7 @@ mod tests {
             ApplicationCloseCode::AdministratorDisconnect,
             ApplicationCloseCode::CredentialCheckComplete,
             ApplicationCloseCode::ClientConnectionError,
+            ApplicationCloseCode::CredentialsRevoked,
         ] {
             let error = ConnectionError::ApplicationClosed(ApplicationClose {
                 error_code: code.value(),

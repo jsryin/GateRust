@@ -1,4 +1,4 @@
-#[cfg(any(feature = "tunnel", feature = "proxy"))]
+#[cfg(feature = "proxy")]
 use std::sync::Mutex;
 use std::{
     fs::{File, OpenOptions},
@@ -12,6 +12,8 @@ use std::{
 
 use rand::RngExt as _;
 use serde::Serialize;
+#[cfg(feature = "tunnel")]
+use tokio::sync::Semaphore;
 use tokio::sync::{RwLock, watch};
 
 use crate::{ControlError, Result};
@@ -57,7 +59,7 @@ struct StoreInner {
     #[cfg(feature = "tunnel")]
     tunnel_path: PathBuf,
     #[cfg(feature = "tunnel")]
-    tunnel_writer: Mutex<()>,
+    tunnel_writer: Semaphore,
     #[cfg(feature = "tunnel")]
     tunnel_runtime: Option<gaterust_tunnel::TunnelRuntime>,
     #[cfg(feature = "proxy")]
@@ -90,7 +92,7 @@ impl ConfigStore {
                 #[cfg(feature = "tunnel")]
                 tunnel_path: absolute_path(&options.tunnel_config)?,
                 #[cfg(feature = "tunnel")]
-                tunnel_writer: Mutex::new(()),
+                tunnel_writer: Semaphore::new(1),
                 #[cfg(feature = "tunnel")]
                 tunnel_runtime: options.tunnel_runtime.clone(),
                 #[cfg(feature = "proxy")]
@@ -376,24 +378,43 @@ impl ConfigStore {
         F: FnOnce(&mut gaterust_tunnel::ServerConfig) -> Result<()> + Send + 'static,
     {
         let inner = Arc::clone(&self.inner);
-        let stored = tokio::task::spawn_blocking(move || {
-            // 串行执行“读取最新文件、合并单项、原子写入”，避免旧页面快照覆盖其它改动。
-            let _guard = inner
-                .tunnel_writer
-                .lock()
-                .map_err(|_| ControlError::WriteRuntimeConfig("隧道配置写入锁已损坏".into()))?;
-            let mut config =
-                load_optional_tunnel(&inner.tunnel_path)?.unwrap_or_else(default_tunnel);
+        let _permit = inner
+            .tunnel_writer
+            .acquire()
+            .await
+            .map_err(|_| ControlError::WriteRuntimeConfig("隧道配置写入通道已关闭".into()))?;
+        let runtime_revision = self
+            .inner
+            .tunnel_runtime
+            .as_ref()
+            .map_or(0, gaterust_tunnel::TunnelRuntime::config_revision);
+        let path = inner.tunnel_path.clone();
+        let (stored, runtime_config) = tokio::task::spawn_blocking(move || {
+            // 串行合并配置，避免旧页面快照覆盖其它改动。
+            let mut config = load_optional_tunnel(&path)?.unwrap_or_else(default_tunnel);
             mutate(&mut config)?;
-            write_validated(
-                &inner.tunnel_path,
-                &config,
-                gaterust_tunnel::ServerConfig::read,
-            )
+            let stored = write_validated(&path, &config, gaterust_tunnel::ServerConfig::read)?;
+            let runtime_config = gaterust_tunnel::ServerConfig::load(&path)
+                .map_err(|error| ControlError::ReadRuntimeConfig(error.to_string()))?;
+            Ok::<_, ControlError>((stored, runtime_config))
         })
         .await
         .map_err(|error| ControlError::WriteRuntimeConfig(error.to_string()))??;
         self.update_tunnel(Some(stored.clone())).await;
+        if let Some(runtime) = &self.inner.tunnel_runtime {
+            let status = runtime
+                .wait_for_config(
+                    &runtime_config,
+                    runtime_revision,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .map_err(|error| ControlError::TunnelRuntimeApply(error.to_string()))?
+                .ok_or_else(|| ControlError::TunnelRuntimeApply("等待运行时确认超时".into()))?;
+            if let Some(error) = status.last_apply_error {
+                return Err(ControlError::TunnelRuntimeApply(error));
+            }
+        }
         Ok(stored)
     }
 

@@ -23,7 +23,7 @@ kind = "udp"
 bind = "0.0.0.0:27015"
 local_port = 27015
 limit_bps = 20971520
-max_udp_sessions = 512
+max_udp_sessions = 128
 udp_idle_seconds = 60
 
 [[tunnels]]

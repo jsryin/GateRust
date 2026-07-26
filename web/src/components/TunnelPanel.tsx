@@ -50,6 +50,9 @@ type Editor = 'quic' | 'group' | 'tunnel' | null;
 
 const minGroupKeyLength = 32;
 const maxGroupKeyLength = 124;
+const maxDataStreams = 512;
+const maxUdpSessions = 128;
+const maxUdpIdleSeconds = 3600;
 const kindLabel: Record<TunnelKind, string> = { tcp: 'TCP', udp: 'UDP', socks5: 'SOCKS5' };
 
 function defaultTunnel(): TunnelConfig {
@@ -61,7 +64,7 @@ function defaultTunnel(): TunnelConfig {
     local_port: 8080,
     limit_bps: null,
     max_connections: 128,
-    max_udp_sessions: 512,
+    max_udp_sessions: 128,
     udp_idle_seconds: 60
   };
 }
@@ -93,7 +96,11 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const [runtime, setRuntime] = useState<TunnelRuntimeState>({ clients: [], tunnels: [] });
+  const [runtime, setRuntime] = useState<TunnelRuntimeState>({
+    clients: [],
+    tunnels: [],
+    config_status: { revision: 0, restart_required: false, last_apply_error: null }
+  });
 
   useEffect(() => {
     setDraft(structuredClone(config ?? defaultConfig()));
@@ -235,6 +242,27 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
       return;
     }
     if (next.kind === 'socks5') next.local_port = null;
+    if (next.limit_bps !== null && (!Number.isSafeInteger(next.limit_bps) || next.limit_bps < 1)) {
+      setError('限速必须为有效的正整数');
+      return;
+    }
+    if (next.kind === 'udp') {
+      if (!Number.isInteger(next.max_udp_sessions) || next.max_udp_sessions < 1 || next.max_udp_sessions > maxUdpSessions) {
+        setError(`最大 UDP 会话必须为 1 到 ${maxUdpSessions} 的整数`);
+        return;
+      }
+      if (!Number.isInteger(next.udp_idle_seconds) || next.udp_idle_seconds < 1 || next.udp_idle_seconds > maxUdpIdleSeconds) {
+        setError(`UDP 空闲秒数必须为 1 到 ${maxUdpIdleSeconds} 的整数`);
+        return;
+      }
+    } else if (!Number.isInteger(next.max_connections) || next.max_connections < 1 || next.max_connections > maxDataStreams) {
+      setError(`最大并发连接必须为 1 到 ${maxDataStreams} 的整数`);
+      return;
+    }
+    if (next.kind === 'socks5' && !isLoopbackBind(next.bind)) {
+      setError('未配置认证的 SOCKS5 只能监听 127.0.0.0/8 或 ::1');
+      return;
+    }
 
     await persistMutation(
       () => originalName ? updateTunnel(token, originalName, next) : createTunnel(token, next),
@@ -281,6 +309,12 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
       <PageIntro description="管理 QUIC 入口、访问分组、隧道和在线客户端" title="隧道配置" />
       {message && <Notice tone="success">{message}</Notice>}
       {error && !editor && <Notice tone="error">{error}</Notice>}
+      {runtime.config_status.last_apply_error && (
+        <Notice tone="error">最近一次运行时应用失败：{runtime.config_status.last_apply_error}</Notice>
+      )}
+      {runtime.config_status.restart_required && (
+        <Notice tone="warning">QUIC 监听或 TLS 文件已变更，重启服务后生效</Notice>
+      )}
 
       <Panel>
         <PanelHeader
@@ -544,15 +578,15 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
                     {tunnel.kind === 'udp' ? (
                       <>
                         <Field label="最大 UDP 会话">
-                          <Input min="1" onChange={(event) => setTunnel((current) => ({ ...current, max_udp_sessions: Number(event.target.value) }))} type="number" value={tunnel.max_udp_sessions} />
+                          <Input max={maxUdpSessions} min="1" onChange={(event) => setTunnel((current) => ({ ...current, max_udp_sessions: Number(event.target.value) }))} type="number" value={tunnel.max_udp_sessions} />
                         </Field>
                         <Field label="UDP 空闲秒数">
-                          <Input min="1" onChange={(event) => setTunnel((current) => ({ ...current, udp_idle_seconds: Number(event.target.value) }))} type="number" value={tunnel.udp_idle_seconds} />
+                          <Input max={maxUdpIdleSeconds} min="1" onChange={(event) => setTunnel((current) => ({ ...current, udp_idle_seconds: Number(event.target.value) }))} type="number" value={tunnel.udp_idle_seconds} />
                         </Field>
                       </>
                     ) : (
                       <Field label="最大并发连接">
-                        <Input min="1" onChange={(event) => setTunnel((current) => ({ ...current, max_connections: Number(event.target.value) }))} type="number" value={tunnel.max_connections} />
+                        <Input max={maxDataStreams} min="1" onChange={(event) => setTunnel((current) => ({ ...current, max_connections: Number(event.target.value) }))} type="number" value={tunnel.max_connections} />
                       </Field>
                     )}
                   </>
@@ -574,4 +608,8 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
       </Dialog>
     </div>
   );
+}
+
+function isLoopbackBind(bind: string): boolean {
+  return /^127(?:\.\d{1,3}){3}:\d+$/.test(bind.trim()) || /^\[::1\]:\d+$/.test(bind.trim());
 }

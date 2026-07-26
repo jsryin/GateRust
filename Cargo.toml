@@ -17,6 +17,7 @@ license = "MIT"
 repository = "https://github.com/jsryin/GateRust"
 
 [workspace.dependencies]
+atomic-write-file = "0.3.0"
 argon2 = "0.5.3"
 axum = "0.8.9"
 base64 = "0.22.1"

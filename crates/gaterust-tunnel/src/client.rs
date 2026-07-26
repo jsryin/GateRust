@@ -18,11 +18,14 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroize as _;
 
 use crate::{
     Result, TunnelError, bootstrap,
     certificate::DownloadedServerCertificate,
-    client_control::{ClientCommand, ClientCommandReceiver, CommandResponse},
+    client_control::{
+        ClientCommand, ClientCommandReceiver, CommandResponse, SERVICE_UPDATE_TIMEOUT,
+    },
     close::{ApplicationCloseCode, connection_error_or},
     config::{
         ClientConfig, ClientServerConfig, ClientServiceConfig, TunnelKind, validate_group_key,
@@ -557,17 +560,17 @@ async fn authenticate(
     let (mut send, mut receive) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| TunnelError::Timeout("打开认证流"))??;
-    write_frame(
-        &mut send,
-        &ClientHandshake::Authenticate(ClientHello {
-            version: PROTOCOL_VERSION,
-            device_id: device_id.into(),
-            key: config.key.as_bytes().to_vec(),
-            services: declarations(&config.services),
-        }),
-    )
-    .await
-    .map_err(|error| connection_error_or(connection, error))?;
+    let mut handshake = ClientHandshake::Authenticate(ClientHello {
+        version: PROTOCOL_VERSION,
+        device_id: device_id.into(),
+        key: config.key.as_bytes().to_vec(),
+        services: declarations(&config.services),
+    });
+    let write_result = write_frame(&mut send, &handshake).await;
+    if let ClientHandshake::Authenticate(hello) = &mut handshake {
+        hello.key.zeroize();
+    }
+    write_result.map_err(|error| connection_error_or(connection, error))?;
     let response: ServerHandshake =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut receive))
             .await
@@ -607,6 +610,7 @@ struct PendingServiceUpdate {
     request_id: u64,
     updated: ClientConfig,
     response: Option<CommandResponse>,
+    deadline: tokio::time::Instant,
 }
 
 async fn run_connected(
@@ -630,8 +634,17 @@ async fn run_connected(
     let mut pending_update: Option<PendingServiceUpdate> = None;
     let mut next_request_id = 1_u64;
     let end = loop {
+        let update_deadline = pending_update.as_ref().map(|update| update.deadline);
         tokio::select! {
             () = shutdown.cancelled() => break ConnectionEnd::Shutdown,
+            () = wait_for_deadline(update_deadline), if update_deadline.is_some() => {
+                if let Some(pending) = pending_update.take()
+                    && let Some(response) = pending.response
+                {
+                    let _ = response.send(Err("等待服务端确认服务配置超时".into()));
+                }
+                break ConnectionEnd::Disconnected(TunnelError::Timeout("等待服务端确认服务配置"));
+            }
             error = connection.closed() => {
                 if is_administrator_disconnect(&error) {
                     break ConnectionEnd::AdministratorDisconnected;
@@ -687,14 +700,18 @@ async fn run_connected(
                     continue;
                 }
                 let request_id = take_request_id(&mut next_request_id);
+                let update = PendingServiceUpdate {
+                    request_id,
+                    updated,
+                    response: None,
+                    deadline: tokio::time::Instant::now() + SERVICE_UPDATE_TIMEOUT,
+                };
                 match begin_service_update(
                     connection,
                     control_send,
                     &services,
                     config,
-                    updated,
-                    request_id,
-                    None,
+                    update,
                 ).await {
                     Ok(pending) => pending_update = Some(pending),
                     Err(error) => break ConnectionEnd::Disconnected(error),
@@ -711,14 +728,18 @@ async fn run_connected(
                 let mut updated = config.clone();
                 updated.services = command.services;
                 let request_id = take_request_id(&mut next_request_id);
+                let update = PendingServiceUpdate {
+                    request_id,
+                    updated,
+                    response: Some(command.response),
+                    deadline: command.deadline,
+                };
                 match begin_service_update(
                     connection,
                     control_send,
                     &services,
                     config,
-                    updated,
-                    request_id,
-                    Some(command.response),
+                    update,
                 ).await {
                     Ok(pending) => pending_update = Some(pending),
                     Err(error) => break ConnectionEnd::Disconnected(error),
@@ -755,33 +776,34 @@ async fn receive_client_command(
     }
 }
 
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn begin_service_update(
     connection: &Connection,
     control_send: &mut quinn::SendStream,
     services: &RwLock<HashMap<String, ClientServiceConfig>>,
     current: &ClientConfig,
-    updated: ClientConfig,
-    request_id: u64,
-    response: Option<CommandResponse>,
+    update: PendingServiceUpdate,
 ) -> Result<PendingServiceUpdate> {
-    *services.write().await = service_map(&updated.services);
+    *services.write().await = service_map(&update.updated.services);
     let message = ControlMessage::UpdateServices {
-        request_id,
-        services: declarations(&updated.services),
+        request_id: update.request_id,
+        services: declarations(&update.updated.services),
     };
     if let Err(error) = write_frame(control_send, &message).await {
         *services.write().await = service_map(&current.services);
         let error = connection_error_or(connection, error);
-        if let Some(response) = response {
+        if let Some(response) = update.response {
             let _ = response.send(Err(error.to_string()));
         }
         return Err(error);
     }
-    Ok(PendingServiceUpdate {
-        request_id,
-        updated,
-        response,
-    })
+    Ok(update)
 }
 
 fn take_request_id(next: &mut u64) -> u64 {

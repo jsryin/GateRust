@@ -16,7 +16,7 @@ use crate::{
     runtime::TunnelRuntime,
 };
 
-use super::socks5;
+use super::{ListenerResources, socks5};
 
 pub(super) async fn bind(config: &ServerTunnelConfig) -> Result<(TcpListener, Arc<Semaphore>)> {
     let listener = TcpListener::bind(config.bind).await?;
@@ -28,10 +28,11 @@ pub(super) async fn run(
     permits: Arc<Semaphore>,
     config: ServerTunnelConfig,
     runtime: TunnelRuntime,
+    resources: ListenerResources,
     cancellation: CancellationToken,
     stopped: oneshot::Sender<()>,
 ) {
-    let limiter = RateLimiter::new(config.limit_bps);
+    let ListenerResources { budget, limiter } = resources;
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -42,11 +43,15 @@ pub(super) async fn run(
                         tracing::warn!(tunnel = %config.name, %peer, "隧道并发数已满，拒绝连接");
                         continue;
                     };
+                    let Some(global_permit) = budget.try_data_stream() else {
+                        tracing::warn!(tunnel = %config.name, %peer, "服务端数据流总数已满，拒绝连接");
+                        continue;
+                    };
                     let config = config.clone();
                     let runtime = runtime.clone();
                     let limiter = limiter.clone();
                     connections.spawn(async move {
-                        let _permit = permit;
+                        let _permits = (permit, global_permit);
                         if let Err(error) = handle(stream, &config, &runtime, &limiter).await {
                             tracing::debug!(tunnel = %config.name, %peer, %error, "流式隧道连接结束");
                         }

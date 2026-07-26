@@ -4,14 +4,17 @@ mod udp;
 
 use std::{
     collections::HashMap,
+    net::IpAddr,
+    num::NonZeroU64,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 
+use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use quinn::{ConnectionError, Endpoint};
 use subtle::ConstantTimeEq as _;
 use tokio::{
@@ -19,6 +22,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroize as _;
 
 use crate::{
     Result, TunnelError, bootstrap,
@@ -33,12 +37,16 @@ use crate::{
         ClientHandshake, ControlMessage, HANDSHAKE_TIMEOUT, PROTOCOL_VERSION, ServerControlMessage,
         ServerHandshake, ServerHello, read_frame, validate_declarations, write_frame,
     },
-    runtime::{RegisterError, TunnelRuntime},
+    rate_limit::RateLimiter,
+    resource::ResourceBudget,
+    runtime::{RegisterError, TunnelRuntime, credential_digest},
     tls,
     watcher::ConfigWatcher,
 };
 
 const MAX_PENDING_AUTHENTICATIONS: usize = 32;
+const MAX_PENDING_AUTHENTICATIONS_PER_IP: usize = 4;
+const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 运行隧道服务端，并按配置变化增删公网监听。
 ///
@@ -88,12 +96,15 @@ pub async fn run_server_with_runtime(
     let (endpoint, certificate) = tls::server_endpoint(&initial.quic)?;
     let certificate = Arc::new(certificate);
     let local_address = endpoint.local_addr()?;
-    let groups = Arc::new(RwLock::new(initial.credentials()));
+    let credentials = initial.credentials();
+    runtime.apply_credentials(&credentials).await;
+    let groups = Arc::new(RwLock::new(credentials));
     let mut listeners = ListenerManager::new(runtime.clone());
     listeners.apply(&initial.tunnels).await?;
+    runtime.report_config_applied(&initial, false)?;
     let accept_task = tokio::spawn(accept_connections(
         endpoint.clone(),
-        runtime,
+        runtime.clone(),
         Arc::clone(&groups),
         certificate,
         cancellation.child_token(),
@@ -108,7 +119,13 @@ pub async fn run_server_with_runtime(
                 if !changed {
                     break;
                 }
-                reload_server(&config_path, &immutable, &groups, &mut listeners).await;
+                reload_server(
+                    &config_path,
+                    &immutable,
+                    &runtime,
+                    &groups,
+                    &mut listeners,
+                ).await;
             }
         }
     }
@@ -128,6 +145,7 @@ pub async fn run_server_with_runtime(
 async fn reload_server(
     path: &Path,
     immutable: &ServerQuicConfig,
+    runtime: &TunnelRuntime,
     groups: &RwLock<Vec<(String, GroupSecret)>>,
     listeners: &mut ListenerManager,
 ) {
@@ -135,20 +153,31 @@ async fn reload_server(
         Ok(config) => config,
         Err(error) => {
             tracing::error!(%error, "新服务端配置无效，继续使用当前配置");
+            runtime.report_config_load_error(error.to_string());
             return;
         }
     };
-    if &config.quic != immutable {
-        tracing::error!("quic.bind、证书或私钥不支持热更新，本次配置未应用");
-        return;
-    }
+    let restart_required = &config.quic != immutable;
     let credentials = config.credentials();
     if let Err(error) = listeners.apply(&config.tunnels).await {
         tracing::error!(%error, "应用隧道监听配置失败");
+        if let Err(status_error) =
+            runtime.report_config_failed(&config, restart_required, error.to_string())
+        {
+            tracing::error!(%status_error, "记录隧道配置应用失败状态失败");
+        }
         return;
     }
+    runtime.apply_credentials(&credentials).await;
     *groups.write().await = credentials;
-    tracing::info!(tunnels = config.tunnels.len(), "服务端配置已热更新");
+    if let Err(error) = runtime.report_config_applied(&config, restart_required) {
+        tracing::error!(%error, "记录隧道配置应用状态失败");
+    }
+    if restart_required {
+        tracing::warn!("QUIC 监听或 TLS 文件变更需要重启；分组和隧道配置已热更新");
+    } else {
+        tracing::info!(tunnels = config.tunnels.len(), "服务端配置已热更新");
+    }
 }
 
 async fn accept_connections(
@@ -160,12 +189,24 @@ async fn accept_connections(
 ) {
     let ids = Arc::new(AtomicU64::new(1));
     let authentication_permits = Arc::new(Semaphore::new(MAX_PENDING_AUTHENTICATIONS));
+    let peer_admission = Arc::new(PeerAdmission::default());
     let mut tasks = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
             incoming = endpoint.accept() => match incoming {
                 Some(incoming) => {
+                    let remote = incoming.remote_address();
+                    if !incoming.remote_address_validated() {
+                        if let Err(error) = incoming.retry() {
+                            tracing::debug!(%remote, %error, "发送 QUIC Retry 失败");
+                        }
+                        continue;
+                    }
+                    let Some(peer_permit) = PeerAdmission::try_acquire(&peer_admission, remote.ip()) else {
+                        tracing::debug!(%remote, "同一来源的待认证客户端数量已达上限");
+                        continue;
+                    };
                     let Ok(permit) = Arc::clone(&authentication_permits).try_acquire_owned() else {
                         drop(incoming);
                         tracing::debug!("待认证客户端数量已达上限，拒绝新连接");
@@ -176,13 +217,22 @@ async fn accept_connections(
                     let certificate = Arc::clone(&certificate);
                     let id = ids.fetch_add(1, Ordering::Relaxed);
                     tasks.spawn(async move {
-                        match incoming.await {
+                        let admission = AuthenticationAdmission {
+                            _global: permit,
+                            _peer: peer_permit,
+                        };
+                        match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
+                            Err(_) => tracing::debug!(%remote, "QUIC 握手超时"),
                             Ok(connection) => {
-                                if let Err(error) = authenticate(connection, id, runtime, groups, certificate, permit).await {
-                                    tracing::warn!(%error, "QUIC 客户端认证失败");
+                                match connection {
+                                    Ok(connection) => {
+                                        if let Err(error) = authenticate(connection, id, runtime, groups, certificate, admission).await {
+                                            tracing::warn!(%error, "QUIC 客户端认证失败");
+                                        }
+                                    }
+                                    Err(error) => tracing::debug!(%error, "QUIC 握手失败"),
                                 }
                             }
-                            Err(error) => tracing::debug!(%error, "QUIC 握手失败"),
                         }
                     });
                 }
@@ -208,7 +258,7 @@ async fn authenticate(
     runtime: TunnelRuntime,
     groups: Arc<RwLock<Vec<(String, GroupSecret)>>>,
     certificate: Arc<rustls::pki_types::CertificateDer<'static>>,
-    authentication_permit: OwnedSemaphorePermit,
+    authentication_admission: AuthenticationAdmission,
 ) -> Result<()> {
     let mut changes = runtime.subscribe();
     let remote = connection.remote_address();
@@ -220,7 +270,7 @@ async fn authenticate(
             .await
             .map_err(|_| TunnelError::Timeout("读取认证信息"))?
             .map_err(|error| connection_error_or(&connection, error))?;
-    let hello = match handshake {
+    let mut hello = match handshake {
         ClientHandshake::Authenticate(hello) => hello,
         ClientHandshake::Bootstrap(request) => {
             return bootstrap_certificate(
@@ -229,7 +279,7 @@ async fn authenticate(
                 request,
                 &groups,
                 certificate.as_ref(),
-                authentication_permit,
+                authentication_admission,
             )
             .await;
         }
@@ -240,15 +290,17 @@ async fn authenticate(
         && valid_key
         && validate_device_id(&hello.device_id).is_ok()
         && validate_declarations(&hello.services).is_ok();
-    let group = if valid_hello {
+    let authenticated_group = if valid_hello {
         let groups = groups.read().await;
         groups.iter().find_map(|(name, secret)| {
-            bool::from(secret.as_bytes().ct_eq(hello.key.as_slice())).then(|| name.clone())
+            bool::from(secret.as_bytes().ct_eq(hello.key.as_slice()))
+                .then(|| (name.clone(), credential_digest(secret.as_bytes())))
         })
     } else {
         None
     };
-    let Some(group) = group else {
+    hello.key.zeroize();
+    let Some((group, authenticated_credential)) = authenticated_group else {
         reject_authentication(
             &connection,
             &mut send,
@@ -264,6 +316,7 @@ async fn authenticate(
             id,
             hello.device_id.clone(),
             group.clone(),
+            authenticated_credential,
             connection.clone(),
             hello.services,
         )
@@ -290,6 +343,16 @@ async fn authenticate(
             .await?;
             return Ok(());
         }
+        Err(RegisterError::CredentialsChanged) => {
+            reject_authentication(
+                &connection,
+                &mut send,
+                AuthenticationStatus::Rejected,
+                "认证凭据已变更，请重试",
+            )
+            .await?;
+            return Ok(());
+        }
     }
     // 先确认已观察到注册变更，再生成快照；后续变更不会在握手窗口内丢失。
     changes.borrow_and_update();
@@ -311,7 +374,7 @@ async fn authenticate(
         runtime.unregister(id).await;
         return Err(connection_error_or(&connection, error));
     }
-    drop(authentication_permit);
+    drop(authentication_admission);
 
     let device_id = hello.device_id;
     tracing::info!(
@@ -442,7 +505,7 @@ async fn bootstrap_certificate(
     request: CertificateBootstrapRequest,
     groups: &RwLock<Vec<(String, GroupSecret)>>,
     certificate: &rustls::pki_types::CertificateDer<'_>,
-    _authentication_permit: OwnedSemaphorePermit,
+    _authentication_admission: AuthenticationAdmission,
 ) -> Result<()> {
     let accepted = if request.version == PROTOCOL_VERSION {
         let groups = groups.read().await;
@@ -533,6 +596,8 @@ struct ListenerHandle {
 
 struct ListenerManager {
     runtime: TunnelRuntime,
+    budget: ResourceBudget,
+    limiters: HashMap<String, LimiterEntry>,
     active: HashMap<String, ListenerHandle>,
     retired: Vec<JoinHandle<()>>,
 }
@@ -541,6 +606,8 @@ impl ListenerManager {
     fn new(runtime: TunnelRuntime) -> Self {
         Self {
             runtime,
+            budget: ResourceBudget::new(),
+            limiters: HashMap::new(),
             active: HashMap::new(),
             retired: Vec::new(),
         }
@@ -553,7 +620,9 @@ impl ListenerManager {
             .values()
             .map(|handle| handle.config.clone())
             .collect();
+        let previous_limiters = self.limiters.clone();
         if let Err(error) = self.apply_once(configs).await {
+            self.limiters = previous_limiters;
             if let Err(rollback_error) = self.apply_once(&previous).await {
                 return Err(TunnelError::InvalidConfig(format!(
                     "应用监听配置失败: {error}; 回滚也失败: {rollback_error}"
@@ -585,7 +654,27 @@ impl ListenerManager {
         }
         for config in configs {
             if !self.active.contains_key(&config.name) {
-                let handle = start_listener(config.clone(), self.runtime.clone()).await?;
+                let limiter = match self.limiters.get(&config.name) {
+                    Some(entry) if entry.limit == config.limit_bps => entry.limiter.clone(),
+                    _ => {
+                        let limiter = RateLimiter::new(config.limit_bps);
+                        self.limiters.insert(
+                            config.name.clone(),
+                            LimiterEntry {
+                                limit: config.limit_bps,
+                                limiter: limiter.clone(),
+                            },
+                        );
+                        limiter
+                    }
+                };
+                let handle = start_listener(
+                    config.clone(),
+                    self.runtime.clone(),
+                    self.budget.clone(),
+                    limiter,
+                )
+                .await?;
                 tracing::info!(tunnel = %config.name, kind = ?config.kind, address = %config.bind, "公网监听已启动");
                 self.active.insert(config.name.clone(), handle);
             }
@@ -595,6 +684,7 @@ impl ListenerManager {
                 handle.config.clone_from(config);
             }
         }
+        self.limiters.retain(|name, _| desired.contains_key(name));
         Ok(())
     }
 
@@ -629,14 +719,25 @@ impl ListenerManager {
         for name in names {
             self.stop(&name).await;
         }
-        let tasks = std::mem::take(&mut self.retired);
-        for mut task in tasks {
-            if tokio::time::timeout(Duration::from_secs(10), &mut task)
-                .await
-                .is_err()
-            {
+        let mut tasks = std::mem::take(&mut self.retired)
+            .into_iter()
+            .collect::<FuturesUnordered<_>>();
+        let graceful = async {
+            while let Some(result) = tasks.next().await {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "已停止的监听任务异常结束");
+                }
+            }
+        };
+        if tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, graceful)
+            .await
+            .is_err()
+        {
+            tracing::warn!("等待监听连接退出超时，正在终止剩余任务");
+            for task in &tasks {
                 task.abort();
             }
+            while tasks.next().await.is_some() {}
         }
     }
 }
@@ -661,6 +762,7 @@ impl Drop for ListenerManager {
     fn drop(&mut self) {
         for handle in self.active.values() {
             handle.cancellation.cancel();
+            handle.task.abort();
         }
         for task in &self.retired {
             task.abort();
@@ -671,9 +773,12 @@ impl Drop for ListenerManager {
 async fn start_listener(
     config: ServerTunnelConfig,
     runtime: TunnelRuntime,
+    budget: ResourceBudget,
+    limiter: RateLimiter,
 ) -> Result<ListenerHandle> {
     let cancellation = CancellationToken::new();
     let (stopped_sender, stopped) = oneshot::channel();
+    let resources = ListenerResources { budget, limiter };
     let task = match config.kind {
         TunnelKind::Tcp | TunnelKind::Socks5 => {
             let (listener, permits) = stream::bind(&config).await?;
@@ -684,6 +789,7 @@ async fn start_listener(
                 permits,
                 task_config,
                 runtime,
+                resources,
                 child,
                 stopped_sender,
             ))
@@ -696,6 +802,7 @@ async fn start_listener(
                 socket,
                 task_config,
                 runtime,
+                resources,
                 child,
                 stopped_sender,
             ))
@@ -709,8 +816,68 @@ async fn start_listener(
     })
 }
 
+#[derive(Clone)]
+struct LimiterEntry {
+    limit: Option<NonZeroU64>,
+    limiter: RateLimiter,
+}
+
+struct ListenerResources {
+    budget: ResourceBudget,
+    limiter: RateLimiter,
+}
+
+struct AuthenticationAdmission {
+    _global: OwnedSemaphorePermit,
+    _peer: PeerAdmissionPermit,
+}
+
+#[derive(Default)]
+struct PeerAdmission {
+    active: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl PeerAdmission {
+    fn try_acquire(admission: &Arc<Self>, address: IpAddr) -> Option<PeerAdmissionPermit> {
+        let mut active = admission
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = active.entry(address).or_default();
+        if *count >= MAX_PENDING_AUTHENTICATIONS_PER_IP {
+            return None;
+        }
+        *count += 1;
+        Some(PeerAdmissionPermit {
+            admission: Arc::clone(admission),
+            address,
+        })
+    }
+}
+
+struct PeerAdmissionPermit {
+    admission: Arc<PeerAdmission>,
+    address: IpAddr,
+}
+
+impl Drop for PeerAdmissionPermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .admission
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = active.get_mut(&self.address) {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.address);
+            }
+        }
+    }
+}
+
 async fn await_task(mut task: JoinHandle<()>, name: &str) {
-    match tokio::time::timeout(Duration::from_secs(10), &mut task).await {
+    match tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut task).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::warn!(%error, task = name, "后台任务异常结束"),
         Err(_) => {

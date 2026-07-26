@@ -7,7 +7,11 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
 };
 
-use crate::{Result, TunnelError, certificate::validate_server_leaf, config::ServerQuicConfig};
+use crate::{
+    Result, TunnelError,
+    certificate::validate_server_leaf,
+    config::{MAX_DATA_STREAMS, ServerQuicConfig},
+};
 
 pub(crate) fn server_endpoint(
     config: &ServerQuicConfig,
@@ -33,7 +37,7 @@ fn build_server_config(
     let private_key = read_private_key(&config.private_key)?;
     let mut server = ServerConfig::with_single_cert(certificates, private_key)
         .map_err(|error| TunnelError::Tls(error.to_string()))?;
-    server.transport_config(transport_config());
+    server.transport_config(server_transport_config());
     Ok((server, certificate))
 }
 
@@ -66,7 +70,7 @@ fn quinn_client_config(tls: rustls::ClientConfig) -> Result<ClientConfig> {
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|error| TunnelError::Tls(error.to_string()))?;
     let mut client = ClientConfig::new(Arc::new(crypto));
-    client.transport_config(transport_config());
+    client.transport_config(client_transport_config());
     Ok(client)
 }
 
@@ -138,11 +142,25 @@ impl ServerCertVerifier for BootstrapCertificateVerifier {
     }
 }
 
-fn transport_config() -> Arc<TransportConfig> {
+fn base_transport_config() -> TransportConfig {
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(15)));
     transport.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
-    transport.max_concurrent_bidi_streams(VarInt::from_u32(4_096));
+    transport.max_concurrent_uni_streams(VarInt::from_u32(0));
+    transport
+}
+
+fn server_transport_config() -> Arc<TransportConfig> {
+    let mut transport = base_transport_config();
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(1));
+    Arc::new(transport)
+}
+
+fn client_transport_config() -> Arc<TransportConfig> {
+    let mut transport = base_transport_config();
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(
+        u32::try_from(MAX_DATA_STREAMS).unwrap_or(u32::MAX),
+    ));
     Arc::new(transport)
 }
 

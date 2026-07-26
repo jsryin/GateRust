@@ -2,7 +2,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, mpsc, oneshot},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
@@ -15,10 +15,13 @@ use crate::{
         write_datagram, write_frame,
     },
     rate_limit::RateLimiter,
+    resource::ResourceBudget,
     runtime::TunnelRuntime,
 };
 
-const SESSION_QUEUE: usize = 64;
+use super::ListenerResources;
+
+const SESSION_QUEUE: usize = 8;
 
 pub(super) async fn bind(config: &ServerTunnelConfig) -> Result<UdpSocket> {
     Ok(UdpSocket::bind(config.bind).await?)
@@ -28,13 +31,13 @@ pub(super) async fn run(
     socket: UdpSocket,
     config: ServerTunnelConfig,
     runtime: TunnelRuntime,
+    resources: ListenerResources,
     cancellation: CancellationToken,
     stopped: oneshot::Sender<()>,
 ) {
+    let ListenerResources { budget, limiter } = resources;
     let socket = Arc::new(socket);
-    let limiter = RateLimiter::new(config.limit_bps);
-    let (cleanup_sender, mut cleanup_receiver) = mpsc::channel(config.max_udp_sessions);
-    let mut sessions = HashMap::<SocketAddr, mpsc::Sender<Vec<u8>>>::new();
+    let mut sessions = HashMap::<SocketAddr, mpsc::Sender<QueuedDatagram>>::new();
     let mut tasks = JoinSet::new();
     let mut buffer = vec![0; MAX_DATAGRAM];
 
@@ -44,17 +47,35 @@ pub(super) async fn run(
             received = socket.recv_from(&mut buffer) => match received {
                 Ok((length, peer)) => {
                     if let Some(sender) = sessions.get(&peer) {
-                        if sender.try_send(buffer[..length].to_vec()).is_err() {
+                        let Ok(slot) = sender.try_reserve() else {
                             tracing::debug!(tunnel = %config.name, %peer, "UDP 会话队列已满，丢弃数据报");
-                        }
+                            continue;
+                        };
+                        let Some(packet) = queued_datagram(&budget, &buffer[..length]) else {
+                            tracing::debug!(tunnel = %config.name, %peer, "UDP 全局排队字节已满，丢弃数据报");
+                            continue;
+                        };
+                        slot.send(packet);
                         continue;
                     }
                     if sessions.len() >= config.max_udp_sessions {
                         tracing::warn!(tunnel = %config.name, %peer, "UDP 会话数已满，丢弃数据报");
                         continue;
                     }
+                    let Some(stream_permit) = budget.try_data_stream() else {
+                        tracing::warn!(tunnel = %config.name, %peer, "服务端数据流总数已满，丢弃数据报");
+                        continue;
+                    };
+                    let Some(session_permit) = budget.try_udp_session() else {
+                        tracing::warn!(tunnel = %config.name, %peer, "服务端 UDP 会话总数已满，丢弃数据报");
+                        continue;
+                    };
+                    let Some(packet) = queued_datagram(&budget, &buffer[..length]) else {
+                        tracing::debug!(tunnel = %config.name, %peer, "UDP 全局排队字节已满，丢弃数据报");
+                        continue;
+                    };
                     let (sender, receiver) = mpsc::channel(SESSION_QUEUE);
-                    if sender.try_send(buffer[..length].to_vec()).is_err() {
+                    if sender.try_send(packet).is_err() {
                         continue;
                     }
                     sessions.insert(peer, sender);
@@ -62,16 +83,11 @@ pub(super) async fn run(
                         socket: Arc::clone(&socket),
                         runtime: runtime.clone(),
                         limiter: limiter.clone(),
-                        cleanup: cleanup_sender.clone(),
                         config: config.clone(),
                     };
                     tasks.spawn(async move {
-                        if let Err(error) = run_session(peer, receiver, &context).await {
-                            tracing::debug!(tunnel = %context.config.name, %peer, %error, "UDP 会话结束");
-                        }
-                        if context.cleanup.send(peer).await.is_err() {
-                            tracing::debug!(tunnel = %context.config.name, %peer, "UDP 监听已停止");
-                        }
+                        let _permits = (stream_permit, session_permit);
+                        (peer, run_session(peer, receiver, &context).await)
                     });
                 }
                 Err(error) => {
@@ -79,25 +95,31 @@ pub(super) async fn run(
                     break;
                 }
             },
-            Some(peer) = cleanup_receiver.recv() => {
-                sessions.remove(&peer);
-            }
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                if let Err(error) = result {
-                    tracing::warn!(tunnel = %config.name, %error, "UDP 转发任务异常结束");
+                match result {
+                    Ok((peer, result)) => {
+                        sessions.remove(&peer);
+                        if let Err(error) = result {
+                            tracing::debug!(tunnel = %config.name, %peer, %error, "UDP 会话结束");
+                        }
+                    }
+                    Err(error) => tracing::warn!(tunnel = %config.name, %error, "UDP 转发任务异常结束"),
                 }
             }
         }
     }
-    drop(socket);
     sessions.clear();
-    if stopped.send(()).is_err() {
-        tracing::debug!(tunnel = %config.name, "监听停止接收方已释放");
-    }
+    tasks.abort_all();
     while let Some(result) = tasks.join_next().await {
-        if let Err(error) = result {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
             tracing::warn!(tunnel = %config.name, %error, "UDP 转发任务异常结束");
         }
+    }
+    drop(socket);
+    if stopped.send(()).is_err() {
+        tracing::debug!(tunnel = %config.name, "监听停止接收方已释放");
     }
 }
 
@@ -105,13 +127,25 @@ struct SessionContext {
     socket: Arc<UdpSocket>,
     runtime: TunnelRuntime,
     limiter: RateLimiter,
-    cleanup: mpsc::Sender<SocketAddr>,
     config: ServerTunnelConfig,
+}
+
+struct QueuedDatagram {
+    payload: Vec<u8>,
+    _permit: OwnedSemaphorePermit,
+}
+
+fn queued_datagram(budget: &ResourceBudget, payload: &[u8]) -> Option<QueuedDatagram> {
+    let permit = budget.try_queue_udp_bytes(payload.len())?;
+    Some(QueuedDatagram {
+        payload: payload.to_vec(),
+        _permit: permit,
+    })
 }
 
 async fn run_session(
     peer: SocketAddr,
-    mut inbound: mpsc::Receiver<Vec<u8>>,
+    mut inbound: mpsc::Receiver<QueuedDatagram>,
     context: &SessionContext,
 ) -> Result<()> {
     let Some(session) = context.runtime.find(&context.config.name).await else {
@@ -158,8 +192,8 @@ async fn run_session(
 
         match event {
             SessionEvent::Inbound(packet) => {
-                context.limiter.acquire(packet.len()).await;
-                write_datagram(&mut send, &packet).await?;
+                context.limiter.acquire(packet.payload.len()).await;
+                write_datagram(&mut send, &packet.payload).await?;
             }
             SessionEvent::Outbound(length) => {
                 context.limiter.acquire(length).await;
@@ -171,7 +205,7 @@ async fn run_session(
 }
 
 enum SessionEvent {
-    Inbound(Vec<u8>),
+    Inbound(QueuedDatagram),
     Outbound(usize),
     Closed,
 }

@@ -12,8 +12,6 @@ pub enum ClientError {
     LoginTimeout,
     #[error("已取消获取连接配置")]
     LoginCancelled,
-    #[error("等待服务端确认隧道操作超时")]
-    TunnelOperationTimeout,
     #[error("客户端运行时未在退出期限内停止")]
     ShutdownTimeout,
     #[error(transparent)]

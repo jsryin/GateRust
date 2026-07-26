@@ -46,7 +46,6 @@ impl LoginOperation {
 
 const LOGIN_TIMEOUT: Duration = Duration::from_mins(1);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const TUNNEL_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl ClientRuntime {
     /// 初始化配置并启动隧道后台任务。
@@ -146,13 +145,6 @@ impl ClientRuntime {
         let result = self
             .login_inner(address, key, &operation.cancellation, deadline)
             .await;
-        let result = if result.is_err() {
-            self.reset_after_failed_login()
-                .await
-                .map_or_else(Err, |()| result)
-        } else {
-            result
-        };
         self.finish_login(&operation).await;
         result
     }
@@ -184,22 +176,21 @@ impl ClientRuntime {
         check_login_state(cancellation, deadline)?;
         let mut config = self.config().await?;
         check_login_state(cancellation, deadline)?;
+        let replaced_certificate =
+            trust::managed_certificate_path(&config, self.config_path.as_ref());
         let address = address.trim().to_owned();
-        let server_changed = config.server.address != address;
-        if server_changed {
-            config.server.name = None;
-            config.server.ca_certificate = None;
-        }
         config.server.address = address;
+        config.server.name = None;
+        config.server.ca_certificate = None;
         config.key = key;
         config.services.clear();
         config.validate()?;
 
-        // 新凭据通过证书引导和正常 QUIC 认证后才落盘，超时不会触发后台自动重试。
-        trust::prepare(
+        // 候选证书和配置均在凭据验证成功后提交，失败不会影响现有会话。
+        let prepared_trust = trust::prepare(
             &mut config,
             self.config_path.as_ref(),
-            server_changed,
+            replaced_certificate,
             cancellation,
             deadline,
         )
@@ -213,15 +204,14 @@ impl ClientRuntime {
         )
         .await?;
         check_login_state(cancellation, deadline)?;
-        let config = self.save_config(config).await?;
-        check_login_state(cancellation, deadline)?;
-        Ok(config)
-    }
-
-    async fn reset_after_failed_login(&self) -> Result<()> {
         let path = Arc::clone(&self.config_path);
-        tokio::task::spawn_blocking(move || ClientConfig::reset(path.as_ref())).await??;
-        Ok(())
+        tokio::task::spawn_blocking(move || {
+            config.save(path.as_ref())?;
+            prepared_trust.commit();
+            Ok::<_, gaterust_tunnel::TunnelError>(config)
+        })
+        .await?
+        .map_err(ClientError::from)
     }
 
     /// 取消并等待当前连接配置获取结束；没有在途任务时直接返回。
@@ -288,13 +278,10 @@ impl ClientRuntime {
         &self,
         services: Vec<ClientServiceConfig>,
     ) -> Result<Vec<ClientTunnel>> {
-        tokio::time::timeout(
-            TUNNEL_OPERATION_TIMEOUT,
-            self.controller.update_services(services),
-        )
-        .await
-        .map_err(|_| ClientError::TunnelOperationTimeout)?
-        .map_err(ClientError::from)
+        self.controller
+            .update_services(services)
+            .await
+            .map_err(ClientError::from)
     }
 
     /// 返回最近一次连接状态。
@@ -454,7 +441,7 @@ fn clear_saved_services(path: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, generate_simple_self_signed};
+    use rcgen::generate_simple_self_signed;
 
     use super::*;
 
@@ -524,7 +511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_login_stops_retrying_existing_config() {
+    async fn failed_login_preserves_existing_config() {
         let directory = tempfile::tempdir().expect("创建测试目录");
         let config_path = directory.path().join("client.toml");
         let sink = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -543,21 +530,17 @@ mod tests {
         existing.key = TEST_KEY.into();
         existing.save(&config_path).expect("保存现有客户端配置");
         let runtime = ClientRuntime::start(Some(config_path.clone())).expect("启动客户端运行时");
+        let before = std::fs::read_to_string(&config_path).expect("读取登录前配置");
 
         let result = runtime
             .login_with_timeout(address, TEST_KEY.into(), Duration::from_millis(50))
             .await;
 
         assert!(matches!(result, Err(ClientError::LoginTimeout)));
-        let stored = ClientConfig::read(&config_path).expect("读取客户端配置");
-        assert!(stored.server.address.is_empty());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !matches!(runtime.status(), ClientStatus::Unconfigured { .. }) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("后台重试应停止");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("读取失败登录后的配置"),
+            before
+        );
         runtime.shutdown().await.expect("停止客户端运行时");
     }
 
@@ -659,7 +642,7 @@ key = "{TEST_KEY}"
                 gaterust_tunnel::TunnelError::Authentication(_)
             ))
         ));
-        assert!(!directory.path().join("server.pem").exists());
+        assert_eq!(managed_certificates(directory.path()).count(), 0);
         assert!(
             ClientConfig::read(&config_path)
                 .expect("读取未认证配置")
@@ -673,11 +656,12 @@ key = "{TEST_KEY}"
             .await
             .expect("获取连接配置");
         assert_eq!(config.server.name.as_deref(), Some("localhost"));
-        assert_eq!(
-            config.server.ca_certificate.as_deref(),
-            Some(std::path::Path::new("server.pem"))
-        );
-        assert!(directory.path().join("server.pem").is_file());
+        let first_certificate = config
+            .server
+            .ca_certificate
+            .clone()
+            .expect("配置应引用候选证书");
+        assert!(directory.path().join(&first_certificate).is_file());
         ClientConfig::load(&config_path).expect("下载的证书应能加载");
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -690,22 +674,21 @@ key = "{TEST_KEY}"
         .await
         .expect("客户端应使用下载证书完成连接");
 
-        let mut ca_params =
-            CertificateParams::new(vec!["localhost".into()]).expect("创建旧证书参数");
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate().expect("生成旧证书密钥");
-        let ca_certificate = ca_params.self_signed(&ca_key).expect("生成旧 CA 证书");
-        std::fs::write(directory.path().join("server.pem"), ca_certificate.pem())
-            .expect("写入旧 CA 证书");
-
-        runtime
+        let refreshed = runtime
             .login(address.to_string(), TEST_KEY.into())
             .await
-            .expect("应重新引导并替换旧 CA 证书");
-        let downloaded =
-            std::fs::read(directory.path().join("server.pem")).expect("读取替换后的服务端证书");
+            .expect("相同地址应重新引导证书");
+        let refreshed_certificate = refreshed
+            .server
+            .ca_certificate
+            .expect("刷新后的配置应引用证书");
+        assert_ne!(refreshed_certificate, first_certificate);
+        assert!(!directory.path().join(&first_certificate).exists());
+        assert_eq!(managed_certificates(directory.path()).count(), 1);
+        let downloaded = std::fs::read(directory.path().join(refreshed_certificate))
+            .expect("读取刷新后的服务端证书");
         gaterust_tunnel::server_name_from_pem(&downloaded, &address.to_string())
-            .expect("替换后的证书应为服务端叶证书");
+            .expect("刷新后的证书应为服务端叶证书");
 
         runtime.shutdown().await.expect("停止客户端运行时");
         cancellation.cancel();
@@ -713,6 +696,22 @@ key = "{TEST_KEY}"
             .await
             .expect("服务端任务正常结束")
             .expect("服务端正常退出");
+    }
+
+    fn managed_certificates(directory: &std::path::Path) -> impl Iterator<Item = PathBuf> + '_ {
+        std::fs::read_dir(directory)
+            .expect("读取客户端配置目录")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("server-"))
+                    .and_then(|name| name.strip_suffix(".pem"))
+                    .is_some_and(|suffix| {
+                        suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+            })
     }
 
     #[tokio::test]

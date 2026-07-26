@@ -15,6 +15,8 @@ pub enum TunnelError {
         path: PathBuf,
         source: toml::ser::Error,
     },
+    #[error("生成运行配置指纹失败: {0}")]
+    ConfigFingerprint(#[source] toml::ser::Error),
     #[error("写入配置 {path} 失败: {source}")]
     WriteConfig { path: PathBuf, source: io::Error },
     #[error("配置无效: {0}")]

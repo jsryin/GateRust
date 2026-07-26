@@ -2,17 +2,19 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use quinn::Connection;
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use tokio::sync::{RwLock, watch};
+use zeroize::Zeroize as _;
 
 use crate::{
     client::{ClientTunnel, ClientTunnelState},
     close::ApplicationCloseCode,
-    config::{ServerTunnelConfig, TunnelKind},
+    config::{GroupSecret, ServerConfig, ServerTunnelConfig, TunnelKind},
     protocol::ServiceDeclaration,
 };
 
@@ -22,12 +24,21 @@ const MAX_ONLINE_CLIENTS: usize = 128;
 pub struct TunnelRuntime {
     state: Arc<RwLock<RuntimeState>>,
     revision: watch::Sender<u64>,
+    config_status: watch::Sender<ConfigApplyState>,
 }
 
 #[derive(Serialize)]
 pub struct TunnelRuntimeSnapshot {
     pub clients: Vec<RuntimeClient>,
     pub tunnels: Vec<RuntimeTunnel>,
+    pub config_status: TunnelConfigStatus,
+}
+
+#[derive(Clone, Serialize)]
+pub struct TunnelConfigStatus {
+    pub revision: u64,
+    pub restart_required: bool,
+    pub last_apply_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -53,6 +64,7 @@ pub(crate) struct ClientSession {
 pub(crate) enum RegisterError {
     DeviceIdConflict,
     Capacity,
+    CredentialsChanged,
 }
 
 pub(crate) struct ServiceUpdate {
@@ -65,6 +77,7 @@ pub(crate) struct ServiceUpdate {
 
 #[derive(Default)]
 struct RuntimeState {
+    credentials: HashMap<String, [u8; 32]>,
     sessions: HashMap<u64, SessionEntry>,
     tunnels: HashMap<String, TunnelSpec>,
     owners: HashMap<String, u64>,
@@ -74,6 +87,7 @@ struct SessionEntry {
     connection: Connection,
     device_id: String,
     group: String,
+    credential_digest: [u8; 32],
     remote_address: SocketAddr,
     connected_at: u64,
     services: HashMap<String, TunnelKind>,
@@ -86,12 +100,27 @@ struct TunnelSpec {
     local_port: Option<u16>,
 }
 
+#[derive(Clone)]
+struct ConfigApplyState {
+    fingerprint: Option<[u8; 32]>,
+    status: TunnelConfigStatus,
+}
+
 impl Default for TunnelRuntime {
     fn default() -> Self {
         let (revision, _) = watch::channel(0);
+        let (config_status, _) = watch::channel(ConfigApplyState {
+            fingerprint: None,
+            status: TunnelConfigStatus {
+                revision: 0,
+                restart_required: false,
+                last_apply_error: None,
+            },
+        });
         Self {
             state: Arc::new(RwLock::new(RuntimeState::default())),
             revision,
+            config_status,
         }
     }
 }
@@ -126,7 +155,46 @@ impl TunnelRuntime {
             })
             .collect::<Vec<_>>();
         tunnels.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-        TunnelRuntimeSnapshot { clients, tunnels }
+        let config_status = self.config_status.borrow().status.clone();
+        TunnelRuntimeSnapshot {
+            clients,
+            tunnels,
+            config_status,
+        }
+    }
+
+    /// 等待服务端处理指定配置，返回匹配配置的应用结果。
+    ///
+    /// # Errors
+    ///
+    /// 配置无法生成稳定指纹时返回错误；超过等待期限时返回 `None`。
+    pub async fn wait_for_config(
+        &self,
+        config: &ServerConfig,
+        after_revision: u64,
+        timeout: Duration,
+    ) -> crate::Result<Option<TunnelConfigStatus>> {
+        let fingerprint = config_fingerprint(config)?;
+        let mut changes = self.config_status.subscribe();
+        let wait = async {
+            loop {
+                let current = changes.borrow_and_update().clone();
+                if current.status.revision != after_revision
+                    && current.fingerprint == Some(fingerprint)
+                {
+                    return Some(current.status);
+                }
+                if changes.changed().await.is_err() {
+                    return None;
+                }
+            }
+        };
+        Ok(tokio::time::timeout(timeout, wait).await.unwrap_or(None))
+    }
+
+    #[must_use]
+    pub fn config_revision(&self) -> u64 {
+        self.config_status.borrow().status.revision
     }
 
     pub async fn disconnect(&self, session_id: u64) -> bool {
@@ -167,17 +235,85 @@ impl TunnelRuntime {
         self.notify();
     }
 
+    pub(crate) async fn apply_credentials(&self, credentials: &[(String, GroupSecret)]) {
+        let credentials = credentials
+            .iter()
+            .map(|(name, secret)| (name.clone(), credential_digest(secret.as_bytes())))
+            .collect::<HashMap<_, _>>();
+        let connections = {
+            let mut state = self.state.write().await;
+            state.credentials = credentials;
+            let revoked = state
+                .sessions
+                .iter()
+                .filter(|(_, session)| {
+                    state.credentials.get(&session.group) != Some(&session.credential_digest)
+                })
+                .map(|(&id, _)| id)
+                .collect::<Vec<_>>();
+            let mut connections = Vec::with_capacity(revoked.len());
+            for id in revoked {
+                if let Some(session) = state.sessions.remove(&id) {
+                    release_session(&mut state, id);
+                    connections.push(session.connection);
+                }
+            }
+            connections
+        };
+        if connections.is_empty() {
+            return;
+        }
+        self.notify();
+        for connection in connections {
+            connection.close(
+                ApplicationCloseCode::CredentialsRevoked.value(),
+                b"credentials revoked",
+            );
+        }
+    }
+
+    pub(crate) fn report_config_applied(
+        &self,
+        config: &ServerConfig,
+        restart_required: bool,
+    ) -> crate::Result<()> {
+        self.publish_config_status(config_fingerprint(config)?, restart_required, None);
+        Ok(())
+    }
+
+    pub(crate) fn report_config_failed(
+        &self,
+        config: &ServerConfig,
+        restart_required: bool,
+        error: String,
+    ) -> crate::Result<()> {
+        self.publish_config_status(config_fingerprint(config)?, restart_required, Some(error));
+        Ok(())
+    }
+
+    pub(crate) fn report_config_load_error(&self, error: String) {
+        self.config_status.send_modify(|state| {
+            state.fingerprint = None;
+            state.status.revision = state.status.revision.wrapping_add(1);
+            state.status.last_apply_error = Some(error);
+        });
+    }
+
     pub(crate) async fn register(
         &self,
         id: u64,
         device_id: String,
         group: String,
+        credential_digest: [u8; 32],
         connection: Connection,
         services: Vec<ServiceDeclaration>,
     ) -> Result<(), RegisterError> {
         let mut state = self.state.write().await;
         if state.sessions.len() >= MAX_ONLINE_CLIENTS {
             return Err(RegisterError::Capacity);
+        }
+        if state.credentials.get(&group) != Some(&credential_digest) {
+            return Err(RegisterError::CredentialsChanged);
         }
         if state
             .sessions
@@ -193,6 +329,7 @@ impl TunnelRuntime {
                 connection,
                 device_id,
                 group,
+                credential_digest,
                 connected_at: unix_timestamp(),
                 services: service_map(services),
             },
@@ -292,6 +429,31 @@ impl TunnelRuntime {
         self.revision
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
+
+    fn publish_config_status(
+        &self,
+        fingerprint: [u8; 32],
+        restart_required: bool,
+        last_apply_error: Option<String>,
+    ) {
+        self.config_status.send_modify(|state| {
+            state.fingerprint = Some(fingerprint);
+            state.status.revision = state.status.revision.wrapping_add(1);
+            state.status.restart_required = restart_required;
+            state.status.last_apply_error = last_apply_error;
+        });
+    }
+}
+
+pub(crate) fn credential_digest(secret: &[u8]) -> [u8; 32] {
+    Sha256::digest(secret).into()
+}
+
+fn config_fingerprint(config: &ServerConfig) -> crate::Result<[u8; 32]> {
+    let mut serialized = toml::to_string(config).map_err(crate::TunnelError::ConfigFingerprint)?;
+    let digest = Sha256::digest(serialized.as_bytes()).into();
+    serialized.zeroize();
+    Ok(digest)
 }
 
 fn retain_valid_owners(state: &mut RuntimeState) {
@@ -299,6 +461,7 @@ fn retain_valid_owners(state: &mut RuntimeState) {
         sessions,
         tunnels,
         owners,
+        ..
     } = state;
     owners.retain(|name, id| {
         let Some(spec) = tunnels.get(name) else {
@@ -353,4 +516,81 @@ fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::config::ServerQuicConfig;
+
+    fn config() -> ServerConfig {
+        ServerConfig {
+            quic: ServerQuicConfig {
+                bind: "127.0.0.1:2333".parse().expect("测试地址有效"),
+                certificate: PathBuf::from("server.pem"),
+                private_key: PathBuf::from("server-key.pem"),
+            },
+            groups: Vec::new(),
+            tunnels: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn waits_for_matching_config_application_status() {
+        let runtime = TunnelRuntime::new();
+        let config = config();
+        let revision = runtime.config_revision();
+        runtime
+            .report_config_applied(&config, true)
+            .expect("记录配置状态");
+
+        let status = runtime
+            .wait_for_config(&config, revision, Duration::from_millis(50))
+            .await
+            .expect("生成配置指纹")
+            .expect("应匹配配置状态");
+
+        assert!(status.restart_required);
+        assert_eq!(status.last_apply_error, None);
+    }
+
+    #[tokio::test]
+    async fn times_out_for_unseen_config() {
+        let runtime = TunnelRuntime::new();
+        let mut applied = config();
+        runtime
+            .report_config_applied(&applied, false)
+            .expect("记录配置状态");
+        let revision = runtime.config_revision();
+        applied.quic.bind = "127.0.0.1:2444".parse().expect("测试地址有效");
+
+        assert!(
+            runtime
+                .wait_for_config(&applied, revision, Duration::from_millis(10))
+                .await
+                .expect("生成配置指纹")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn load_error_does_not_match_previous_config() {
+        let runtime = TunnelRuntime::new();
+        let config = config();
+        runtime
+            .report_config_applied(&config, false)
+            .expect("记录配置状态");
+        let revision = runtime.config_revision();
+        runtime.report_config_load_error("配置文件无效".into());
+
+        assert!(
+            runtime
+                .wait_for_config(&config, revision, Duration::from_millis(10))
+                .await
+                .expect("生成配置指纹")
+                .is_none()
+        );
+    }
 }

@@ -7,16 +7,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rand::RngExt as _;
 use rand::distr::{Alphanumeric, SampleString as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use zeroize::Zeroize as _;
 
 use crate::{Result, TunnelError};
 
-const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
-const DEFAULT_MAX_UDP_SESSIONS: usize = 1_024;
+const DEFAULT_MAX_CONNECTIONS: usize = 128;
+const DEFAULT_MAX_UDP_SESSIONS: usize = 128;
 const DEFAULT_UDP_IDLE_SECONDS: u64 = 60;
+pub(crate) const MAX_DATA_STREAMS: usize = 512;
+pub(crate) const MAX_UDP_SESSIONS: usize = 128;
+pub(crate) const MAX_UDP_IDLE_SECONDS: u64 = 3_600;
+pub(crate) const MAX_QUEUED_UDP_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MIN_GROUP_KEY_LENGTH: usize = 32;
 pub(crate) const MAX_GROUP_KEY_LENGTH: usize = 124;
 pub const MAX_CLIENT_SERVICES: usize = 256;
@@ -229,16 +232,28 @@ impl ServerConfig {
                     tunnel.name
                 )));
             }
-            if tunnel.max_connections == 0 {
+            if tunnel.kind == TunnelKind::Socks5 && !tunnel.bind.ip().is_loopback() {
                 return Err(TunnelError::InvalidConfig(format!(
-                    "隧道 {} 的 max_connections 必须大于 0",
+                    "未配置认证的 SOCKS5 隧道 {} 只能监听回环地址",
                     tunnel.name
                 )));
             }
-            if tunnel.max_udp_sessions == 0 || tunnel.udp_idle_seconds == 0 {
+            if !(1..=MAX_DATA_STREAMS).contains(&tunnel.max_connections) {
                 return Err(TunnelError::InvalidConfig(format!(
-                    "隧道 {} 的 UDP 会话限制和空闲时间必须大于 0",
-                    tunnel.name
+                    "隧道 {} 的 max_connections 必须为 1..={MAX_DATA_STREAMS}",
+                    tunnel.name,
+                )));
+            }
+            if !(1..=MAX_UDP_SESSIONS).contains(&tunnel.max_udp_sessions) {
+                return Err(TunnelError::InvalidConfig(format!(
+                    "隧道 {} 的 max_udp_sessions 必须为 1..={MAX_UDP_SESSIONS}",
+                    tunnel.name,
+                )));
+            }
+            if !(1..=MAX_UDP_IDLE_SECONDS).contains(&tunnel.udp_idle_seconds) {
+                return Err(TunnelError::InvalidConfig(format!(
+                    "隧道 {} 的 udp_idle_seconds 必须为 1..={MAX_UDP_IDLE_SECONDS}",
+                    tunnel.name,
                 )));
             }
             let inserted = match tunnel.kind {
@@ -463,45 +478,23 @@ fn write_client_config(path: &Path, content: &[u8]) -> Result<()> {
         path: path.to_owned(),
         source,
     })?;
-    let temporary = parent.join(format!(
-        ".gaterust-client-{:016x}.tmp",
-        rand::rng().random::<u64>()
-    ));
+    let mut options = atomic_write_file::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use atomic_write_file::unix::OpenOptionsExt as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.preserve_mode(false).mode(0o600);
+    }
     let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
+        let mut file = options.open(path)?;
         file.write_all(content)?;
-        file.sync_all()?;
-        replace_file(&temporary, path)
+        file.commit()
     })();
-    if let Err(source) = result {
-        cleanup_file(&temporary);
-        return Err(TunnelError::WriteConfig {
-            path: path.to_owned(),
-            source,
-        });
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
-    std::fs::rename(temporary, path)
-}
-
-#[cfg(windows)]
-fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
-    // Windows 标准库不能用 rename 覆盖现有文件，先同步写入再完成替换。
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    std::fs::rename(temporary, path)
+    result.map_err(|source| TunnelError::WriteConfig {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 fn config_parent(path: &Path) -> &Path {
@@ -620,6 +613,48 @@ mod tests {
             tunnels: Vec::new(),
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unsafe_socks_bind_and_excessive_resource_limits() {
+        let tunnel = ServerTunnelConfig {
+            name: "proxy".into(),
+            group: "office".into(),
+            kind: TunnelKind::Socks5,
+            bind: "0.0.0.0:1080".parse().expect("测试地址有效"),
+            local_port: None,
+            limit_bps: None,
+            max_connections: 8,
+            max_udp_sessions: 8,
+            udp_idle_seconds: 30,
+        };
+        let server = |tunnel| ServerConfig {
+            quic: ServerQuicConfig {
+                bind: "127.0.0.1:2333".parse().expect("测试地址有效"),
+                certificate: "server.pem".into(),
+                private_key: "server-key.pem".into(),
+            },
+            groups: vec![GroupConfig {
+                name: "office".into(),
+                key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            }],
+            tunnels: vec![tunnel],
+        };
+
+        assert!(server(tunnel.clone()).validate().is_err());
+
+        let mut tunnel = tunnel;
+        tunnel.bind = "127.0.0.1:1080".parse().expect("测试地址有效");
+        tunnel.max_connections = MAX_DATA_STREAMS + 1;
+        assert!(server(tunnel.clone()).validate().is_err());
+
+        tunnel.max_connections = 8;
+        tunnel.max_udp_sessions = MAX_UDP_SESSIONS + 1;
+        assert!(server(tunnel.clone()).validate().is_err());
+
+        tunnel.max_udp_sessions = 8;
+        tunnel.udp_idle_seconds = MAX_UDP_IDLE_SECONDS + 1;
+        assert!(server(tunnel).validate().is_err());
     }
 
     #[test]

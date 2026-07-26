@@ -102,4 +102,9 @@ export interface TunnelRuntimeState {
     name: string;
     owner_session_id: number | null;
   }[];
+  config_status: {
+    revision: number;
+    restart_required: boolean;
+    last_apply_error: string | null;
+  };
 }

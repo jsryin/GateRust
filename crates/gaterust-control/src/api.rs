@@ -387,10 +387,10 @@ impl ApiError {
     #[cfg(any(feature = "tunnel", feature = "proxy"))]
     fn from_control(error: &crate::ControlError) -> Self {
         tracing::warn!(%error, "Web UI 配置操作失败");
-        let status = if matches!(error, crate::ControlError::ResourceNotFound { .. }) {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::BAD_REQUEST
+        let status = match error {
+            crate::ControlError::ResourceNotFound { .. } => StatusCode::NOT_FOUND,
+            crate::ControlError::TunnelRuntimeApply(_) => StatusCode::CONFLICT,
+            _ => StatusCode::BAD_REQUEST,
         };
         Self::new(status, error.to_string())
     }

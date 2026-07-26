@@ -17,6 +17,7 @@ use crate::{
 };
 
 const TEST_KEY: &str = "12345678901234567890123456789012";
+const ROTATED_TEST_KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
 
 #[test]
 fn checks_server_tls_credentials_before_startup() {
@@ -105,6 +106,70 @@ async fn bootstraps_certificate_with_key_proof_and_checks_credentials() {
 
     cancellation.cancel();
     assert_task_ok(server, "服务端").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotating_group_key_revokes_existing_sessions() {
+    let directory = tempfile::tempdir().expect("应能创建测试目录");
+    write_certificate(directory.path());
+    let quic = unused_udp_address();
+    write_server_config(
+        directory.path(),
+        quic,
+        unused_tcp_address(),
+        unused_udp_address(),
+        unused_tcp_address(),
+        true,
+    );
+    write_client_config(
+        directory.path(),
+        quic,
+        unused_tcp_address(),
+        unused_udp_address(),
+        true,
+    );
+    let cancellation = CancellationToken::new();
+    let runtime = TunnelRuntime::new();
+    let server_path = directory.path().join("server.toml");
+    let server_cancel = cancellation.clone();
+    let server_runtime = runtime.clone();
+    let server = tokio::spawn(async move {
+        run_server_with_runtime(server_path, server_runtime, server_cancel).await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let client_path = directory.path().join("client.toml");
+    let client_cancel = cancellation.clone();
+    let client =
+        tokio::spawn(async move { run_client_with_shutdown(client_path, client_cancel).await });
+    wait_for_runtime(&runtime, |snapshot| snapshot.clients.len() == 1).await;
+
+    let server_path = directory.path().join("server.toml");
+    let config = std::fs::read_to_string(&server_path)
+        .expect("读取服务端配置")
+        .replace(TEST_KEY, ROTATED_TEST_KEY);
+    std::fs::write(&server_path, config).expect("轮换分组密钥");
+    let snapshot = wait_for_runtime(&runtime, |snapshot| {
+        snapshot.clients.is_empty()
+            && snapshot.config_status.revision >= 2
+            && snapshot.config_status.last_apply_error.is_none()
+    })
+    .await;
+    assert!(
+        snapshot
+            .tunnels
+            .iter()
+            .all(|tunnel| tunnel.owner_session_id.is_none())
+    );
+
+    let address = format!("localhost:{}", quic.port());
+    assert!(fetch_server_certificate(&address, TEST_KEY).await.is_err());
+    fetch_server_certificate(&address, ROTATED_TEST_KEY)
+        .await
+        .expect("新密钥应立即生效");
+
+    cancellation.cancel();
+    assert_task_ok(server, "服务端").await;
+    assert_task_ok(client, "客户端").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -355,6 +420,18 @@ async fn forwards_tcp_udp_and_socks5() {
     drop(persistent);
 
     assert_udp_echo(udp_public, b"udp-through-quic").await;
+    let config_revision = runtime.snapshot().await.config_status.revision;
+    let server_path = directory.path().join("server.toml");
+    let config = std::fs::read_to_string(&server_path)
+        .expect("读取 UDP 重载前配置")
+        .replace("udp_idle_seconds = 30", "udp_idle_seconds = 31");
+    std::fs::write(&server_path, config).expect("修改 UDP 会话空闲时间");
+    wait_for_runtime(&runtime, |snapshot| {
+        snapshot.config_status.revision > config_revision
+            && snapshot.config_status.last_apply_error.is_none()
+    })
+    .await;
+    assert_udp_echo(udp_public, b"udp-after-reload").await;
     assert_socks_echo(socks_public, tcp_target_address, b"socks-through-quic").await;
 
     cancellation.cancel();
@@ -582,6 +659,7 @@ name = "udp-echo"
 group = "test"
 kind = "udp"
 bind = "{udp_public}"
+udp_idle_seconds = 30
 
 [[tunnels]]
 name = "socks"

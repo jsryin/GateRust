@@ -1,6 +1,5 @@
 use std::{
     ffi::OsString,
-    fs::OpenOptions,
     io::{ErrorKind, Write as _},
     path::{Path, PathBuf},
 };
@@ -57,40 +56,18 @@ impl DeviceIdentity {
 
     fn persist(&self) -> Result<()> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        let mut random = [0_u8; 8];
-        rand::rng().fill(&mut random);
-        let temporary = parent.join(format!(
-            ".device-id-{:016x}.tmp",
-            u64::from_ne_bytes(random)
-        ));
-        let result = (|| {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)?;
-            file.write_all(self.id.as_bytes())?;
-            file.sync_all()?;
-            #[cfg(windows)]
-            if self.path.exists() {
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(&self.path)?;
-                file.write_all(self.id.as_bytes())?;
-                file.sync_all()?;
-                std::fs::remove_file(&temporary)?;
-                return Ok(());
-            }
-            std::fs::rename(&temporary, &self.path)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
+        std::fs::create_dir_all(parent)?;
+        let mut options = atomic_write_file::OpenOptions::new();
+        #[cfg(unix)]
+        {
+            use atomic_write_file::unix::OpenOptionsExt as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options.preserve_mode(false).mode(0o600);
         }
-        result.map_err(Into::into)
+        let mut file = options.open(&self.path)?;
+        file.write_all(self.id.as_bytes())?;
+        file.commit().map_err(Into::into)
     }
 }
 
