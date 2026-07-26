@@ -1,13 +1,5 @@
-import {
-  Copy,
-  KeyRound,
-  LogOut,
-  Pencil,
-  Plus,
-  RefreshCw,
-  Trash2
-} from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Pencil, RefreshCw } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   createGroup,
   createTunnel,
@@ -30,15 +22,13 @@ import type {
   TunnelRuntimeClient,
   TunnelRuntimeState
 } from '../lib/types';
-import { Badge } from './ui/Badge';
 import { Button } from './ui/Button';
-import { ConfirmAction } from './ui/ConfirmAction';
 import { Dialog, DialogBody, DialogContent, DialogFooter } from './ui/Dialog';
 import { Field, Input, Select, ValueField } from './ui/Fields';
 import { FormGrid, PageIntro } from './ui/Page';
-import { EmptyState, Panel, PanelHeader } from './ui/Panel';
+import { Panel, PanelHeader } from './ui/Panel';
 import { Notice } from './ui/Notice';
-import { Table, TableCell, TableHead, TableHeader, TableRow } from './ui/Table';
+import { TunnelGroupList } from './TunnelGroupList';
 
 interface TunnelPanelProps {
   config: ServerConfig | null | undefined;
@@ -54,7 +44,6 @@ const maxDataStreams = 512;
 const maxUdpSessions = 128;
 const maxUdpIdleSeconds = 3600;
 const bytesPerKilobyte = 1024;
-const kindLabel: Record<TunnelKind, string> = { tcp: 'TCP', udp: 'UDP', socks5: 'SOCKS5' };
 
 function defaultTunnel(): TunnelConfig {
   return {
@@ -134,30 +123,6 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
     };
   }, [refreshRuntime]);
 
-  const clientsById = useMemo(
-    () => new Map(runtime.clients.map((client) => [client.session_id, client])),
-    [runtime.clients]
-  );
-  const runtimeByTunnel = useMemo(
-    () => new Map(runtime.tunnels.map((item) => [item.name, item])),
-    [runtime.tunnels]
-  );
-  const tunnelsByOwner = useMemo(() => {
-    const entries = new Map<number, string[]>();
-    runtime.tunnels.forEach((item) => {
-      if (item.owner_session_id === null) return;
-      const names = entries.get(item.owner_session_id) ?? [];
-      names.push(item.name);
-      entries.set(item.owner_session_id, names);
-    });
-    return entries;
-  }, [runtime.tunnels]);
-  const tunnelCountByGroup = useMemo(() => {
-    const counts = new Map<string, number>();
-    draft.tunnels.forEach((item) => counts.set(item.group, (counts.get(item.group) ?? 0) + 1));
-    return counts;
-  }, [draft.tunnels]);
-
   function openQuic() {
     setOriginalName(null);
     setQuic({ ...draft.quic });
@@ -172,10 +137,10 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
     setError('');
   }
 
-  function openTunnel(item?: TunnelConfig) {
+  function openTunnel(item?: TunnelConfig, groupName?: string) {
     const next = item
       ? { ...item }
-      : { ...defaultTunnel(), group: draft.groups[0]?.name ?? '' };
+      : { ...defaultTunnel(), group: groupName ?? draft.groups[0]?.name ?? '' };
     setOriginalName(item?.name ?? null);
     setTunnel(next);
     setLimitKilobytes(next.limit_bps === null ? '' : (next.limit_bps / bytesPerKilobyte).toString());
@@ -195,6 +160,8 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
   async function copyGroupKey(key: string) {
     try {
       await navigator.clipboard.writeText(key);
+      setError('');
+      setMessage('分组密钥已复制');
     } catch (cause) {
       setError(errorMessage(cause, '复制密钥失败'));
     }
@@ -328,7 +295,6 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
               <Pencil className="h-4 w-4" />
             </Button>
           )}
-          description="服务端传输入口与 TLS 文件"
           title="QUIC 监听"
         />
         <FormGrid columns={3}>
@@ -338,174 +304,24 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
         </FormGrid>
       </Panel>
 
-      <Panel>
-        <PanelHeader
-          action={(
-            <Button onClick={() => openGroup()} variant="secondary">
-              <Plus className="h-4 w-4" />
-              新建分组
-            </Button>
-          )}
-          description="同一分组共享密钥与隧道权限"
-          title="访问分组"
-        />
-        {draft.groups.length ? (
-          <Table className="min-w-[660px]">
-            <TableHeader>
-              <TableRow>
-                <TableHead>名称</TableHead>
-                <TableHead>密钥</TableHead>
-                <TableHead>隧道数</TableHead>
-                <TableHead className="text-right">操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <tbody>
-              {draft.groups.map((item) => (
-                <TableRow key={item.name}>
-                  <TableCell className="font-medium text-[color:var(--fg-base)]">{item.name}</TableCell>
-                  <TableCell>
-                    <div className="flex items-center gap-1">
-                      <code className="rounded bg-[var(--bg-component)] px-1.5 py-0.5 text-xs">{item.key.slice(0, 9)}••••••••••••</code>
-                      <Button
-                        aria-label={`复制 ${item.name} 的密钥`}
-                        onClick={() => void copyGroupKey(item.key)}
-                        size="icon"
-                        title="复制密钥"
-                        variant="ghost"
-                      >
-                        <Copy className="h-3.5 w-3.5" />
-                      </Button>
-                    </div>
-                  </TableCell>
-                  <TableCell>{tunnelCountByGroup.get(item.name) ?? 0}</TableCell>
-                  <TableCell>
-                    <div className="flex justify-end gap-1">
-                      <Button aria-label={`编辑 ${item.name}`} onClick={() => openGroup(item)} size="icon" variant="ghost">
-                        <Pencil className="h-4 w-4" />
-                      </Button>
-                      <ConfirmAction
-                        confirmLabel="删除"
-                        description={`将同时删除分组 ${item.name} 下的全部隧道。`}
-                        onConfirm={() => removeGroup(item.name)}
-                        title={`删除分组 ${item.name}？`}
-                      >
-                        <Button aria-label={`删除 ${item.name}`} size="icon" variant="ghost">
-                          <Trash2 className="h-4 w-4 text-[color:var(--tag-red-text)]" />
-                        </Button>
-                      </ConfirmAction>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </tbody>
-          </Table>
-        ) : (
-          <EmptyState description="创建分组后才能添加隧道。" icon={KeyRound} title="还没有访问分组" />
-        )}
-      </Panel>
-
-      <Panel>
-        <PanelHeader
-          action={(
-            <Button disabled={!draft.groups.length} onClick={() => openTunnel()} variant="secondary">
-              <Plus className="h-4 w-4" />
-              新建隧道
-            </Button>
-          )}
-          description="公网监听、本地端口、协议类型和资源边界"
-          title="隧道"
-        />
-        {draft.tunnels.length ? (
-          <Table className="min-w-[1120px]">
-            <TableHeader>
-              <TableRow>
-                <TableHead>名称</TableHead>
-                <TableHead>协议</TableHead>
-                <TableHead>分组</TableHead>
-                <TableHead>监听</TableHead>
-                <TableHead>本地端口</TableHead>
-                <TableHead>客户端</TableHead>
-                <TableHead>限速</TableHead>
-                <TableHead className="text-right">操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <tbody>
-              {draft.tunnels.map((item) => {
-                const state = runtimeByTunnel.get(item.name);
-                const owner = state?.owner_session_id == null ? undefined : clientsById.get(state.owner_session_id);
-                const releasedTunnels = owner ? tunnelsByOwner.get(owner.session_id) ?? [] : [];
-
-                return (
-                  <TableRow key={item.name}>
-                    <TableCell className="font-medium text-[color:var(--fg-base)]">{item.name}</TableCell>
-                    <TableCell><Badge>{kindLabel[item.kind]}</Badge></TableCell>
-                    <TableCell>{item.group}</TableCell>
-                    <TableCell><code className="text-xs">{item.bind}</code></TableCell>
-                    <TableCell>
-                      {item.kind === 'socks5' ? '—' : item.local_port ?? '同监听端口'}
-                    </TableCell>
-                    <TableCell>
-                      <div>
-                        {owner ? (
-                          <>
-                            <div className="font-medium text-[color:var(--fg-base)]">{owner.device_id}</div>
-                            <div className="txt-compact-xsmall text-[color:var(--fg-muted)]">
-                              {owner.remote_address} · {new Date(owner.connected_at * 1000).toLocaleString()}
-                            </div>
-                          </>
-                        ) : (
-                          <span className="text-[color:var(--fg-muted)]">未连接</span>
-                        )}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      {item.limit_bps
-                        ? `${(item.limit_bps / bytesPerKilobyte).toLocaleString()} KB/s`
-                        : '不限'}
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex justify-end gap-1">
-                        {owner && (
-                          <ConfirmAction
-                            confirmLabel="下线"
-                            description={`将释放隧道：${releasedTunnels.join(', ') || '无'}`}
-                            onConfirm={() => disconnectClient(owner)}
-                            title={`下线 ${owner.device_id}？`}
-                          >
-                            <Button aria-label={`下线 ${owner.device_id}`} size="icon" variant="ghost">
-                              <LogOut className="h-4 w-4 text-[color:var(--tag-red-text)]" />
-                            </Button>
-                          </ConfirmAction>
-                        )}
-                        <Button aria-label={`编辑 ${item.name}`} onClick={() => openTunnel(item)} size="icon" variant="ghost">
-                          <Pencil className="h-4 w-4" />
-                        </Button>
-                        <ConfirmAction
-                          confirmLabel="删除"
-                          description={`删除后，隧道 ${item.name} 将立即停止提供服务。`}
-                          onConfirm={() => removeTunnel(item.name)}
-                          title={`删除隧道 ${item.name}？`}
-                        >
-                          <Button aria-label={`删除 ${item.name}`} size="icon" variant="ghost">
-                            <Trash2 className="h-4 w-4 text-[color:var(--tag-red-text)]" />
-                          </Button>
-                        </ConfirmAction>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
-            </tbody>
-          </Table>
-        ) : (
-          <EmptyState title="暂无隧道配置" />
-        )}
-      </Panel>
+      <TunnelGroupList
+        groups={draft.groups}
+        runtime={runtime}
+        tunnels={draft.tunnels}
+        onCopyGroupKey={copyGroupKey}
+        onCreateGroup={() => openGroup()}
+        onCreateTunnel={(groupName) => openTunnel(undefined, groupName)}
+        onDeleteGroup={removeGroup}
+        onDeleteTunnel={removeTunnel}
+        onDisconnectClient={disconnectClient}
+        onEditGroup={openGroup}
+        onEditTunnel={openTunnel}
+      />
 
       <Dialog open={editor !== null} onOpenChange={(open) => !open && !saving && setEditor(null)}>
         {editor && (
           <DialogContent
-            description={editor === 'quic' || originalName ? '修改现有配置项' : '创建新的配置项'}
+            description={editor === 'quic' || (editor === 'tunnel' && originalName) ? '修改现有配置项' : undefined}
             title={editor === 'quic' ? 'QUIC 监听' : editor === 'group' ? '访问分组' : '隧道'}
           >
             <DialogBody>
@@ -530,7 +346,7 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
                     <Field className="sm:col-span-2" label="分组密钥（32-124 个字符）">
                       <div className="grid grid-cols-[minmax(0,1fr)_32px]">
                         <Input className="rounded-r-none" onChange={(event) => setGroup((current) => ({ ...current, key: event.target.value }))} value={group.key} />
-                        <Button aria-label="生成新密钥" className="rounded-l-none" onClick={() => void refreshKey()} size="icon" variant="secondary">
+                        <Button aria-label="生成新密钥" className="h-8 w-8 rounded-l-none" onClick={() => void refreshKey()} size="icon" variant="secondary">
                           <RefreshCw className="h-4 w-4" />
                         </Button>
                       </div>
