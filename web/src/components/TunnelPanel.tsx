@@ -53,6 +53,7 @@ const maxGroupKeyLength = 124;
 const maxDataStreams = 512;
 const maxUdpSessions = 128;
 const maxUdpIdleSeconds = 3600;
+const bytesPerKilobyte = 1024;
 const kindLabel: Record<TunnelKind, string> = { tcp: 'TCP', udp: 'UDP', socks5: 'SOCKS5' };
 
 function defaultTunnel(): TunnelConfig {
@@ -92,7 +93,7 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
   const [quic, setQuic] = useState<ServerQuicConfig>(defaultQuic);
   const [group, setGroup] = useState<GroupConfig>({ name: '', key: '' });
   const [tunnel, setTunnel] = useState<TunnelConfig>(defaultTunnel);
-  const [limit, setLimit] = useState('');
+  const [limitKilobytes, setLimitKilobytes] = useState('');
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -177,7 +178,7 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
       : { ...defaultTunnel(), group: draft.groups[0]?.name ?? '' };
     setOriginalName(item?.name ?? null);
     setTunnel(next);
-    setLimit(next.limit_bps?.toString() ?? '');
+    setLimitKilobytes(next.limit_bps === null ? '' : (next.limit_bps / bytesPerKilobyte).toString());
     setEditor('tunnel');
     setError('');
   }
@@ -228,7 +229,11 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
   }
 
   async function commitTunnel() {
-    const next = { ...tunnel, limit_bps: limit ? Number(limit) : null };
+    // 配置和 API 保持字节单位，仅在界面边界换算，避免给转发热路径增加开销。
+    const limitBps = limitKilobytes
+      ? Math.round(Number(limitKilobytes) * bytesPerKilobyte)
+      : null;
+    const next = { ...tunnel, limit_bps: limitBps };
     if (!next.name || !next.group || !next.bind) {
       setError('名称、分组和监听地址不能为空');
       return;
@@ -243,7 +248,7 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
     }
     if (next.kind === 'socks5') next.local_port = null;
     if (next.limit_bps !== null && (!Number.isSafeInteger(next.limit_bps) || next.limit_bps < 1)) {
-      setError('限速必须为有效的正整数');
+      setError('限速必须为有效的正数（KB/s）');
       return;
     }
     if (next.kind === 'udp') {
@@ -453,7 +458,11 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
                         )}
                       </div>
                     </TableCell>
-                    <TableCell>{item.limit_bps ? `${item.limit_bps.toLocaleString()} B/s` : '不限'}</TableCell>
+                    <TableCell>
+                      {item.limit_bps
+                        ? `${(item.limit_bps / bytesPerKilobyte).toLocaleString()} KB/s`
+                        : '不限'}
+                    </TableCell>
                     <TableCell>
                       <div className="flex justify-end gap-1">
                         {owner && (
@@ -572,8 +581,15 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
                         />
                       </Field>
                     )}
-                    <Field label="限速（B/s）">
-                      <Input min="1" onChange={(event) => setLimit(event.target.value)} placeholder="留空表示不限" type="number" value={limit} />
+                    <Field label="限速（KB/s）">
+                      <Input
+                        min={1 / bytesPerKilobyte}
+                        onChange={(event) => setLimitKilobytes(event.target.value)}
+                        placeholder="留空表示不限"
+                        step="any"
+                        type="number"
+                        value={limitKilobytes}
+                      />
                     </Field>
                     {tunnel.kind === 'udp' ? (
                       <>
