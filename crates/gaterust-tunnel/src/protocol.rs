@@ -10,7 +10,7 @@ use crate::{
     config::{MAX_CLIENT_SERVICES, TunnelKind},
 };
 
-pub(crate) const PROTOCOL_VERSION: u16 = 4;
+pub(crate) const PROTOCOL_VERSION: u16 = 5;
 pub(crate) const MAX_CONTROL_FRAME: usize = 256 * 1024;
 pub(crate) const MAX_DATAGRAM: usize = u16::MAX as usize;
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -71,12 +71,19 @@ pub(crate) enum CertificateBootstrapResponse {
 
 #[derive(serde::Deserialize, Serialize)]
 pub(crate) enum ControlMessage {
-    UpdateServices(Vec<ServiceDeclaration>),
+    UpdateServices {
+        request_id: u64,
+        services: Vec<ServiceDeclaration>,
+    },
 }
 
 #[derive(serde::Deserialize, Serialize)]
 pub(crate) enum ServerControlMessage {
     TunnelSnapshot(Vec<ClientTunnel>),
+    ServicesApplied {
+        request_id: u64,
+        tunnels: Vec<ClientTunnel>,
+    },
 }
 
 #[derive(Clone, serde::Deserialize, Serialize)]
@@ -181,19 +188,25 @@ mod tests {
     use crate::client::ClientTunnelState;
 
     #[test]
-    fn maximum_tunnel_snapshot_fits_control_frame() {
+    fn maximum_tunnel_responses_fit_control_frame() {
         let tunnels = (0..1_024)
             .map(|index| ClientTunnel {
                 name: format!("{index:064}"),
                 kind: TunnelKind::Tcp,
                 server_port: u16::MAX,
                 local_port: Some(u16::MAX),
-                state: ClientTunnelState::Connected,
+                state: ClientTunnelState::Enabled,
             })
-            .collect();
-        let message = ServerControlMessage::TunnelSnapshot(tunnels);
-        let payload = serde_json::to_vec(&message).expect("快照应可序列化");
+            .collect::<Vec<_>>();
+        let snapshot = ServerControlMessage::TunnelSnapshot(tunnels.clone());
+        let snapshot_payload = serde_json::to_vec(&snapshot).expect("快照应可序列化");
+        let confirmation = ServerControlMessage::ServicesApplied {
+            request_id: u64::MAX,
+            tunnels,
+        };
+        let confirmation_payload = serde_json::to_vec(&confirmation).expect("回执应可序列化");
 
-        assert!(payload.len() <= MAX_CONTROL_FRAME);
+        assert!(snapshot_payload.len() <= MAX_CONTROL_FRAME);
+        assert!(confirmation_payload.len() <= MAX_CONTROL_FRAME);
     }
 }

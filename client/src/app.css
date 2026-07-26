@@ -347,7 +347,7 @@ input::placeholder {
   background: #f8faf9;
 }
 
-.tunnel-row.connected {
+.tunnel-row.enabled {
   cursor: default;
 }
 
@@ -403,7 +403,7 @@ input::placeholder {
   font-weight: 750;
 }
 
-.state-badge.connected {
+.state-badge.enabled {
   color: #176f61;
   background: #dff0eb;
 }

@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     Result, TunnelError, bootstrap,
     certificate::DownloadedServerCertificate,
+    client_control::{ClientCommand, ClientCommandReceiver, CommandResponse},
     close::{ApplicationCloseCode, connection_error_or},
     config::{
         ClientConfig, ClientServerConfig, ClientServiceConfig, TunnelKind, validate_group_key,
@@ -47,7 +48,7 @@ const CONFIG_RELOAD_RETRY_DELAY: Duration = Duration::from_millis(10);
 #[serde(rename_all = "snake_case")]
 pub enum ClientTunnelState {
     Idle,
-    Connected,
+    Enabled,
     Occupied,
 }
 
@@ -60,7 +61,7 @@ pub struct ClientTunnel {
     pub state: ClientTunnelState,
 }
 
-/// 客户端连接状态，供本机管理界面展示。
+/// 客户端控制会话状态，供本机管理界面展示。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientStatus {
     Starting,
@@ -70,7 +71,7 @@ pub enum ClientStatus {
     Connecting {
         server: String,
     },
-    Connected {
+    Online {
         server: String,
         device_id: String,
         tunnels: Vec<ClientTunnel>,
@@ -188,6 +189,31 @@ pub async fn run_client_with_status(
     shutdown: CancellationToken,
     status: watch::Sender<ClientStatus>,
 ) -> Result<()> {
+    run_client_loop(config_path, shutdown, status, None).await
+}
+
+/// 运行由命令通道管理临时隧道选择的客户端，并发布控制会话状态。
+///
+/// 配置文件中的服务列表在此模式下不会自动启用，服务选择仅在本次进程中保留。
+///
+/// # Errors
+///
+/// 初始配置无效或无法创建文件监听器时返回错误。连接类错误会在内部退避重试。
+pub async fn run_managed_client_with_status(
+    config_path: impl AsRef<Path>,
+    shutdown: CancellationToken,
+    status: watch::Sender<ClientStatus>,
+    commands: ClientCommandReceiver,
+) -> Result<()> {
+    run_client_loop(config_path, shutdown, status, Some(commands)).await
+}
+
+async fn run_client_loop(
+    config_path: impl AsRef<Path>,
+    shutdown: CancellationToken,
+    status: watch::Sender<ClientStatus>,
+    mut commands: Option<ClientCommandReceiver>,
+) -> Result<()> {
     let config_path = config_path.as_ref().to_owned();
     let mut watcher = ConfigWatcher::new(&config_path)?;
     let Some(mut config) =
@@ -196,6 +222,9 @@ pub async fn run_client_with_status(
         status.send_replace(ClientStatus::Stopped { reason: None });
         return Ok(());
     };
+    if commands.is_some() {
+        config.services.clear();
+    }
     let mut identity = DeviceIdentity::load(&config_path)?;
     let mut retry = Duration::from_secs(1);
     let mut stop_reason = None;
@@ -205,12 +234,13 @@ pub async fn run_client_with_status(
             server: config.server.address.clone(),
         });
         match connect_and_run(
-            config.clone(),
+            &mut config,
             &identity,
             &config_path,
             &mut watcher,
             &shutdown,
             &status,
+            commands.as_mut(),
         )
         .await
         {
@@ -223,7 +253,7 @@ pub async fn run_client_with_status(
                     error: error.to_string(),
                     retry_seconds: retry.as_secs(),
                 });
-                tracing::warn!(%error, delay_seconds = retry.as_secs(), "隧道连接断开，稍后重试");
+                tracing::warn!(%error, delay_seconds = retry.as_secs(), "客户端控制连接断开，稍后重试");
                 let became_unconfigured = tokio::select! {
                     () = shutdown.cancelled() => break 'running,
                     () = tokio::time::sleep(retry) => false,
@@ -233,7 +263,7 @@ pub async fn run_client_with_status(
                         }
                         match load_client_config_after_change(&config_path).await {
                             Ok(updated) => {
-                                config = updated;
+                                config = reconcile_config_update(&config, updated, commands.is_some());
                                 false
                             }
                             Err(_) => true,
@@ -247,7 +277,7 @@ pub async fn run_client_with_status(
                     else {
                         break;
                     };
-                    config = updated;
+                    config = reconcile_config_update(&config, updated, commands.is_some());
                     retry = Duration::from_secs(1);
                     continue;
                 }
@@ -259,7 +289,7 @@ pub async fn run_client_with_status(
                 else {
                     break;
                 };
-                config = updated;
+                config = reconcile_config_update(&config, updated, commands.is_some());
                 retry = Duration::from_secs(1);
             }
             ConnectionEnd::DeviceIdConflict => {
@@ -328,26 +358,34 @@ enum ConnectionStep<T> {
 }
 
 async fn connect_and_run(
-    mut config: ClientConfig,
+    config: &mut ClientConfig,
     identity: &DeviceIdentity,
     config_path: &Path,
     watcher: &mut ConfigWatcher,
     shutdown: &CancellationToken,
     status: &watch::Sender<ClientStatus>,
+    commands: Option<&mut ClientCommandReceiver>,
 ) -> ConnectionEnd {
-    let (endpoint, connection) =
-        match wait_for_connection_step(connect_server(&config), config_path, watcher, shutdown)
-            .await
-        {
-            ConnectionStep::Completed(Ok(connected)) => connected,
-            ConnectionStep::Completed(Err(error)) => return ConnectionEnd::Disconnected(error),
-            ConnectionStep::Reconfigure(updated) => return ConnectionEnd::Reconfigure(updated),
-            ConnectionStep::Unconfigured => return ConnectionEnd::Unconfigured,
-            ConnectionStep::Shutdown => return ConnectionEnd::Shutdown,
-            ConnectionStep::WatcherClosed => return config_watcher_closed(),
-        };
+    let managed = commands.is_some();
+    let (endpoint, connection) = match wait_for_connection_step(
+        connect_server(config),
+        config_path,
+        watcher,
+        shutdown,
+    )
+    .await
+    {
+        ConnectionStep::Completed(Ok(connected)) => connected,
+        ConnectionStep::Completed(Err(error)) => return ConnectionEnd::Disconnected(error),
+        ConnectionStep::Reconfigure(updated) => {
+            return ConnectionEnd::Reconfigure(reconcile_config_update(config, updated, managed));
+        }
+        ConnectionStep::Unconfigured => return ConnectionEnd::Unconfigured,
+        ConnectionStep::Shutdown => return ConnectionEnd::Shutdown,
+        ConnectionStep::WatcherClosed => return config_watcher_closed(),
+    };
     let authentication = match wait_for_connection_step(
-        authenticate(&connection, &config, identity.as_str()),
+        authenticate(&connection, config, identity.as_str()),
         config_path,
         watcher,
         shutdown,
@@ -361,7 +399,7 @@ async fn connect_and_run(
                 b"client configuration changed",
             );
             endpoint.wait_idle().await;
-            return ConnectionEnd::Reconfigure(updated);
+            return ConnectionEnd::Reconfigure(reconcile_config_update(config, updated, managed));
         }
         ConnectionStep::Unconfigured => {
             endpoint.close(
@@ -414,9 +452,9 @@ async fn connect_and_run(
     tracing::info!(
         server = %config.server.address,
         device_id = identity.as_str(),
-        "已连接 QUIC 隧道服务端"
+        "客户端控制会话已建立"
     );
-    status.send_replace(ClientStatus::Connected {
+    status.send_replace(ClientStatus::Online {
         server: config.server.address.clone(),
         device_id: identity.as_str().into(),
         tunnels,
@@ -424,7 +462,7 @@ async fn connect_and_run(
     let services = Arc::new(RwLock::new(service_map(&config.services)));
     let result = run_connected(
         &connection,
-        &mut config,
+        config,
         services,
         ConnectedContext {
             config_path,
@@ -434,6 +472,8 @@ async fn connect_and_run(
             status,
             device_id: identity.as_str(),
             shutdown,
+            commands,
+            managed,
         },
     )
     .await;
@@ -559,6 +599,14 @@ struct ConnectedContext<'a> {
     status: &'a watch::Sender<ClientStatus>,
     device_id: &'a str,
     shutdown: &'a CancellationToken,
+    commands: Option<&'a mut ClientCommandReceiver>,
+    managed: bool,
+}
+
+struct PendingServiceUpdate {
+    request_id: u64,
+    updated: ClientConfig,
+    response: Option<CommandResponse>,
 }
 
 async fn run_connected(
@@ -575,8 +623,12 @@ async fn run_connected(
         status,
         device_id,
         shutdown,
+        mut commands,
+        managed,
     } = context;
     let mut tasks = JoinSet::new();
+    let mut pending_update: Option<PendingServiceUpdate> = None;
+    let mut next_request_id = 1_u64;
     let end = loop {
         tokio::select! {
             () = shutdown.cancelled() => break ConnectionEnd::Shutdown,
@@ -589,18 +641,39 @@ async fn run_connected(
             message = read_frame::<_, ServerControlMessage>(control_receive) => {
                 match message {
                     Ok(ServerControlMessage::TunnelSnapshot(tunnels)) => {
-                        status.send_replace(ClientStatus::Connected {
+                        status.send_replace(ClientStatus::Online {
                             server: config.server.address.clone(),
                             device_id: device_id.into(),
                             tunnels,
                         });
+                    }
+                    Ok(ServerControlMessage::ServicesApplied { request_id, tunnels }) => {
+                        let Some(pending) = pending_update.take() else {
+                            break ConnectionEnd::Disconnected(TunnelError::Protocol(
+                                "收到没有对应请求的服务应用回执".into(),
+                            ));
+                        };
+                        if pending.request_id != request_id {
+                            break ConnectionEnd::Disconnected(TunnelError::Protocol(
+                                "服务应用回执编号不匹配".into(),
+                            ));
+                        }
+                        *config = pending.updated;
+                        status.send_replace(ClientStatus::Online {
+                            server: config.server.address.clone(),
+                            device_id: device_id.into(),
+                            tunnels: tunnels.clone(),
+                        });
+                        if let Some(response) = pending.response {
+                            let _ = response.send(Ok(tunnels));
+                        }
                     }
                     Err(error) => {
                         break ConnectionEnd::Disconnected(connection_error_or(connection, error));
                     }
                 }
             }
-            changed = watcher.changed() => {
+            changed = watcher.changed(), if pending_update.is_none() => {
                 if !changed {
                     break ConnectionEnd::Disconnected(TunnelError::Protocol("配置监听器已关闭".into()));
                 }
@@ -608,23 +681,48 @@ async fn run_connected(
                     break ConnectionEnd::Unconfigured;
                 };
                 if connection_identity_changed(config, &updated) {
-                    break ConnectionEnd::Reconfigure(updated);
+                    break ConnectionEnd::Reconfigure(reconcile_config_update(config, updated, managed));
                 }
-                let services_changed = config.services != updated.services;
-                let declarations = declarations(&updated.services);
-                if let Err(error) = write_frame(
+                if managed {
+                    continue;
+                }
+                let request_id = take_request_id(&mut next_request_id);
+                match begin_service_update(
+                    connection,
                     control_send,
-                    &ControlMessage::UpdateServices(declarations),
-                )
-                .await
-                {
-                    break ConnectionEnd::Disconnected(connection_error_or(connection, error));
+                    &services,
+                    config,
+                    updated,
+                    request_id,
+                    None,
+                ).await {
+                    Ok(pending) => pending_update = Some(pending),
+                    Err(error) => break ConnectionEnd::Disconnected(error),
                 }
-                if services_changed {
-                    *services.write().await = service_map(&updated.services);
-                    tracing::info!(services = updated.services.len(), "客户端服务配置已热更新");
+            }
+            command = receive_client_command(&mut commands), if pending_update.is_none() => {
+                let Some(command) = command else {
+                    commands = None;
+                    continue;
+                };
+                if command.response.is_closed() {
+                    continue;
                 }
-                *config = updated;
+                let mut updated = config.clone();
+                updated.services = command.services;
+                let request_id = take_request_id(&mut next_request_id);
+                match begin_service_update(
+                    connection,
+                    control_send,
+                    &services,
+                    config,
+                    updated,
+                    request_id,
+                    Some(command.response),
+                ).await {
+                    Ok(pending) => pending_update = Some(pending),
+                    Err(error) => break ConnectionEnd::Disconnected(error),
+                }
             }
             stream = connection.accept_bi() => match stream {
                 Ok((send, receive)) => {
@@ -646,6 +744,65 @@ async fn run_connected(
     };
     tasks.shutdown().await;
     end
+}
+
+async fn receive_client_command(
+    commands: &mut Option<&mut ClientCommandReceiver>,
+) -> Option<ClientCommand> {
+    match commands {
+        Some(commands) => commands.receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn begin_service_update(
+    connection: &Connection,
+    control_send: &mut quinn::SendStream,
+    services: &RwLock<HashMap<String, ClientServiceConfig>>,
+    current: &ClientConfig,
+    updated: ClientConfig,
+    request_id: u64,
+    response: Option<CommandResponse>,
+) -> Result<PendingServiceUpdate> {
+    *services.write().await = service_map(&updated.services);
+    let message = ControlMessage::UpdateServices {
+        request_id,
+        services: declarations(&updated.services),
+    };
+    if let Err(error) = write_frame(control_send, &message).await {
+        *services.write().await = service_map(&current.services);
+        let error = connection_error_or(connection, error);
+        if let Some(response) = response {
+            let _ = response.send(Err(error.to_string()));
+        }
+        return Err(error);
+    }
+    Ok(PendingServiceUpdate {
+        request_id,
+        updated,
+        response,
+    })
+}
+
+fn take_request_id(next: &mut u64) -> u64 {
+    let request_id = *next;
+    *next = next.wrapping_add(1).max(1);
+    request_id
+}
+
+fn reconcile_config_update(
+    current: &ClientConfig,
+    mut updated: ClientConfig,
+    managed: bool,
+) -> ClientConfig {
+    if managed {
+        if connection_identity_changed(current, &updated) {
+            updated.services.clear();
+        } else {
+            updated.services.clone_from(&current.services);
+        }
+    }
+    updated
 }
 
 async fn handle_stream(

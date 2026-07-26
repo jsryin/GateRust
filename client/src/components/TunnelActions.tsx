@@ -1,32 +1,32 @@
 import { LoaderCircle } from 'lucide-react';
 import { useEffect, useRef } from 'react';
 
-type TunnelAction = 'connect' | 'disconnect' | null;
+type TunnelAction = 'enable' | 'disable' | null;
 
 interface TunnelActionsProps {
   action: TunnelAction;
-  connectedCount: number;
+  enabledCount: number;
   idleCount: number;
-  onConnect: () => Promise<void>;
-  onDisconnect: () => Promise<void>;
+  onEnable: () => Promise<void>;
+  onDisable: () => Promise<void>;
   onToggleAll: () => void;
   selectedIdleCount: number;
 }
 
 export function TunnelActions({
   action,
-  connectedCount,
+  enabledCount,
   idleCount,
-  onConnect,
-  onDisconnect,
+  onEnable,
+  onDisable,
   onToggleAll,
   selectedIdleCount
 }: TunnelActionsProps) {
   const selectAllRef = useRef<HTMLInputElement>(null);
   const allIdleSelected = idleCount > 0 && selectedIdleCount === idleCount;
   const selectionDisabled = idleCount === 0 || action !== null;
-  const disconnectMode = connectedCount > 0 || action === 'disconnect';
-  const handleAction = disconnectMode ? onDisconnect : onConnect;
+  const disableMode = enabledCount > 0 || action === 'disable';
+  const handleAction = disableMode ? onDisable : onEnable;
 
   useEffect(() => {
     if (selectAllRef.current) {
@@ -49,17 +49,17 @@ export function TunnelActions({
           <span>全选</span>
         </label>
         <span className="action-status">
-          {selectedIdleCount ? `已选 ${selectedIdleCount} 条` : `${connectedCount} 条已连接`}
+          {selectedIdleCount ? `已选 ${selectedIdleCount} 条` : `${enabledCount} 条已启用`}
         </span>
       </div>
       <button
-        className={disconnectMode ? 'danger-button' : 'primary-button'}
-        disabled={action !== null || (!disconnectMode && selectedIdleCount === 0)}
+        className={disableMode ? 'danger-button' : 'primary-button'}
+        disabled={action !== null || (!disableMode && selectedIdleCount === 0)}
         onClick={() => void handleAction()}
         type="button"
       >
         {action && <LoaderCircle className="spin" size={16} />}
-        {disconnectMode ? '断开' : '连接'}
+        {disableMode ? '停用' : '启用'}
       </button>
     </div>
   );

@@ -8,8 +8,9 @@ use std::{collections::HashSet, future::Future, path::PathBuf, sync::Arc, time::
 
 pub use error::{ClientError, Result};
 use gaterust_tunnel::{
-    ClientConfig, ClientServiceConfig, ClientStatus, ClientTunnel, ClientTunnelState,
-    MAX_CLIENT_SERVICES, TunnelKind, run_client_with_status, verify_client_credentials,
+    ClientConfig, ClientController, ClientServiceConfig, ClientStatus, ClientTunnel,
+    ClientTunnelState, MAX_CLIENT_SERVICES, TunnelKind, client_control_channel,
+    run_managed_client_with_status, verify_client_credentials,
 };
 use tokio::{
     sync::{Mutex, watch},
@@ -25,6 +26,7 @@ pub struct ClientRuntime {
     shutdown: CancellationToken,
     task: Mutex<Option<JoinHandle<gaterust_tunnel::Result<()>>>>,
     login: Mutex<Option<LoginOperation>>,
+    controller: ClientController,
 }
 
 #[derive(Clone)]
@@ -44,6 +46,7 @@ impl LoginOperation {
 
 const LOGIN_TIMEOUT: Duration = Duration::from_mins(1);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const TUNNEL_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl ClientRuntime {
     /// 初始化配置并启动隧道后台任务。
@@ -55,16 +58,23 @@ impl ClientRuntime {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| ClientError::RuntimeUnavailable)?;
         let config_path = prepare_config_path(explicit_config_path)?;
+        clear_saved_services(&config_path)?;
 
         let config_path = Arc::new(config_path);
         let shutdown = CancellationToken::new();
         let (status_sender, status) = watch::channel(ClientStatus::Starting);
+        let (controller, commands) = client_control_channel();
         let task_status = status_sender.clone();
         let task_path = Arc::clone(&config_path);
         let task_shutdown = shutdown.clone();
         let task = runtime.spawn(async move {
-            let result =
-                run_client_with_status(task_path.as_ref(), task_shutdown, status_sender).await;
+            let result = run_managed_client_with_status(
+                task_path.as_ref(),
+                task_shutdown,
+                status_sender,
+                commands,
+            )
+            .await;
             if let Err(error) = &result {
                 task_status.send_replace(ClientStatus::Stopped {
                     reason: Some(error.to_string()),
@@ -79,6 +89,7 @@ impl ClientRuntime {
             shutdown,
             task: Mutex::new(Some(task)),
             login: Mutex::new(None),
+            controller,
         })
     }
 
@@ -222,31 +233,68 @@ impl ClientRuntime {
         }
     }
 
-    /// 将选择的空闲隧道映射到服务端指定的本地回环端口。
+    /// 启用选择的空闲隧道，并等待服务端确认最终状态。
     ///
     /// # Errors
     ///
-    /// 尚未登录、隧道不存在或已被其他客户端占用时返回错误。
-    pub async fn connect_tunnels(&self, names: Vec<String>) -> Result<ClientConfig> {
-        let ClientStatus::Connected { tunnels, .. } = self.status() else {
+    /// 控制会话未在线、隧道不可用、请求超时或服务端未能启用全部选择时返回错误。
+    pub async fn enable_tunnels(&self, names: Vec<String>) -> Result<ClientStatus> {
+        let ClientStatus::Online { tunnels, .. } = self.status() else {
             return Err(ClientError::InvalidOperation("尚未登录服务器".into()));
         };
         let services = services_for_selection(tunnels, names)?;
-
-        let mut config = self.config().await?;
-        config.services = services;
-        self.save_config(config).await
+        let requested = services
+            .iter()
+            .map(|service| service.name.clone())
+            .collect::<HashSet<_>>();
+        let tunnels = self.update_services(services).await?;
+        let enabled = tunnels
+            .iter()
+            .filter(|tunnel| tunnel.state == ClientTunnelState::Enabled)
+            .map(|tunnel| tunnel.name.as_str())
+            .collect::<HashSet<_>>();
+        let mut failed = requested
+            .iter()
+            .filter(|name| !enabled.contains(name.as_str()))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        failed.sort_unstable();
+        if !failed.is_empty() {
+            return Err(ClientError::InvalidOperation(format!(
+                "以下隧道未能启用: {}",
+                failed.join(", ")
+            )));
+        }
+        Ok(self.status())
     }
 
-    /// 释放当前客户端占用的全部隧道，同时保持服务器登录。
+    /// 停用当前客户端的全部隧道，同时保持控制会话在线。
     ///
     /// # Errors
     ///
-    /// 配置不可读写时返回错误。
-    pub async fn disconnect_tunnels(&self) -> Result<ClientConfig> {
-        let mut config = self.config().await?;
-        config.services.clear();
-        self.save_config(config).await
+    /// 控制请求超时、中断或服务端未能释放全部隧道时返回错误。
+    pub async fn disable_tunnels(&self) -> Result<ClientStatus> {
+        let tunnels = self.update_services(Vec::new()).await?;
+        if tunnels
+            .iter()
+            .any(|tunnel| tunnel.state == ClientTunnelState::Enabled)
+        {
+            return Err(ClientError::InvalidOperation("部分隧道未能停用".into()));
+        }
+        Ok(self.status())
+    }
+
+    async fn update_services(
+        &self,
+        services: Vec<ClientServiceConfig>,
+    ) -> Result<Vec<ClientTunnel>> {
+        tokio::time::timeout(
+            TUNNEL_OPERATION_TIMEOUT,
+            self.controller.update_services(services),
+        )
+        .await
+        .map_err(|_| ClientError::TunnelOperationTimeout)?
+        .map_err(ClientError::from)
     }
 
     /// 返回最近一次连接状态。
@@ -388,6 +436,22 @@ pub fn prepare_config_path(explicit_config_path: Option<PathBuf>) -> Result<Path
     Ok(path)
 }
 
+fn clear_saved_services(path: &std::path::Path) -> Result<()> {
+    let Ok(mut config) = ClientConfig::read(path) else {
+        return Ok(());
+    };
+    if config.services.is_empty() {
+        return Ok(());
+    }
+    // 桌面端的隧道选择是进程内状态，避免重新打开应用时未经确认自动启用。
+    config.services.clear();
+    if config.validate().is_err() {
+        return Ok(());
+    }
+    config.save(path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, generate_simple_self_signed};
@@ -434,6 +498,29 @@ mod tests {
         }];
 
         assert!(services_for_selection(tunnels, vec!["ssh".into()]).is_err());
+    }
+
+    #[test]
+    fn removes_legacy_saved_services_for_desktop_runtime() {
+        let directory = tempfile::tempdir().expect("创建测试目录");
+        let path = directory.path().join("client.toml");
+        let mut config = ClientConfig::initial();
+        config.server.address = "127.0.0.1:2333".into();
+        config.services.push(ClientServiceConfig {
+            name: "ssh".into(),
+            kind: TunnelKind::Tcp,
+            target: Some("127.0.0.1:22".into()),
+        });
+        config.save(&path).expect("保存旧版客户端配置");
+
+        clear_saved_services(&path).expect("清理旧版持久化服务");
+
+        assert!(
+            ClientConfig::read(&path)
+                .expect("读取迁移后的客户端配置")
+                .services
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -594,7 +681,7 @@ key = "{TEST_KEY}"
         ClientConfig::load(&config_path).expect("下载的证书应能加载");
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if matches!(runtime.status(), ClientStatus::Connected { .. }) {
+                if matches!(runtime.status(), ClientStatus::Online { .. }) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -653,6 +740,7 @@ key = "{TEST_KEY}"
             shutdown: CancellationToken::new(),
             task: Mutex::new(Some(task)),
             login: Mutex::new(None),
+            controller: client_control_channel().0,
         };
 
         let result = runtime

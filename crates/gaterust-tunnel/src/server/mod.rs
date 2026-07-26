@@ -258,6 +258,7 @@ async fn authenticate(
         .await?;
         return Err(TunnelError::Protocol("密钥或设备信息无效".into()));
     };
+    let declared_services = hello.services.len();
     match runtime
         .register(
             id,
@@ -292,12 +293,17 @@ async fn authenticate(
     }
     // 先确认已观察到注册变更，再生成快照；后续变更不会在握手窗口内丢失。
     changes.borrow_and_update();
+    let tunnels = runtime.catalog(id).await;
+    let active_tunnels = tunnels
+        .iter()
+        .filter(|tunnel| tunnel.state == crate::ClientTunnelState::Enabled)
+        .count();
     if let Err(error) = write_frame(
         &mut send,
         &ServerHandshake::Authenticate(ServerHello {
             status: AuthenticationStatus::Accepted,
             message: String::new(),
-            tunnels: runtime.catalog(id).await,
+            tunnels,
         }),
     )
     .await
@@ -308,18 +314,57 @@ async fn authenticate(
     drop(authentication_permit);
 
     let device_id = hello.device_id;
-    tracing::info!(session_id = id, group, %device_id, %remote, "内网客户端已上线");
+    tracing::info!(
+        session_id = id,
+        group,
+        %device_id,
+        %remote,
+        declared_services,
+        active_tunnels,
+        "客户端控制会话已上线"
+    );
     let result = loop {
         tokio::select! {
             error = connection.closed() => break SessionEnd::Connection(error),
             message = read_frame::<_, ControlMessage>(&mut receive) => {
                 match message {
-                    Ok(ControlMessage::UpdateServices(services)) => {
+                    Ok(ControlMessage::UpdateServices { request_id, services }) => {
                         if let Err(error) = validate_declarations(&services) {
                             break SessionEnd::Control(error);
                         }
-                        runtime.update_services(id, services).await;
-                        tracing::info!(group, %device_id, "客户端服务声明已更新");
+                        let Some(update) = runtime.update_services(id, services).await else {
+                            break SessionEnd::Control(TunnelError::Protocol("客户端会话已注销".into()));
+                        };
+                        // 回执中的快照已经覆盖本次运行时修订，避免再向请求方发送重复快照。
+                        changes.borrow_and_update();
+                        let response = ServerControlMessage::ServicesApplied {
+                            request_id,
+                            tunnels: runtime.catalog(id).await,
+                        };
+                        if let Err(error) = write_frame(&mut send, &response).await {
+                            break session_end(&connection, error);
+                        }
+                        if update.changed {
+                            tracing::info!(
+                                session_id = id,
+                                group,
+                                %device_id,
+                                declared_services = update.declared_services,
+                                active_tunnels = update.active_tunnels,
+                                claimed_tunnels = update.claimed_tunnels,
+                                released_tunnels = update.released_tunnels,
+                                "客户端隧道声明已应用"
+                            );
+                        } else {
+                            tracing::debug!(
+                                session_id = id,
+                                group,
+                                %device_id,
+                                declared_services = update.declared_services,
+                                active_tunnels = update.active_tunnels,
+                                "客户端隧道声明无变化"
+                            );
+                        }
                     }
                     Err(error) => break session_end(&connection, error),
                 }
@@ -366,13 +411,20 @@ fn log_session_end(
 ) {
     match end {
         SessionEnd::Connection(error) if is_expected_client_close(error) => {
-            tracing::info!(session_id, group, device_id, %remote, %error, "内网客户端已下线");
+            tracing::info!(
+                session_id,
+                group,
+                %device_id,
+                %remote,
+                reason = %error,
+                "客户端控制会话已下线"
+            );
         }
         SessionEnd::Connection(error) => {
-            tracing::warn!(session_id, group, device_id, %remote, %error, "内网客户端连接异常结束");
+            tracing::warn!(session_id, group, %device_id, %remote, %error, "客户端控制会话异常结束");
         }
         SessionEnd::Control(error) => {
-            tracing::warn!(session_id, group, device_id, %remote, %error, "内网客户端控制通道异常结束");
+            tracing::warn!(session_id, group, %device_id, %remote, %error, "客户端控制通道异常结束");
         }
     }
 }

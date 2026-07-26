@@ -31,9 +31,9 @@ export function App() {
   const [submitting, setSubmitting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [editingConfig, setEditingConfig] = useState(false);
-  const [action, setAction] = useState<'connect' | 'disconnect' | null>(null);
+  const [action, setAction] = useState<'enable' | 'disable' | null>(null);
   const [error, setError] = useState('');
-  const connectedIdentity = useRef('');
+  const onlineIdentity = useRef('');
   const knownTunnels = useRef<Set<string>>(new Set());
   const loginCancellationRequested = useRef(false);
   const configBeforeEdit = useRef<{ address: string; key: string } | null>(null);
@@ -98,16 +98,16 @@ export function App() {
   }, [refreshStatus]);
 
   useEffect(() => {
-    if (status.state !== 'connected' || !status.device_id) return;
+    if (status.state !== 'online' || !status.device_id) return;
     const identity = `${status.server ?? ''}/${status.device_id}`;
     const currentNames = new Set(status.tunnels.map((tunnel) => tunnel.name));
     setSelected((current) => {
-      const sameIdentity = connectedIdentity.current === identity;
+      const sameIdentity = onlineIdentity.current === identity;
       const next = sameIdentity ? new Set(current) : new Set<string>();
       let changed = !sameIdentity && current.size > 0;
       for (const tunnel of status.tunnels) {
         if (
-          tunnel.state === 'connected' ||
+          tunnel.state === 'enabled' ||
           (tunnel.state === 'idle' && !knownTunnels.current.has(tunnel.name))
         ) {
           if (!next.has(tunnel.name)) {
@@ -127,7 +127,7 @@ export function App() {
       }
       return changed ? next : current;
     });
-    connectedIdentity.current = identity;
+    onlineIdentity.current = identity;
     knownTunnels.current = currentNames;
   }, [status]);
 
@@ -136,7 +136,7 @@ export function App() {
     loginCancellationRequested.current = false;
     setSubmitting(true);
     setError('');
-    connectedIdentity.current = '';
+    onlineIdentity.current = '';
     knownTunnels.current = new Set();
     try {
       applyConfig(await desktop.login(address, key));
@@ -168,56 +168,56 @@ export function App() {
     }
   }
 
-  async function connect(): Promise<void> {
+  async function enable(): Promise<void> {
     if (action) return;
-    setAction('connect');
+    setAction('enable');
     setError('');
     try {
-      await desktop.connectTunnels(tunnelSelection.selectedIdleNames);
-      await refreshStatus();
+      setStatus(await desktop.enableTunnels(tunnelSelection.selectedIdleNames));
     } catch (cause) {
-      setError(errorMessage(cause, '连接隧道失败'));
+      setError(errorMessage(cause, '启用隧道失败'));
+      await refreshStatus();
     } finally {
       setAction(null);
     }
   }
 
-  async function disconnect(): Promise<void> {
+  async function disable(): Promise<void> {
     if (action) return;
-    setAction('disconnect');
+    setAction('disable');
     setError('');
     try {
-      await desktop.disconnectTunnels();
-      await refreshStatus();
+      setStatus(await desktop.disableTunnels());
     } catch (cause) {
-      setError(errorMessage(cause, '断开隧道失败'));
+      setError(errorMessage(cause, '停用隧道失败'));
+      await refreshStatus();
     } finally {
       setAction(null);
     }
   }
 
-  const connected = status.state === 'connected';
-  const showTunnelView = connected && !editingConfig;
+  const online = status.state === 'online';
+  const showTunnelView = online && !editingConfig;
   const tunnelSelection = useMemo(() => {
     const idleNames: string[] = [];
     const selectedIdleNames: string[] = [];
-    let connectedCount = 0;
+    let enabledCount = 0;
 
     for (const tunnel of status.tunnels) {
       if (tunnel.state === 'idle') {
         idleNames.push(tunnel.name);
         if (selected.has(tunnel.name)) selectedIdleNames.push(tunnel.name);
-      } else if (tunnel.state === 'connected') {
-        connectedCount += 1;
+      } else if (tunnel.state === 'enabled') {
+        enabledCount += 1;
       }
     }
 
-    return { connectedCount, idleNames, selectedIdleNames };
+    return { enabledCount, idleNames, selectedIdleNames };
   }, [selected, status.tunnels]);
 
   function toggleAllIdle(): void {
     setSelected((current) => {
-      // 全选仅增删当前空闲项，已连接和被占用项始终保持原状态。
+      // 全选仅增删当前空闲项，已启用和被占用项始终保持原状态。
       const selectAll = tunnelSelection.idleNames.some((name) => !current.has(name));
       const next = new Set(current);
       for (const name of tunnelSelection.idleNames) {
@@ -282,10 +282,10 @@ export function App() {
             />
             <TunnelActions
               action={action}
-              connectedCount={tunnelSelection.connectedCount}
+              enabledCount={tunnelSelection.enabledCount}
               idleCount={tunnelSelection.idleNames.length}
-              onConnect={connect}
-              onDisconnect={disconnect}
+              onEnable={enable}
+              onDisable={disable}
               onToggleAll={toggleAllIdle}
               selectedIdleCount={tunnelSelection.selectedIdleNames.length}
             />

@@ -1,9 +1,11 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use tokio::sync::mpsc;
 
 use crate::{Result, TunnelError};
+
+const CHANGE_QUIET_PERIOD: Duration = Duration::from_millis(50);
 
 pub(crate) struct ConfigWatcher {
     _watcher: RecommendedWatcher,
@@ -52,6 +54,43 @@ impl ConfigWatcher {
     }
 
     pub(crate) async fn changed(&mut self) -> bool {
-        self.receiver.recv().await.is_some()
+        if self.receiver.recv().await.is_none() {
+            return false;
+        }
+        // 原子替换在部分平台会产生删除、创建等多个事件，等待短暂静默后只重载一次。
+        loop {
+            match tokio::time::timeout(CHANGE_QUIET_PERIOD, self.receiver.recv()).await {
+                Ok(Some(())) => {}
+                Ok(None) | Err(_) => return true,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn coalesces_atomic_replace_events() {
+        let directory = tempfile::tempdir().expect("创建测试目录");
+        let path = directory.path().join("client.toml");
+        std::fs::write(&path, "initial").expect("写入初始文件");
+        let mut watcher = ConfigWatcher::new(&path).expect("创建配置监听器");
+
+        std::fs::remove_file(&path).expect("删除旧文件");
+        std::fs::write(&path, "updated").expect("写入替换文件");
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), watcher.changed())
+                .await
+                .expect("应检测到配置替换")
+        );
+        assert!(
+            tokio::time::timeout(CHANGE_QUIET_PERIOD * 2, watcher.changed())
+                .await
+                .is_err(),
+            "同一次原子替换不应留下第二个变化事件"
+        );
     }
 }

@@ -39,24 +39,26 @@ pub(crate) async fn cancel_login(runtime: State<'_, ClientRuntime>) -> CommandRe
 }
 
 #[tauri::command]
-pub(crate) async fn connect_tunnels(
+pub(crate) async fn enable_tunnels(
     runtime: State<'_, ClientRuntime>,
     names: Vec<String>,
-) -> CommandResult<()> {
-    runtime
-        .connect_tunnels(names)
+) -> CommandResult<StatusResponse> {
+    let status = runtime
+        .enable_tunnels(names)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(StatusResponse::from(status))
 }
 
 #[tauri::command]
-pub(crate) async fn disconnect_tunnels(runtime: State<'_, ClientRuntime>) -> CommandResult<()> {
-    runtime
-        .disconnect_tunnels()
+pub(crate) async fn disable_tunnels(
+    runtime: State<'_, ClientRuntime>,
+) -> CommandResult<StatusResponse> {
+    let status = runtime
+        .disable_tunnels()
         .await
         .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(StatusResponse::from(status))
 }
 
 #[tauri::command]
@@ -79,16 +81,16 @@ impl From<ClientStatus> for StatusResponse {
                 server: Some(server),
                 ..Self::new("connecting")
             },
-            ClientStatus::Connected {
+            ClientStatus::Online {
                 server,
                 device_id,
                 tunnels,
             } => Self {
-                state: "connected",
+                state: "online",
                 server: Some(server),
                 device_id: Some(device_id),
                 tunnels,
-                ..Self::new("connected")
+                ..Self::new("online")
             },
             ClientStatus::Reconnecting {
                 error,
@@ -118,5 +120,22 @@ impl StatusResponse {
             retry_seconds: None,
             tunnels: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_online_control_session_state() {
+        let response = StatusResponse::from(ClientStatus::Online {
+            server: "127.0.0.1:2333".into(),
+            device_id: "test-device".into(),
+            tunnels: Vec::new(),
+        });
+
+        assert_eq!(response.state, "online");
+        assert_eq!(response.server.as_deref(), Some("127.0.0.1:2333"));
     }
 }

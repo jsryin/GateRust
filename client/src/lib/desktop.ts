@@ -16,7 +16,7 @@ export const desktop = {
   login: (serverAddress: string, key: string) =>
     command<ClientConfig>('login', { serverAddress, key }),
   cancelLogin: () => command<void>('cancel_login'),
-  connectTunnels: (names: string[]) => command<void>('connect_tunnels', { names }),
-  disconnectTunnels: () => command<void>('disconnect_tunnels'),
+  enableTunnels: (names: string[]) => command<ClientStatus>('enable_tunnels', { names }),
+  disableTunnels: () => command<ClientStatus>('disable_tunnels'),
   show: () => getCurrentWindow().show()
 };

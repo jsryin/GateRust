@@ -5,6 +5,7 @@ use std::path::Path;
 mod bootstrap;
 mod certificate;
 mod client;
+mod client_control;
 mod close;
 mod config;
 mod error;
@@ -20,8 +21,10 @@ mod watcher;
 pub use certificate::{DownloadedServerCertificate, server_name_from_pem};
 pub use client::{
     ClientStatus, ClientTunnel, ClientTunnelState, fetch_server_certificate, run_client,
-    run_client_with_shutdown, run_client_with_status, verify_client_credentials,
+    run_client_with_shutdown, run_client_with_status, run_managed_client_with_status,
+    verify_client_credentials,
 };
+pub use client_control::{ClientCommandReceiver, ClientController, client_control_channel};
 pub use config::{
     ClientConfig, ClientServerConfig, ClientServiceConfig, GroupConfig, MAX_CLIENT_SERVICES,
     ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind, generate_group_key,

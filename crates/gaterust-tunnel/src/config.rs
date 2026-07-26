@@ -389,38 +389,7 @@ impl ClientConfig {
         }
         self.server_name()?;
 
-        if self.services.len() > MAX_CLIENT_SERVICES {
-            return Err(TunnelError::InvalidConfig(format!(
-                "单个客户端最多声明 {MAX_CLIENT_SERVICES} 个服务"
-            )));
-        }
-        let mut names = HashSet::new();
-        for service in &self.services {
-            validate_name("服务", &service.name)?;
-            if !names.insert(service.name.as_str()) {
-                return Err(TunnelError::InvalidConfig(format!(
-                    "服务名称重复: {}",
-                    service.name
-                )));
-            }
-            match (&service.kind, &service.target) {
-                (TunnelKind::Tcp | TunnelKind::Udp, Some(target)) if !target.is_empty() => {}
-                (TunnelKind::Socks5, None) => {}
-                (TunnelKind::Socks5, Some(_)) => {
-                    return Err(TunnelError::InvalidConfig(format!(
-                        "SOCKS5 服务 {} 不应配置固定 target",
-                        service.name
-                    )));
-                }
-                _ => {
-                    return Err(TunnelError::InvalidConfig(format!(
-                        "TCP/UDP 服务 {} 必须配置 target",
-                        service.name
-                    )));
-                }
-            }
-        }
-        Ok(())
+        validate_client_services(&self.services)
     }
 
     pub(crate) fn server_name(&self) -> Result<&str> {
@@ -433,6 +402,41 @@ impl ClientConfig {
         address_host(&self.server.address)
             .ok_or_else(|| TunnelError::InvalidConfig("无法从服务器地址推导 TLS 服务器名称".into()))
     }
+}
+
+pub(crate) fn validate_client_services(services: &[ClientServiceConfig]) -> Result<()> {
+    if services.len() > MAX_CLIENT_SERVICES {
+        return Err(TunnelError::InvalidConfig(format!(
+            "单个客户端最多声明 {MAX_CLIENT_SERVICES} 个服务"
+        )));
+    }
+    let mut names = HashSet::new();
+    for service in services {
+        validate_name("服务", &service.name)?;
+        if !names.insert(service.name.as_str()) {
+            return Err(TunnelError::InvalidConfig(format!(
+                "服务名称重复: {}",
+                service.name
+            )));
+        }
+        match (&service.kind, &service.target) {
+            (TunnelKind::Tcp | TunnelKind::Udp, Some(target)) if !target.is_empty() => {}
+            (TunnelKind::Socks5, None) => {}
+            (TunnelKind::Socks5, Some(_)) => {
+                return Err(TunnelError::InvalidConfig(format!(
+                    "SOCKS5 服务 {} 不应配置固定 target",
+                    service.name
+                )));
+            }
+            _ => {
+                return Err(TunnelError::InvalidConfig(format!(
+                    "TCP/UDP 服务 {} 必须配置 target",
+                    service.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_config<T: DeserializeOwned>(path: &Path) -> Result<T> {

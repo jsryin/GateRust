@@ -4,14 +4,16 @@ use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, generate_simple_
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream, UdpSocket},
+    sync::watch,
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ClientConfig, ClientServerConfig, ClientTunnelState, TunnelError, TunnelRuntime,
-    TunnelRuntimeSnapshot, check_server_config, fetch_server_certificate, run_client_with_shutdown,
-    run_server_with_runtime, verify_client_credentials,
+    ClientConfig, ClientServerConfig, ClientServiceConfig, ClientStatus, ClientTunnelState,
+    TunnelError, TunnelKind, TunnelRuntime, TunnelRuntimeSnapshot, check_server_config,
+    client_control_channel, fetch_server_certificate, run_client_with_shutdown,
+    run_managed_client_with_status, run_server_with_runtime, verify_client_credentials,
 };
 
 const TEST_KEY: &str = "12345678901234567890123456789012";
@@ -105,6 +107,108 @@ async fn bootstraps_certificate_with_key_proof_and_checks_credentials() {
     assert_task_ok(server, "服务端").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_client_applies_confirmed_ephemeral_tunnel_selection() {
+    let directory = tempfile::tempdir().expect("应能创建测试目录");
+    write_certificate(directory.path());
+    let quic = unused_udp_address();
+    let public = unused_tcp_address();
+    write_server_config(
+        directory.path(),
+        quic,
+        public,
+        unused_udp_address(),
+        unused_tcp_address(),
+        true,
+    );
+    write_client_config(
+        directory.path(),
+        quic,
+        "127.0.0.1:9".parse().expect("测试目标地址有效"),
+        unused_udp_address(),
+        true,
+    );
+
+    let cancellation = CancellationToken::new();
+    let runtime = TunnelRuntime::new();
+    let server_path = directory.path().join("server.toml");
+    let server_cancel = cancellation.clone();
+    let server_runtime = runtime.clone();
+    let server = tokio::spawn(async move {
+        run_server_with_runtime(server_path, server_runtime, server_cancel).await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client_path = directory.path().join("client.toml");
+    let client_cancel = cancellation.clone();
+    let (controller, commands) = client_control_channel();
+    let (status, _status_receiver) = watch::channel(ClientStatus::Starting);
+    let client = tokio::spawn(async move {
+        run_managed_client_with_status(client_path, client_cancel, status, commands).await
+    });
+    wait_for_runtime(&runtime, |snapshot| {
+        snapshot.clients.len() == 1
+            && snapshot
+                .tunnels
+                .iter()
+                .all(|tunnel| tunnel.owner_session_id.is_none())
+    })
+    .await;
+
+    let services = vec![ClientServiceConfig {
+        name: "tcp-echo".into(),
+        kind: TunnelKind::Tcp,
+        target: Some("127.0.0.1:9".into()),
+    }];
+    let enabled = tokio::time::timeout(
+        Duration::from_secs(2),
+        controller.update_services(services.clone()),
+    )
+    .await
+    .expect("启用请求不应超时")
+    .expect("启用请求应成功");
+    assert!(
+        enabled
+            .iter()
+            .find(|tunnel| tunnel.name == "tcp-echo")
+            .is_some_and(|tunnel| tunnel.state == ClientTunnelState::Enabled)
+    );
+
+    let mut changes = runtime.subscribe();
+    changes.borrow_and_update();
+    controller
+        .update_services(services)
+        .await
+        .expect("重复启用应返回当前状态");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), changes.changed())
+            .await
+            .is_err(),
+        "无状态变化的重复声明不应广播运行时更新"
+    );
+
+    let disabled = controller
+        .update_services(Vec::new())
+        .await
+        .expect("停用请求应成功");
+    assert!(
+        disabled
+            .iter()
+            .all(|tunnel| tunnel.state != ClientTunnelState::Enabled)
+    );
+    let snapshot = runtime.snapshot().await;
+    assert!(
+        snapshot
+            .tunnels
+            .iter()
+            .all(|tunnel| tunnel.owner_session_id.is_none())
+    );
+
+    cancellation.cancel();
+    assert_task_ok(server, "服务端").await;
+    assert_task_ok(client, "客户端").await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forwards_tcp_udp_and_socks5() {
     let directory = tempfile::tempdir().expect("应能创建测试目录");
@@ -170,21 +274,17 @@ async fn forwards_tcp_udp_and_socks5() {
         .expect("应能建立持久 TCP 隧道");
     exchange(&mut persistent, b"before-reload").await;
 
-    let mut runtime_changes = runtime.subscribe();
-    runtime_changes.borrow_and_update();
     let client_config = std::fs::read(&client_path).expect("应能暂存客户端配置");
     std::fs::remove_file(&client_path).expect("应能模拟 Windows 配置替换空窗");
     tokio::time::sleep(Duration::from_millis(25)).await;
     std::fs::write(&client_path, client_config).expect("应能完成客户端配置替换");
-    tokio::time::timeout(Duration::from_secs(2), runtime_changes.changed())
-        .await
-        .expect("服务端应收到合并后的配置更新")
-        .expect("运行时状态通道保持打开");
+    tokio::time::sleep(Duration::from_millis(150)).await;
     let snapshot = runtime.snapshot().await;
     assert_eq!(snapshot.clients.len(), 1);
     assert_eq!(snapshot.clients[0].session_id, session_id);
     exchange(&mut persistent, b"after-config-replace").await;
 
+    let mut runtime_changes = runtime.subscribe();
     runtime_changes.borrow_and_update();
     write_client_config(
         directory.path(),

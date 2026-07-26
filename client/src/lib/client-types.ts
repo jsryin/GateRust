@@ -18,7 +18,7 @@ export interface ClientConfig {
   services: ClientServiceConfig[];
 }
 
-export type ClientTunnelState = 'idle' | 'connected' | 'occupied';
+export type ClientTunnelState = 'idle' | 'enabled' | 'occupied';
 
 export interface ClientTunnel {
   name: string;
@@ -32,7 +32,7 @@ export type ClientStatusState =
   | 'starting'
   | 'unconfigured'
   | 'connecting'
-  | 'connected'
+  | 'online'
   | 'reconnecting'
   | 'stopped'
   | 'offline';

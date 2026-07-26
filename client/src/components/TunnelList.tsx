@@ -15,7 +15,7 @@ const kindLabels: Record<TunnelKind, string> = {
 
 const stateLabels = {
   idle: '空闲',
-  connected: '已连接',
+  enabled: '已启用',
   occupied: '被占用'
 } as const;
 
@@ -39,7 +39,7 @@ export function TunnelList({ onToggle, selected, tunnels }: TunnelListProps) {
           return (
             <label className={`tunnel-row ${tunnel.state}`} key={tunnel.name}>
               <input
-                checked={tunnel.state === 'connected' || selected.has(tunnel.name)}
+                checked={tunnel.state === 'enabled' || selected.has(tunnel.name)}
                 disabled={unavailable}
                 onChange={() => onToggle(tunnel.name)}
                 type="checkbox"

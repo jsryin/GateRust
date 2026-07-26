@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -53,6 +53,14 @@ pub(crate) struct ClientSession {
 pub(crate) enum RegisterError {
     DeviceIdConflict,
     Capacity,
+}
+
+pub(crate) struct ServiceUpdate {
+    pub(crate) declared_services: usize,
+    pub(crate) active_tunnels: usize,
+    pub(crate) claimed_tunnels: usize,
+    pub(crate) released_tunnels: usize,
+    pub(crate) changed: bool,
 }
 
 #[derive(Default)]
@@ -195,16 +203,39 @@ impl TunnelRuntime {
         Ok(())
     }
 
-    pub(crate) async fn update_services(&self, id: u64, services: Vec<ServiceDeclaration>) {
+    pub(crate) async fn update_services(
+        &self,
+        id: u64,
+        services: Vec<ServiceDeclaration>,
+    ) -> Option<ServiceUpdate> {
         let mut state = self.state.write().await;
-        let Some(session) = state.sessions.get_mut(&id) else {
-            return;
-        };
-        session.services = service_map(services);
+        if !state.sessions.contains_key(&id) {
+            return None;
+        }
+        let previously_owned = owned_tunnels(&state, id);
+        let services = service_map(services);
+        let session = state.sessions.get_mut(&id)?;
+        let declarations_changed = session.services != services;
+        session.services = services;
+        let declared_services = session.services.len();
         retain_valid_owners(&mut state);
         claim_available(&mut state, id);
+        let currently_owned = owned_tunnels(&state, id);
+        let claimed_tunnels = currently_owned.difference(&previously_owned).count();
+        let released_tunnels = previously_owned.difference(&currently_owned).count();
+        let changed = declarations_changed || claimed_tunnels != 0 || released_tunnels != 0;
+        let update = ServiceUpdate {
+            declared_services,
+            active_tunnels: currently_owned.len(),
+            claimed_tunnels,
+            released_tunnels,
+            changed,
+        };
         drop(state);
-        self.notify();
+        if changed {
+            self.notify();
+        }
+        Some(update)
     }
 
     pub(crate) async fn unregister(&self, id: u64) {
@@ -237,7 +268,7 @@ impl TunnelRuntime {
             .map(|(name, spec)| {
                 let state = match state.owners.get(name) {
                     None => ClientTunnelState::Idle,
-                    Some(owner) if *owner == session_id => ClientTunnelState::Connected,
+                    Some(owner) if *owner == session_id => ClientTunnelState::Enabled,
                     Some(_) => ClientTunnelState::Occupied,
                 };
                 ClientTunnel {
@@ -281,6 +312,15 @@ fn retain_valid_owners(state: &mut RuntimeState) {
 
 fn release_session(state: &mut RuntimeState, session_id: u64) {
     state.owners.retain(|_, owner| *owner != session_id);
+}
+
+fn owned_tunnels(state: &RuntimeState, session_id: u64) -> HashSet<String> {
+    state
+        .owners
+        .iter()
+        .filter(|&(_, owner)| *owner == session_id)
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 fn claim_available(state: &mut RuntimeState, session_id: u64) {
