@@ -11,33 +11,21 @@ GateRust 是一个基于 Rust 的内网穿透与反向代理工具，提供 QUIC
 - 支持 Let's Encrypt、Google Trust Services，以及 HTTP-01、TLS-ALPN-01、Cloudflare DNS-01 验证。
 - Web 控制台提供管理员认证、配置管理、热重载状态和客户端配置生成。
 
-## Linux 服务端部署
+## Release 二进制
 
-支持使用 systemd 的 x86_64 和 aarch64 Linux。安装脚本会校验版本、架构和 SHA-256：
+每个版本只发布服务端和命令行客户端的原始可执行文件，覆盖 Linux amd64/arm/arm64、macOS amd64/arm64 和 Windows amd64/arm64。文件名中的版本号不包含标签前导 `v`，Windows 文件带 `.exe` 后缀。
 
-```bash
-curl -fsSL https://github.com/jsryin/GateRust/releases/latest/download/gaterust.sh | sudo sh
-```
-
-交互安装可选择 `tunnel`、`proxy` 和 `web` 模块；无人值守安装示例：
+以 Linux amd64 服务端为例：
 
 ```bash
-sudo sh gaterust.sh install \
-  --modules tunnel,proxy,web \
-  --init-tunnel --init-proxy --enable
+version=0.1.1-beta.1
+curl -fLO "https://github.com/jsryin/GateRust/releases/download/v${version}/gaterust_server_${version}_linux_amd64"
+chmod +x "gaterust_server_${version}_linux_amd64"
 ```
 
-常用管理命令：
+配置示例和 systemd unit 位于源码仓库的 `config` 与 `scripts` 目录。Web 控制台静态文件需单独构建或部署。
 
-```bash
-gaterust start
-gaterust restart
-gaterust status
-gaterust logs
-gaterust uninstall --all --yes
-```
-
-配置位于 `/etc/gaterust`，运行数据位于 `/var/lib/gaterust`。`--init-tunnel` 生成的自签名证书位于 `/etc/gaterust/tunnel/server.pem`。
+服务端隧道证书默认位于配置指定的路径；使用仓库 systemd 示例部署时建议放在 `/etc/gaterust/tunnel/server.pem`。
 
 旧版本的 `--init-tunnel` 可能生成 `Basic Constraints CA:TRUE` 的证书，新版本会在服务端启动前拒绝将其作为叶证书。可先用以下命令确认：
 
