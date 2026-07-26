@@ -9,7 +9,23 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+      - name: Verify release versions
+        env:
+          TAG: ${{ github.ref_name }}
+        run: node scripts/verify-release-version.mjs
+
   server:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -47,8 +63,6 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -eu
-          test "$(sed -n 's/^version = "\([^"]*\)"/v\1/p' Cargo.toml | head -n 1)" = "$TAG"
-          grep -Fqx "SCRIPT_VERSION=\"$TAG\"" scripts/gaterust.sh
           stage="dist/gaterust-$ASSET_ARCH-linux-musl"
           mkdir -p "$stage/config"
           install -m 0755 "target/$TARGET/release/gaterust-server" "$stage/gaterust-server"
@@ -67,6 +81,7 @@ jobs:
           if-no-files-found: error
 
   client:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -111,10 +126,6 @@ jobs:
           node-version: 24.18.0
           cache: pnpm
           cache-dependency-path: client/pnpm-lock.yaml
-      - name: Verify client versions
-        env:
-          TAG: ${{ github.ref_name }}
-        run: node -e "const fs=require('node:fs');const cargo=fs.readFileSync('Cargo.toml','utf8').match(/version = \"([^\"]+)\"/)[1];const desktop=require('./client/package.json').version;if ('v'+cargo!==process.env.TAG || desktop!==cargo) throw new Error('client versions do not match release tag')"
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         run: |

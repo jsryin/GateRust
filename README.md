@@ -98,7 +98,7 @@ RC=llvm-rc-21 pnpm --dir client exec tauri build \
     -- --locked
 ```
 安装包输出位置：
-target/x86_64-pc-windows-msvc/release/bundle/nsis/GateRust Client_0.1.0_x64-setup.exe
+target/x86_64-pc-windows-msvc/release/bundle/nsis/GateRust Client_*_x64-setup.exe
 
 
 ## 本地测试

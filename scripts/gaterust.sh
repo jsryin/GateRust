@@ -2,7 +2,7 @@
 
 set -eu
 
-SCRIPT_VERSION="v0.1.0"
+SCRIPT_VERSION="v0.1.1-beta.1"
 REPOSITORY="jsryin/GateRust"
 ROOT="${GATERUST_ROOT:-}"
 SYSTEMCTL="${GATERUST_SYSTEMCTL:-systemctl}"

@@ -1422,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "gaterust-client"
-version = "0.1.0"
+version = "0.1.1-beta.1"
 dependencies = [
  "clap",
  "gaterust-tunnel",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "gaterust-client-desktop"
-version = "0.1.0"
+version = "0.1.1-beta.1"
 dependencies = [
  "gaterust-client",
  "gaterust-tunnel",
@@ -1454,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "gaterust-control"
-version = "0.1.0"
+version = "0.1.1-beta.1"
 dependencies = [
  "argon2",
  "axum",
@@ -1480,7 +1480,7 @@ dependencies = [
 
 [[package]]
 name = "gaterust-proxy"
-version = "0.1.0"
+version = "0.1.1-beta.1"
 dependencies = [
  "acme2-eab",
  "base64 0.22.1",
@@ -1513,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "gaterust-server"
-version = "0.1.0"
+version = "0.1.1-beta.1"
 dependencies = [
  "clap",
  "gaterust-control",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "gaterust-tunnel"
-version = "0.1.0"
+version = "0.1.1-beta.1"
 dependencies = [
  "atomic-write-file",
  "futures-util",
