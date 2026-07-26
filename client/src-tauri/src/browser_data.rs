@@ -94,7 +94,9 @@ fn migrate_macos(application: &App) -> tauri::Result<()> {
     let cleanup = tauri::WebviewWindowBuilder::new(
         application,
         "browser-data-cleanup",
-        tauri::WebviewUrl::External(tauri::Url::parse("about:blank")?),
+        tauri::WebviewUrl::External(
+            tauri::Url::parse("about:blank").map_err(tauri::Error::InvalidUrl)?,
+        ),
     )
     .visible(false)
     .incognito(false)
