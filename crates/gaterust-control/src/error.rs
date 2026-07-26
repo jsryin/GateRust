@@ -13,12 +13,16 @@ pub enum ControlError {
     InvalidConfig(String),
     #[error("{kind}不存在: {name}")]
     ResourceNotFound { kind: &'static str, name: String },
+    #[error("{0}")]
+    ResourceConflict(String),
     #[error("读取运行配置失败: {0}")]
     ReadRuntimeConfig(String),
     #[error("写入运行配置失败: {0}")]
     WriteRuntimeConfig(String),
     #[error("配置已保存，但隧道运行时应用失败: {0}")]
     TunnelRuntimeApply(String),
+    #[error("配置已保存，但代理运行时应用失败: {0}")]
+    ProxyRuntimeApply(String),
     #[error("启动配置文件监听失败: {0}")]
     Watch(#[from] notify::Error),
     #[error("绑定 Web UI 地址失败: {0}")]

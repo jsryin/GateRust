@@ -11,7 +11,7 @@ use std::{
 };
 
 use rand::RngExt as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "tunnel")]
 use tokio::sync::Semaphore;
 use tokio::sync::{RwLock, watch};
@@ -23,7 +23,33 @@ pub(crate) struct ConfigSnapshot {
     #[cfg(feature = "tunnel")]
     pub tunnel: Option<gaterust_tunnel::ServerConfig>,
     #[cfg(feature = "proxy")]
-    pub proxy: Option<gaterust_proxy::ProxyConfig>,
+    pub proxy: Option<gaterust_proxy::ProxyConfigView>,
+}
+
+#[cfg(feature = "proxy")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcmeAccountRequest {
+    pub id: String,
+    pub name: String,
+    pub provider: gaterust_proxy::AcmeProvider,
+    pub environment: gaterust_proxy::AcmeEnvironment,
+    pub email: String,
+    pub key_algorithm: gaterust_proxy::KeyAlgorithm,
+    pub eab_key_id: Option<String>,
+    pub eab_hmac_key: Option<String>,
+}
+
+#[cfg(feature = "proxy")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DnsAccountRequest {
+    pub id: String,
+    pub name: String,
+    pub provider: gaterust_proxy::DnsProvider,
+    pub api_token: Option<String>,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -66,6 +92,10 @@ struct StoreInner {
     proxy_path: PathBuf,
     #[cfg(feature = "proxy")]
     proxy_writer: Mutex<()>,
+    #[cfg(feature = "proxy")]
+    proxy_runtime: Option<gaterust_proxy::ProxyRuntime>,
+    #[cfg(feature = "proxy")]
+    running_proxy_listener: Option<gaterust_proxy::ProxyListenerConfig>,
 }
 
 impl ConfigStore {
@@ -73,7 +103,11 @@ impl ConfigStore {
         #[cfg(feature = "tunnel")]
         let tunnel = load_optional_tunnel(&options.tunnel_config)?;
         #[cfg(feature = "proxy")]
-        let proxy = load_optional_proxy(&options.proxy_config)?;
+        let proxy_config = load_optional_proxy(&options.proxy_config)?;
+        #[cfg(feature = "proxy")]
+        let proxy = proxy_config
+            .as_ref()
+            .map(gaterust_proxy::ProxyConfigView::from);
         let snapshot = ConfigSnapshot {
             #[cfg(feature = "tunnel")]
             tunnel,
@@ -99,6 +133,10 @@ impl ConfigStore {
                 proxy_path: absolute_path(&options.proxy_config)?,
                 #[cfg(feature = "proxy")]
                 proxy_writer: Mutex::new(()),
+                #[cfg(feature = "proxy")]
+                proxy_runtime: options.proxy_runtime.clone(),
+                #[cfg(feature = "proxy")]
+                running_proxy_listener: proxy_config.map(|config| config.proxy),
             }),
         })
     }
@@ -114,6 +152,11 @@ impl ConfigStore {
     #[cfg(feature = "tunnel")]
     pub(crate) fn tunnel_runtime(&self) -> Option<&gaterust_tunnel::TunnelRuntime> {
         self.inner.tunnel_runtime.as_ref()
+    }
+
+    #[cfg(feature = "proxy")]
+    pub(crate) fn proxy_runtime(&self) -> Option<&gaterust_proxy::ProxyRuntime> {
+        self.inner.proxy_runtime.as_ref()
     }
 
     pub(crate) fn watched_paths(&self) -> Vec<(ConfigKind, PathBuf)> {
@@ -232,7 +275,7 @@ impl ConfigStore {
     pub(crate) async fn set_proxy_listener(
         &self,
         listener: gaterust_proxy::ProxyListenerConfig,
-    ) -> Result<gaterust_proxy::ProxyConfig> {
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
         self.mutate_proxy(move |config| {
             config.proxy = listener;
             Ok(())
@@ -241,10 +284,170 @@ impl ConfigStore {
     }
 
     #[cfg(feature = "proxy")]
+    pub(crate) async fn create_acme_account(
+        &self,
+        request: AcmeAccountRequest,
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
+        self.mutate_proxy(move |config| {
+            config
+                .acme_accounts
+                .push(acme_account_from_request(request));
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(feature = "proxy")]
+    pub(crate) async fn update_acme_account(
+        &self,
+        id: String,
+        request: AcmeAccountRequest,
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
+        self.mutate_proxy(move |config| {
+            if request.id != id {
+                return Err(ControlError::ResourceConflict(
+                    "ACME 账户 ID 创建后不可修改".into(),
+                ));
+            }
+            let current = config
+                .acme_accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| resource_not_found("ACME 账户", &id))?;
+            let mut replacement = acme_account_from_request(request);
+            if replacement.provider == gaterust_proxy::AcmeProvider::GoogleCloud
+                && replacement.eab_hmac_key.is_none()
+                && current.provider == gaterust_proxy::AcmeProvider::GoogleCloud
+            {
+                replacement.eab_hmac_key.clone_from(&current.eab_hmac_key);
+            }
+            *current = replacement;
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(feature = "proxy")]
+    pub(crate) async fn delete_acme_account(
+        &self,
+        id: String,
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
+        self.mutate_proxy(move |config| {
+            if config
+                .certificates
+                .iter()
+                .any(|certificate| certificate.acme_account_id == id)
+            {
+                return Err(ControlError::ResourceConflict(
+                    "ACME 账户仍被托管证书引用，不能删除".into(),
+                ));
+            }
+            remove_named(&mut config.acme_accounts, &id, "ACME 账户", |account| {
+                &account.id
+            })
+        })
+        .await
+    }
+
+    #[cfg(feature = "proxy")]
+    pub(crate) async fn create_dns_account(
+        &self,
+        request: DnsAccountRequest,
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
+        self.mutate_proxy(move |config| {
+            config.dns_accounts.push(dns_account_from_request(request));
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(feature = "proxy")]
+    pub(crate) async fn update_dns_account(
+        &self,
+        id: String,
+        request: DnsAccountRequest,
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
+        self.mutate_proxy(move |config| {
+            if request.id != id {
+                return Err(ControlError::ResourceConflict(
+                    "DNS 账户 ID 创建后不可修改".into(),
+                ));
+            }
+            let current = config
+                .dns_accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| resource_not_found("DNS 账户", &id))?;
+            let mut replacement = dns_account_from_request(request);
+            if replacement.provider == current.provider {
+                if replacement.api_token.is_none() {
+                    replacement.api_token.clone_from(&current.api_token);
+                }
+                if replacement.access_key.is_none() {
+                    replacement.access_key.clone_from(&current.access_key);
+                }
+                if replacement.secret_key.is_none() {
+                    replacement.secret_key.clone_from(&current.secret_key);
+                }
+            }
+            *current = replacement;
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(feature = "proxy")]
+    pub(crate) async fn delete_dns_account(
+        &self,
+        id: String,
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
+        self.mutate_proxy(move |config| {
+            let referenced = config.certificates.iter().any(|certificate| {
+                matches!(
+                    &certificate.validation,
+                    Some(gaterust_proxy::CertificateValidation::DnsAccount { dns_account_id })
+                        if dns_account_id == &id
+                )
+            });
+            if referenced {
+                return Err(ControlError::ResourceConflict(
+                    "DNS 账户仍被托管证书引用，不能删除".into(),
+                ));
+            }
+            remove_named(&mut config.dns_accounts, &id, "DNS 账户", |account| {
+                &account.id
+            })
+        })
+        .await
+    }
+
+    #[cfg(feature = "proxy")]
+    pub(crate) async fn dns_account(&self, id: String) -> Result<gaterust_proxy::DnsAccountConfig> {
+        let path = self.inner.proxy_path.clone();
+        tokio::task::spawn_blocking(move || {
+            load_optional_proxy(&path)?
+                .and_then(|config| {
+                    config
+                        .dns_accounts
+                        .into_iter()
+                        .find(|account| account.id == id)
+                })
+                .ok_or_else(|| resource_not_found("DNS 账户", &id))
+        })
+        .await
+        .map_err(|error| ControlError::ReadRuntimeConfig(error.to_string()))?
+    }
+
+    #[cfg(feature = "proxy")]
     pub(crate) async fn create_certificate(
         &self,
         certificate: gaterust_proxy::CertificateConfig,
-    ) -> Result<gaterust_proxy::ProxyConfig> {
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
+        if certificate.migration_error.is_some() {
+            return Err(ControlError::ResourceConflict(
+                "不能通过 API 创建待迁移证书".into(),
+            ));
+        }
         self.mutate_proxy(move |config| {
             config.certificates.push(certificate);
             Ok(())
@@ -255,26 +458,28 @@ impl ConfigStore {
     #[cfg(feature = "proxy")]
     pub(crate) async fn update_certificate(
         &self,
-        original_name: String,
+        id: String,
         certificate: gaterust_proxy::CertificateConfig,
-    ) -> Result<gaterust_proxy::ProxyConfig> {
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
+        if certificate.migration_error.is_some() {
+            return Err(ControlError::ResourceConflict(
+                "不能通过 API 设置证书迁移状态".into(),
+            ));
+        }
+        if certificate.id != id {
+            return Err(ControlError::ResourceConflict(
+                "证书 ID 创建后不可修改".into(),
+            ));
+        }
         self.mutate_proxy(move |config| {
             let Some(current) = config
                 .certificates
                 .iter_mut()
-                .find(|current| current.name == original_name)
+                .find(|current| current.id == id)
             else {
-                return Err(resource_not_found("证书", &original_name));
+                return Err(resource_not_found("证书", &id));
             };
-            let renamed = current.name != certificate.name;
             *current = certificate;
-            if renamed {
-                for route in &mut config.routes {
-                    if route.certificate.as_deref() == Some(&original_name) {
-                        route.certificate.clone_from(&Some(current.name.clone()));
-                    }
-                }
-            }
             Ok(())
         })
         .await
@@ -283,18 +488,21 @@ impl ConfigStore {
     #[cfg(feature = "proxy")]
     pub(crate) async fn delete_certificate(
         &self,
-        name: String,
-    ) -> Result<gaterust_proxy::ProxyConfig> {
+        id: String,
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
         self.mutate_proxy(move |config| {
-            remove_named(&mut config.certificates, &name, "证书", |certificate| {
-                &certificate.name
-            })?;
-            for route in &mut config.routes {
-                if route.certificate.as_deref() == Some(&name) {
-                    route.certificate = None;
-                }
+            if config
+                .routes
+                .iter()
+                .any(|route| route.certificate_id.as_deref() == Some(&id))
+            {
+                return Err(ControlError::ResourceConflict(
+                    "证书仍被域名路由引用，不能删除".into(),
+                ));
             }
-            Ok(())
+            remove_named(&mut config.certificates, &id, "证书", |certificate| {
+                &certificate.id
+            })
         })
         .await
     }
@@ -303,7 +511,7 @@ impl ConfigStore {
     pub(crate) async fn create_route(
         &self,
         route: gaterust_proxy::RouteConfig,
-    ) -> Result<gaterust_proxy::ProxyConfig> {
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
         self.mutate_proxy(move |config| {
             config.routes.push(route);
             Ok(())
@@ -316,7 +524,7 @@ impl ConfigStore {
         &self,
         original_name: String,
         route: gaterust_proxy::RouteConfig,
-    ) -> Result<gaterust_proxy::ProxyConfig> {
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
         self.mutate_proxy(move |config| {
             replace_named(
                 &mut config.routes,
@@ -330,7 +538,10 @@ impl ConfigStore {
     }
 
     #[cfg(feature = "proxy")]
-    pub(crate) async fn delete_route(&self, name: String) -> Result<gaterust_proxy::ProxyConfig> {
+    pub(crate) async fn delete_route(
+        &self,
+        name: String,
+    ) -> Result<gaterust_proxy::ProxyConfigView> {
         self.mutate_proxy(move |config| {
             remove_named(&mut config.routes, &name, "路由", |route| &route.name)
         })
@@ -368,7 +579,8 @@ impl ConfigStore {
 
     #[cfg(feature = "proxy")]
     async fn update_proxy(&self, config: Option<gaterust_proxy::ProxyConfig>) {
-        self.inner.snapshot.write().await.proxy = config;
+        self.inner.snapshot.write().await.proxy =
+            config.as_ref().map(gaterust_proxy::ProxyConfigView::from);
         self.publish().await;
     }
 
@@ -419,12 +631,12 @@ impl ConfigStore {
     }
 
     #[cfg(feature = "proxy")]
-    async fn mutate_proxy<F>(&self, mutate: F) -> Result<gaterust_proxy::ProxyConfig>
+    async fn mutate_proxy<F>(&self, mutate: F) -> Result<gaterust_proxy::ProxyConfigView>
     where
         F: FnOnce(&mut gaterust_proxy::ProxyConfig) -> Result<()> + Send + 'static,
     {
         let inner = Arc::clone(&self.inner);
-        let stored = tokio::task::spawn_blocking(move || {
+        let (stored, runtime_config) = tokio::task::spawn_blocking(move || {
             // 文件锁仅存在于阻塞任务内，不跨异步等待持有。
             let _guard = inner
                 .proxy_writer
@@ -432,16 +644,30 @@ impl ConfigStore {
                 .map_err(|_| ControlError::WriteRuntimeConfig("代理配置写入锁已损坏".into()))?;
             let mut config = load_optional_proxy(&inner.proxy_path)?.unwrap_or_else(default_proxy);
             mutate(&mut config)?;
-            write_validated(
+            let stored = write_validated(
                 &inner.proxy_path,
                 &config,
                 gaterust_proxy::ProxyConfig::read,
-            )
+            )?;
+            let runtime_config = gaterust_proxy::ProxyConfig::load(&inner.proxy_path)
+                .map_err(|error| ControlError::ReadRuntimeConfig(error.to_string()))?;
+            Ok::<_, ControlError>((stored, runtime_config))
         })
         .await
         .map_err(|error| ControlError::WriteRuntimeConfig(error.to_string()))??;
         self.update_proxy(Some(stored.clone())).await;
-        Ok(stored)
+        if let Some(runtime) = &self.inner.proxy_runtime {
+            let restart_required = self
+                .inner
+                .running_proxy_listener
+                .as_ref()
+                .is_some_and(|running| running != &runtime_config.proxy);
+            runtime
+                .apply_config(runtime_config, restart_required)
+                .await
+                .map_err(|error| ControlError::ProxyRuntimeApply(error.to_string()))?;
+        }
+        Ok(gaterust_proxy::ProxyConfigView::from(&stored))
     }
 
     async fn publish(&self) {
@@ -479,7 +705,35 @@ fn default_proxy() -> gaterust_proxy::ProxyConfig {
             max_connections: 2_048,
         },
         certificates: Vec::new(),
+        acme_accounts: Vec::new(),
+        dns_accounts: Vec::new(),
         routes: Vec::new(),
+    }
+}
+
+#[cfg(feature = "proxy")]
+fn acme_account_from_request(request: AcmeAccountRequest) -> gaterust_proxy::AcmeAccountConfig {
+    gaterust_proxy::AcmeAccountConfig {
+        id: request.id,
+        name: request.name,
+        provider: request.provider,
+        environment: request.environment,
+        email: request.email,
+        key_algorithm: request.key_algorithm,
+        eab_key_id: request.eab_key_id,
+        eab_hmac_key: request.eab_hmac_key.map(gaterust_proxy::SecretString::new),
+    }
+}
+
+#[cfg(feature = "proxy")]
+fn dns_account_from_request(request: DnsAccountRequest) -> gaterust_proxy::DnsAccountConfig {
+    gaterust_proxy::DnsAccountConfig {
+        id: request.id,
+        name: request.name,
+        provider: request.provider,
+        api_token: request.api_token.map(gaterust_proxy::SecretString::new),
+        access_key: request.access_key.map(gaterust_proxy::SecretString::new),
+        secret_key: request.secret_key.map(gaterust_proxy::SecretString::new),
     }
 }
 
@@ -641,7 +895,13 @@ where
         Ok(stored)
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+        match std::fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %temporary.display(), %error, "清理配置临时文件失败");
+            }
+        }
     }
     result
 }
@@ -679,6 +939,8 @@ mod tunnel_tests {
             tunnel_runtime: None,
             #[cfg(feature = "proxy")]
             proxy_config: directory.path().join("proxy.toml"),
+            #[cfg(feature = "proxy")]
+            proxy_runtime: None,
         };
         let store = ConfigStore::new(&options).expect("创建配置存储");
         let quic = ServerQuicConfig {
@@ -762,8 +1024,8 @@ mod tunnel_tests {
 #[cfg(all(test, feature = "proxy"))]
 mod proxy_tests {
     use gaterust_proxy::{
-        AcmeChallenge, CertificateConfig, CertificateIssuer, ProxyConfig, ProxyListenerConfig,
-        RouteConfig,
+        AcmeEnvironment, AcmeProvider, CertificateConfig, CertificateValidation, DnsProvider,
+        KeyAlgorithm, ProxyConfig, ProxyListenerConfig, RouteConfig,
     };
 
     use super::*;
@@ -780,6 +1042,7 @@ mod proxy_tests {
             #[cfg(feature = "tunnel")]
             tunnel_runtime: None,
             proxy_config: path.clone(),
+            proxy_runtime: None,
         };
         let store = ConfigStore::new(&options).expect("创建配置存储");
         let listener = ProxyListenerConfig {
@@ -798,7 +1061,55 @@ mod proxy_tests {
             listener
         );
         store
-            .create_certificate(certificate("site"))
+            .create_acme_account(AcmeAccountRequest {
+                id: "account".into(),
+                name: "默认账户".into(),
+                provider: AcmeProvider::LetsEncrypt,
+                environment: AcmeEnvironment::Staging,
+                email: "admin@example.com".into(),
+                key_algorithm: KeyAlgorithm::Ec256,
+                eab_key_id: None,
+                eab_hmac_key: None,
+            })
+            .await
+            .expect("创建 ACME 账户");
+        store
+            .create_dns_account(DnsAccountRequest {
+                id: "dns".into(),
+                name: "Cloudflare".into(),
+                provider: DnsProvider::Cloudflare,
+                api_token: Some("token".into()),
+                access_key: None,
+                secret_key: None,
+            })
+            .await
+            .expect("创建 DNS 账户");
+        store
+            .update_dns_account(
+                "dns".into(),
+                DnsAccountRequest {
+                    id: "dns".into(),
+                    name: "Cloudflare 主账户".into(),
+                    provider: DnsProvider::Cloudflare,
+                    api_token: None,
+                    access_key: None,
+                    secret_key: None,
+                },
+            )
+            .await
+            .expect("留空时保留 DNS 密钥");
+        let dns = store
+            .dns_account("dns".into())
+            .await
+            .expect("读取 DNS 账户");
+        assert_eq!(
+            dns.api_token
+                .as_ref()
+                .map(gaterust_proxy::SecretString::expose),
+            Some("token")
+        );
+        store
+            .create_certificate(certificate("站点证书"))
             .await
             .expect("创建证书");
         store
@@ -807,29 +1118,52 @@ mod proxy_tests {
                 host: "example.com".into(),
                 path_prefix: "/".into(),
                 upstream: "http://127.0.0.1:3000".into(),
-                certificate: Some("site".into()),
+                certificate_id: Some("site".into()),
             })
             .await
             .expect("创建路由");
         let updated = store
-            .update_certificate("site".into(), certificate("primary"))
+            .update_certificate("site".into(), certificate("主站证书"))
             .await
             .expect("重命名证书");
 
         assert_eq!(updated.proxy, listener);
-        assert_eq!(updated.certificates[0].name, "primary");
-        assert_eq!(updated.routes[0].certificate.as_deref(), Some("primary"));
+        assert_eq!(updated.certificates[0].name, "主站证书");
+        assert_eq!(updated.routes[0].certificate_id.as_deref(), Some("site"));
 
+        let Err(error) = store.delete_acme_account("account".into()).await else {
+            panic!("被证书引用的 ACME 账户不能删除");
+        };
+        assert!(matches!(error, ControlError::ResourceConflict(_)));
+        let Err(error) = store.delete_dns_account("dns".into()).await else {
+            panic!("被证书引用的 DNS 账户不能删除");
+        };
+        assert!(matches!(error, ControlError::ResourceConflict(_)));
+        let Err(error) = store.delete_certificate("site".into()).await else {
+            panic!("被路由引用的证书不能删除");
+        };
+        assert!(matches!(error, ControlError::ResourceConflict(_)));
+        store.delete_route("web".into()).await.expect("删除路由");
         let updated = store
-            .delete_certificate("primary".into())
+            .delete_certificate("site".into())
             .await
-            .expect("删除证书");
+            .expect("删除未引用证书");
         assert_eq!(updated.proxy, listener);
         assert!(updated.certificates.is_empty());
-        assert_eq!(updated.routes[0].certificate, None);
+        assert!(updated.routes.is_empty());
+        store
+            .delete_dns_account("dns".into())
+            .await
+            .expect("删除未引用 DNS 账户");
+        store
+            .delete_acme_account("account".into())
+            .await
+            .expect("删除未引用 ACME 账户");
         let stored = ProxyConfig::read(&path).expect("读取保存的配置");
         assert_eq!(stored.proxy, listener);
-        assert_eq!(stored.routes.len(), 1);
+        assert!(stored.routes.is_empty());
+        assert!(stored.dns_accounts.is_empty());
+        assert!(stored.acme_accounts.is_empty());
         let runtime = ProxyConfig::load(&path).expect("加载运行时配置");
         assert_eq!(
             runtime.proxy.cache_dir,
@@ -839,17 +1173,15 @@ mod proxy_tests {
 
     fn certificate(name: &str) -> CertificateConfig {
         CertificateConfig {
+            id: "site".into(),
             name: name.into(),
             domains: vec!["example.com".into()],
-            email: "admin@example.com".into(),
-            issuer: CertificateIssuer::LetsEncrypt,
-            challenge: AcmeChallenge::TlsAlpn01,
-            production: false,
-            cloudflare_api_token: None,
-            cloudflare_zone_id: None,
-            google_eab_key_id: None,
-            google_eab_hmac_key: None,
-            dns_propagation_seconds: 30,
+            acme_account_id: "account".into(),
+            validation: Some(CertificateValidation::DnsAccount {
+                dns_account_id: "dns".into(),
+            }),
+            auto_renew: false,
+            migration_error: None,
         }
     }
 }

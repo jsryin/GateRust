@@ -5,14 +5,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use crate::{ProxyError, Result, config::wildcard_matches};
 use rustls::{
     ServerConfig,
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
-use rustls_acme::ResolvesServerCertAcme;
-
-use crate::{ProxyError, Result};
 
 #[derive(Clone)]
 pub(crate) struct CertificateResolver {
@@ -23,7 +21,6 @@ pub(crate) struct CertificateResolver {
 struct ResolverState {
     exact: HashMap<String, ResolverEntry>,
     wildcard: HashMap<String, ResolverEntry>,
-    http01: HashMap<String, Arc<ResolvesServerCertAcme>>,
 }
 
 #[derive(Clone)]
@@ -43,41 +40,23 @@ impl CertificateResolver {
         let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(self.clone()));
-        config.alpn_protocols = vec![b"acme-tls/1".to_vec(), b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Arc::new(config)
     }
 
-    pub(crate) fn install_acme(
-        &self,
-        owner: &str,
-        domains: &[String],
-        resolver: Arc<ResolvesServerCertAcme>,
-    ) {
-        self.install(owner, domains, &resolver);
-        self.inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .http01
-            .insert(owner.into(), resolver);
-    }
-
-    pub(crate) fn install_direct(
+    pub(crate) fn replace_direct(
         &self,
         owner: &str,
         domains: &[String],
         resolver: &Arc<DirectResolver>,
     ) {
-        self.install(owner, domains, resolver);
-    }
-
-    fn install<R>(&self, owner: &str, domains: &[String], resolver: &Arc<R>)
-    where
-        R: ResolvesServerCert + 'static,
-    {
         let mut state = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 在同一写锁内移除旧域名并安装新解析器，避免配置更新时出现无证书窗口。
+        state.exact.retain(|_, entry| entry.owner != owner);
+        state.wildcard.retain(|_, entry| entry.owner != owner);
         for domain in domains {
             let entry = ResolverEntry {
                 owner: owner.into(),
@@ -98,18 +77,6 @@ impl CertificateResolver {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.exact.retain(|_, entry| entry.owner != owner);
         state.wildcard.retain(|_, entry| entry.owner != owner);
-        state.http01.remove(owner);
-    }
-
-    pub(crate) fn http01_key_authorization(&self, token: &str) -> Option<String> {
-        let state = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .http01
-            .values()
-            .find_map(|resolver| resolver.get_http_01_key_auth(token))
     }
 
     fn resolver_for(&self, server_name: &str) -> Option<Arc<dyn ResolvesServerCert>> {
@@ -184,8 +151,20 @@ impl ResolvesServerCert for DirectResolver {
     }
 }
 
-fn wildcard_matches(server_name: &str, suffix: &str) -> bool {
-    server_name.len() > suffix.len()
-        && server_name.ends_with(suffix)
-        && server_name.as_bytes()[server_name.len() - suffix.len() - 1] == b'.'
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacing_owner_swaps_domain_mappings_atomically() {
+        let resolver = CertificateResolver::new();
+        let first = Arc::new(DirectResolver::default());
+        resolver.replace_direct("site", &["old.example.com".into()], &first);
+        assert!(resolver.resolver_for("old.example.com").is_some());
+
+        let replacement = Arc::new(DirectResolver::default());
+        resolver.replace_direct("site", &["new.example.com".into()], &replacement);
+        assert!(resolver.resolver_for("old.example.com").is_none());
+        assert!(resolver.resolver_for("new.example.com").is_some());
+    }
 }

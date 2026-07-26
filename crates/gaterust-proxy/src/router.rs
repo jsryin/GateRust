@@ -2,7 +2,10 @@ use std::{cmp::Reverse, collections::HashMap, sync::Arc};
 
 use http::Uri;
 
-use crate::{Result, RouteConfig, config::ProxyConfig};
+use crate::{
+    Result, RouteConfig,
+    config::{ProxyConfig, wildcard_matches},
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Route {
@@ -66,7 +69,7 @@ fn route_entry(config: &RouteConfig) -> Result<RouteEntry> {
             upstream: config.upstream.parse().map_err(|_| {
                 crate::ProxyError::InvalidConfig(format!("上游 URI 无效: {}", config.upstream))
             })?,
-            tls: config.certificate.is_some(),
+            tls: config.certificate_id.is_some(),
         },
     })
 }
@@ -85,12 +88,6 @@ fn path_matches(path: &str, prefix: &str) -> bool {
         })
 }
 
-fn wildcard_matches(host: &str, suffix: &str) -> bool {
-    host.len() > suffix.len()
-        && host.ends_with(suffix)
-        && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
-}
-
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, path::PathBuf};
@@ -106,6 +103,8 @@ mod tests {
                 cache_dir: PathBuf::from("cache"),
                 max_connections: 16,
             },
+            acme_accounts: vec![],
+            dns_accounts: vec![],
             certificates: vec![],
             routes,
         }
@@ -117,7 +116,7 @@ mod tests {
             host: host.into(),
             path_prefix: path_prefix.into(),
             upstream: "http://127.0.0.1:3000".into(),
-            certificate: None,
+            certificate_id: None,
         }
     }
 

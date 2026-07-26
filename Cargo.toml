@@ -17,6 +17,7 @@ license = "MIT"
 repository = "https://github.com/jsryin/GateRust"
 
 [workspace.dependencies]
+acme2-eab = "0.5.7"
 atomic-write-file = "0.3.0"
 argon2 = "0.5.3"
 axum = "0.8.9"
@@ -24,22 +25,23 @@ base64 = "0.22.1"
 bytes = "1.12.1"
 clap = { version = "4.6.3", features = ["derive"] }
 futures-util = "0.3.33"
+hickory-resolver = "0.26.1"
 hmac = "0.12.1"
 http = "1.4.2"
 http-body-util = "0.1.4"
 hyper = { version = "1.11.0", features = ["client", "http1", "server"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "server", "tokio"] }
-instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "ring"] }
 jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
 notify = "8.2.0"
+openssl = { version = "0.10.73", features = ["vendored"] }
 pem = "3.0.6"
 quinn = { version = "0.11.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 rand = "0.10.2"
+reqwest = { version = "0.13.1", default-features = false, features = ["json", "query", "native-tls"] }
 rcgen = "0.14.8"
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2.0"
-rustls-acme = { version = "0.15.3", default-features = false, features = ["ring", "tokio", "tower", "webpki-roots"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"

@@ -42,6 +42,8 @@ pub struct ControlOptions {
     pub tunnel_runtime: Option<gaterust_tunnel::TunnelRuntime>,
     #[cfg(feature = "proxy")]
     pub proxy_config: PathBuf,
+    #[cfg(feature = "proxy")]
+    pub proxy_runtime: Option<gaterust_proxy::ProxyRuntime>,
 }
 
 /// 启动 Web API、配置监听和可选的静态 SPA 服务。

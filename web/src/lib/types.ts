@@ -29,21 +29,63 @@ export interface ServerConfig {
   tunnels: TunnelConfig[];
 }
 
-export type CertificateIssuer = 'lets_encrypt' | 'google_trust_services';
-export type AcmeChallenge = 'http-01' | 'tls-alpn-01' | 'cloudflare-dns-01';
+export type AcmeProvider = 'lets_encrypt' | 'google_cloud';
+export type AcmeEnvironment = 'production' | 'staging';
+export type KeyAlgorithm = 'ec256' | 'rsa2048';
+export type DnsProvider = 'cloudflare' | 'go_daddy' | 'aliyun' | 'tencent_cloud';
+
+export interface AcmeAccountView {
+  id: string;
+  name: string;
+  provider: AcmeProvider;
+  environment: AcmeEnvironment;
+  email: string;
+  key_algorithm: KeyAlgorithm;
+  eab_key_id: string | null;
+  eab_hmac_key_configured: boolean;
+}
+
+export interface AcmeAccountInput {
+  id: string;
+  name: string;
+  provider: AcmeProvider;
+  environment: AcmeEnvironment;
+  email: string;
+  key_algorithm: KeyAlgorithm;
+  eab_key_id: string | null;
+  eab_hmac_key: string | null;
+}
+
+export interface DnsAccountView {
+  id: string;
+  name: string;
+  provider: DnsProvider;
+  api_token_configured: boolean;
+  access_key_configured: boolean;
+  secret_key_configured: boolean;
+}
+
+export interface DnsAccountInput {
+  id: string;
+  name: string;
+  provider: DnsProvider;
+  api_token: string | null;
+  access_key: string | null;
+  secret_key: string | null;
+}
+
+export type CertificateValidation =
+  | { method: 'dns_account'; dns_account_id: string }
+  | { method: 'manual' };
 
 export interface CertificateConfig {
+  id: string;
   name: string;
   domains: string[];
-  email: string;
-  issuer: CertificateIssuer;
-  challenge: AcmeChallenge;
-  production: boolean;
-  cloudflare_api_token: string | null;
-  cloudflare_zone_id: string | null;
-  google_eab_key_id: string | null;
-  google_eab_hmac_key: string | null;
-  dns_propagation_seconds: number;
+  acme_account_id: string;
+  validation: CertificateValidation | null;
+  auto_renew: boolean;
+  migration_error?: string | null;
 }
 
 export interface RouteConfig {
@@ -51,7 +93,7 @@ export interface RouteConfig {
   host: string;
   path_prefix: string;
   upstream: string;
-  certificate: string | null;
+  certificate_id: string | null;
 }
 
 export interface ProxyListenerConfig {
@@ -63,8 +105,34 @@ export interface ProxyListenerConfig {
 
 export interface ProxyConfig {
   proxy: ProxyListenerConfig;
+  acme_accounts: AcmeAccountView[];
+  dns_accounts: DnsAccountView[];
   certificates: CertificateConfig[];
   routes: RouteConfig[];
+}
+
+export type CertificateStatus = 'idle' | 'issuing' | 'waiting_dns' | 'valid' | 'renewing' | 'failed' | 'expired';
+
+export interface ManualDnsRecord {
+  name: string;
+  value: string;
+}
+
+export interface CertificateRuntimeStatus {
+  certificate_id: string;
+  status: CertificateStatus;
+  expires_at: number | null;
+  last_error: string | null;
+  manual_records: ManualDnsRecord[];
+}
+
+export interface ProxyRuntimeState {
+  certificates: CertificateRuntimeStatus[];
+  config_status: {
+    revision: number;
+    restart_required: boolean;
+    last_apply_error: string | null;
+  };
 }
 
 export interface ConfigSnapshot {

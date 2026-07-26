@@ -125,11 +125,31 @@ fn module_routes() -> Router<ApiState> {
     #[cfg(feature = "proxy")]
     let router = router
         .route("/config/proxy/listener", put(set_proxy_listener))
+        .route("/config/proxy/acme-accounts", post(create_acme_account))
+        .route(
+            "/config/proxy/acme-accounts/{id}",
+            put(update_acme_account).delete(delete_acme_account),
+        )
+        .route("/config/proxy/dns-accounts", post(create_dns_account))
+        .route(
+            "/config/proxy/dns-accounts/{id}",
+            put(update_dns_account).delete(delete_dns_account),
+        )
+        .route(
+            "/config/proxy/dns-accounts/{id}/test",
+            post(test_dns_account),
+        )
         .route("/config/proxy/certificates", post(create_certificate))
         .route(
-            "/config/proxy/certificates/{name}",
+            "/config/proxy/certificates/{id}",
             put(update_certificate).delete(delete_certificate),
         )
+        .route("/proxy/certificates/{id}/issue", post(issue_certificate))
+        .route(
+            "/proxy/certificates/{id}/continue",
+            post(continue_certificate),
+        )
+        .route("/proxy/runtime", get(proxy_runtime))
         .route("/config/proxy/routes", post(create_route))
         .route(
             "/config/proxy/routes/{name}",
@@ -259,40 +279,154 @@ async fn delete_tunnel(
 async fn set_proxy_listener(
     State(state): State<ApiState>,
     Json(listener): Json<gaterust_proxy::ProxyListenerConfig>,
-) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
     saved(state.store.set_proxy_listener(listener).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn create_acme_account(
+    State(state): State<ApiState>,
+    Json(account): Json<crate::store::AcmeAccountRequest>,
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
+    saved(state.store.create_acme_account(account).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn update_acme_account(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(account): Json<crate::store::AcmeAccountRequest>,
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
+    saved(state.store.update_acme_account(id, account).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn delete_acme_account(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
+    saved(state.store.delete_acme_account(id).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn create_dns_account(
+    State(state): State<ApiState>,
+    Json(account): Json<crate::store::DnsAccountRequest>,
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
+    saved(state.store.create_dns_account(account).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn update_dns_account(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(account): Json<crate::store::DnsAccountRequest>,
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
+    saved(state.store.update_dns_account(id, account).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn delete_dns_account(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
+    saved(state.store.delete_dns_account(id).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn test_dns_account(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let account = state
+        .store
+        .dns_account(id)
+        .await
+        .map_err(|error| ApiError::from_control(&error))?;
+    let runtime = state
+        .store
+        .proxy_runtime()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "代理模块未运行"))?;
+    runtime
+        .test_dns_account(account)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(feature = "proxy")]
 async fn create_certificate(
     State(state): State<ApiState>,
     Json(certificate): Json<gaterust_proxy::CertificateConfig>,
-) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
     saved(state.store.create_certificate(certificate).await)
 }
 
 #[cfg(feature = "proxy")]
 async fn update_certificate(
     State(state): State<ApiState>,
-    Path(name): Path<String>,
+    Path(id): Path<String>,
     Json(certificate): Json<gaterust_proxy::CertificateConfig>,
-) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
-    saved(state.store.update_certificate(name, certificate).await)
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
+    saved(state.store.update_certificate(id, certificate).await)
 }
 
 #[cfg(feature = "proxy")]
 async fn delete_certificate(
     State(state): State<ApiState>,
-    Path(name): Path<String>,
-) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
-    saved(state.store.delete_certificate(name).await)
+    Path(id): Path<String>,
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
+    saved(state.store.delete_certificate(id).await)
+}
+
+#[cfg(feature = "proxy")]
+async fn issue_certificate(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let runtime = state
+        .store
+        .proxy_runtime()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "代理模块未运行"))?;
+    runtime
+        .issue_certificate(id)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error.to_string()))?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+#[cfg(feature = "proxy")]
+async fn continue_certificate(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let runtime = state
+        .store
+        .proxy_runtime()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "代理模块未运行"))?;
+    runtime
+        .continue_certificate(id)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error.to_string()))?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+#[cfg(feature = "proxy")]
+async fn proxy_runtime(
+    State(state): State<ApiState>,
+) -> Result<Json<gaterust_proxy::ProxyRuntimeSnapshot>, ApiError> {
+    let runtime = state
+        .store
+        .proxy_runtime()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "代理模块未运行"))?;
+    Ok(Json(runtime.snapshot()))
 }
 
 #[cfg(feature = "proxy")]
 async fn create_route(
     State(state): State<ApiState>,
     Json(route): Json<gaterust_proxy::RouteConfig>,
-) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
     saved(state.store.create_route(route).await)
 }
 
@@ -301,7 +435,7 @@ async fn update_route(
     State(state): State<ApiState>,
     Path(name): Path<String>,
     Json(route): Json<gaterust_proxy::RouteConfig>,
-) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
     saved(state.store.update_route(name, route).await)
 }
 
@@ -309,7 +443,7 @@ async fn update_route(
 async fn delete_route(
     State(state): State<ApiState>,
     Path(name): Path<String>,
-) -> Result<Json<gaterust_proxy::ProxyConfig>, ApiError> {
+) -> Result<Json<gaterust_proxy::ProxyConfigView>, ApiError> {
     saved(state.store.delete_route(name).await)
 }
 
@@ -389,7 +523,9 @@ impl ApiError {
         tracing::warn!(%error, "Web UI 配置操作失败");
         let status = match error {
             crate::ControlError::ResourceNotFound { .. } => StatusCode::NOT_FOUND,
-            crate::ControlError::TunnelRuntimeApply(_) => StatusCode::CONFLICT,
+            crate::ControlError::ResourceConflict(_)
+            | crate::ControlError::TunnelRuntimeApply(_)
+            | crate::ControlError::ProxyRuntimeApply(_) => StatusCode::CONFLICT,
             _ => StatusCode::BAD_REQUEST,
         };
         Self::new(status, error.to_string())

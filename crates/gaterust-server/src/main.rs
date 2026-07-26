@@ -143,6 +143,12 @@ async fn run(arguments: ServerArguments) -> Result<(), String> {
         .then(gaterust_tunnel::TunnelRuntime::new);
     #[cfg(all(feature = "tunnel", feature = "web"))]
     let control_tunnel_runtime = tunnel_runtime.clone();
+    #[cfg(feature = "proxy")]
+    let proxy_runtime = arguments
+        .enable_proxy
+        .then(gaterust_proxy::ProxyRuntime::new);
+    #[cfg(all(feature = "proxy", feature = "web"))]
+    let control_proxy_runtime = proxy_runtime.clone();
     #[cfg(feature = "tunnel")]
     if let Some(runtime) = tunnel_runtime {
         let token = cancellation.child_token();
@@ -153,10 +159,10 @@ async fn run(arguments: ServerArguments) -> Result<(), String> {
         });
     }
     #[cfg(feature = "proxy")]
-    if arguments.enable_proxy {
+    if let Some(runtime) = proxy_runtime {
         let token = cancellation.child_token();
         tasks.spawn(async move {
-            gaterust_proxy::run_proxy_with_shutdown(arguments.proxy_config, token)
+            gaterust_proxy::run_proxy_with_runtime(arguments.proxy_config, runtime, token)
                 .await
                 .map_err(|error| format!("代理模块: {error}"))
         });
@@ -171,6 +177,10 @@ async fn run(arguments: ServerArguments) -> Result<(), String> {
             #[cfg(not(feature = "tunnel"))]
             tunnel_runtime: None,
             proxy_config,
+            #[cfg(feature = "proxy")]
+            proxy_runtime: control_proxy_runtime,
+            #[cfg(not(feature = "proxy"))]
+            proxy_runtime: None,
             #[cfg(feature = "tunnel")]
             tunnel_enabled: arguments.enable_tunnel,
             #[cfg(not(feature = "tunnel"))]

@@ -1,11 +1,14 @@
 import type {
   CertificateConfig,
+  AcmeAccountInput,
+  DnsAccountInput,
   ClientService,
   ConfigSnapshot,
   Dashboard,
   GroupConfig,
   ProxyConfig,
   ProxyListenerConfig,
+  ProxyRuntimeState,
   RouteConfig,
   ServerConfig,
   ServerQuicConfig,
@@ -34,7 +37,7 @@ async function request<T>(path: string, token: string, init: RequestInit = {}): 
     const body = await response.json().catch(() => ({ error: `请求失败 (${response.status})` }));
     throw new ApiError(response.status, body.error ?? `请求失败 (${response.status})`);
   }
-  return response.status === 204 ? (undefined as T) : response.json();
+  return response.status === 204 || response.status === 202 ? (undefined as T) : response.json();
 }
 
 export async function login(username: string, password: string) {
@@ -88,11 +91,20 @@ export const setProxyListener = (token: string, listener: ProxyListenerConfig) =
 export const createCertificate = (token: string, certificate: CertificateConfig) =>
   writeConfig<ProxyConfig, CertificateConfig>('/api/config/proxy/certificates', token, 'POST', certificate);
 
-export const updateCertificate = (token: string, name: string, certificate: CertificateConfig) =>
-  writeConfig<ProxyConfig, CertificateConfig>(namedPath('/api/config/proxy/certificates', name), token, 'PUT', certificate);
+export const updateCertificate = (token: string, id: string, certificate: CertificateConfig) =>
+  writeConfig<ProxyConfig, CertificateConfig>(namedPath('/api/config/proxy/certificates', id), token, 'PUT', certificate);
 
-export const deleteCertificate = (token: string, name: string) =>
-  deleteConfig<ProxyConfig>(namedPath('/api/config/proxy/certificates', name), token);
+export const deleteCertificate = (token: string, id: string) =>
+  deleteConfig<ProxyConfig>(namedPath('/api/config/proxy/certificates', id), token);
+
+export const issueCertificate = (token: string, id: string) =>
+  request<void>(`${namedPath('/api/proxy/certificates', id)}/issue`, token, { method: 'POST' });
+
+export const continueCertificate = (token: string, id: string) =>
+  request<void>(`${namedPath('/api/proxy/certificates', id)}/continue`, token, { method: 'POST' });
+
+export const getProxyRuntime = (token: string, signal?: AbortSignal) =>
+  request<ProxyRuntimeState>('/api/proxy/runtime', token, { signal });
 
 export const createRoute = (token: string, route: RouteConfig) =>
   writeConfig<ProxyConfig, RouteConfig>('/api/config/proxy/routes', token, 'POST', route);
@@ -152,3 +164,23 @@ export async function streamDashboard(
     }
   }
 }
+export const createAcmeAccount = (token: string, account: AcmeAccountInput) =>
+  writeConfig<ProxyConfig, AcmeAccountInput>('/api/config/proxy/acme-accounts', token, 'POST', account);
+
+export const updateAcmeAccount = (token: string, id: string, account: AcmeAccountInput) =>
+  writeConfig<ProxyConfig, AcmeAccountInput>(namedPath('/api/config/proxy/acme-accounts', id), token, 'PUT', account);
+
+export const deleteAcmeAccount = (token: string, id: string) =>
+  deleteConfig<ProxyConfig>(namedPath('/api/config/proxy/acme-accounts', id), token);
+
+export const createDnsAccount = (token: string, account: DnsAccountInput) =>
+  writeConfig<ProxyConfig, DnsAccountInput>('/api/config/proxy/dns-accounts', token, 'POST', account);
+
+export const updateDnsAccount = (token: string, id: string, account: DnsAccountInput) =>
+  writeConfig<ProxyConfig, DnsAccountInput>(namedPath('/api/config/proxy/dns-accounts', id), token, 'PUT', account);
+
+export const deleteDnsAccount = (token: string, id: string) =>
+  deleteConfig<ProxyConfig>(namedPath('/api/config/proxy/dns-accounts', id), token);
+
+export const testDnsAccount = (token: string, id: string) =>
+  request<void>(`${namedPath('/api/config/proxy/dns-accounts', id)}/test`, token, { method: 'POST' });

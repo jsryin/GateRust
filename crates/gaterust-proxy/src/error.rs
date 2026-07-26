@@ -24,8 +24,22 @@ pub enum ProxyError {
     Tls(String),
     #[error("ACME 操作失败: {0}")]
     Acme(String),
-    #[error("Cloudflare API 操作失败: {0}")]
-    Cloudflare(String),
+    #[error("DNS 操作失败: {0}")]
+    Dns(String),
+    #[error("代理运行时操作失败: {0}")]
+    Runtime(String),
+}
+
+impl From<acme2_eab::Error> for ProxyError {
+    fn from(error: acme2_eab::Error) -> Self {
+        Self::Acme(error.to_string())
+    }
+}
+
+impl From<openssl::error::ErrorStack> for ProxyError {
+    fn from(error: openssl::error::ErrorStack) -> Self {
+        Self::Acme(error.to_string())
+    }
 }
 
 pub type Result<T, E = ProxyError> = std::result::Result<T, E>;

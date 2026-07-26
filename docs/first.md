@@ -7,7 +7,7 @@ Rust 单二进制工具，实现**内网穿透（QUIC）** + **反向代理 + �
 目标：**高性能 + 极低资源（128MB 服务器）+ 模块化 + 安全**。
 
 ### 技术栈（现代 + 轻量）
-- **核心**：Tokio + Axum（控制平面） + quinn（QUIC） + rustls-acme（SSL）。
+- **核心**：Tokio + Axum（控制平面） + quinn（QUIC） + ACME（SSL）。
 - **配置**：TOML（serde） + notify（文件监听）。
 - **前端**：React 静态 SPA（嵌入或 Cloudflare Pages）。
 - **其他**：clap、tracing、rand（密钥生成）、tower。
@@ -24,7 +24,7 @@ unified-server（一个 binary）
 ├── Tunnel Module（QUIC）
 │   └── 分组 + 密钥 + TCP/UDP/SOCKS5 + 限速
 └── Proxy Module
-    └── 反向代理 + rustls-acme + DNS-01
+    └── 反向代理 + ACME 订单运行时 + DNS-01
 ```
 
 **关键逻辑**（必须清晰）：
@@ -51,13 +51,13 @@ unified-server（一个 binary）
 **性能与资源**：QUIC 内置多路复用 + 0-RTT，单 UDP 端口；Rust 异步零拷贝，转发效率高，内存占用极低。
 
 ### 反向代理 + 自动 SSL 模块（已补充新需求）
-- **SSL**：rustls-acme 自动申请/续签。
+- **SSL**：ACME 账户与 DNS-01 自动申请/续签。
   - Let's Encrypt（HTTP-01 / TLS-ALPN-01）。
   - Cloudflare DNS-01（Web UI 配置 Token）。
   - Google Cloud 免费证书支持。
 - **反向代理**：hyper + tower 实现 host/path 路由（轻量）。**支持选择之前已自动申请的某个 SSL 证书**（可反代到公网 IP 或本地端口），Web UI 中可直接选择已管理的证书绑定到域名规则。
-- **自动续期更新**：当选中的 SSL 证书自动续期成功后（rustls-acme 通知或文件变更检测），**自动热更新对应反向代理的 TLS 配置**（通过 channel 通知 Proxy Module 重新加载该域名的证书上下文，无需重启服务）。
-- **关键**：Web UI 配置域名规则后自动处理证书 + 应用；支持自动续签定时任务 + 续期后自动刷新代理 SSL。
+- **自动续期更新**：当选中的 SSL 证书自动续期成功后，证书运行时会**自动热更新对应反向代理的 TLS 配置**，无需重启服务。
+- **关键**：Web UI 保存托管证书后由用户点击申请；自动续签仅适用于 DNS 账户验证，并在真实到期时间前 14 天启动，续签成功后热更新代理 SSL。
 
 ### Web UI（中心控制）
 - React 静态 SPA（支持 Cloudflare Pages 独立部署，调用后端 API）。
@@ -78,7 +78,7 @@ Tauri 2 桌面程序直接嵌入 Rust 客户端运行时，无需启动额外后
 1. 基础框架（Axum + TOML + 共享 Config + CLI flag）。
 2. Control Plane + Web UI 骨架 + 配置热重载机制。
 3. Tunnel Module（QUIC + 分组 + 密钥 + 隧道类型 + 限速，与 Control Plane 集成）。
-4. Proxy Module（rustls-acme + DNS-01 + 选择已有证书 + 续期自动更新代理 SSL，与 Tunnel 联动）。
+4. Proxy Module（ACME + DNS-01 + 选择已有证书 + 续期自动更新代理 SSL，与 Tunnel 联动）。
 5. 客户端 + deploy.sh（含卸载 + 自启开关） + 测试 + 文档。
 
 **总结关键优势**：
