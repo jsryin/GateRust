@@ -103,7 +103,7 @@ export function ClientGenerator({ config, token }: ClientGeneratorProps) {
         <>
           {error && <Notice tone="error">{error}</Notice>}
           <Panel>
-            <PanelHeader description="用于建立 QUIC 控制连接" title="连接信息" />
+            <PanelHeader title="连接信息" />
             <FormGrid columns={4}>
               <Field label="访问分组">
                 <Select onChange={(event) => setGroup(event.target.value)} value={group}>
@@ -117,7 +117,7 @@ export function ClientGenerator({ config, token }: ClientGeneratorProps) {
           </Panel>
 
           <Panel>
-            <PanelHeader description="为服务端隧道指定此客户端上的目标地址" title="本地服务" />
+            <PanelHeader title="本地服务" />
             {services.length ? (
               <div className="px-5 sm:px-6">
                 {services.map((service, index) => (

@@ -62,10 +62,7 @@ export function AppShell({ active, children, onLogout, onNavigate, onToggleTheme
           <div className="grid h-7 w-7 place-items-center rounded-md bg-[var(--button-neutral)] text-[color:var(--fg-subtle)] shadow-[var(--buttons-neutral)]">
             <Network className="h-4 w-4" />
           </div>
-          <div className="min-w-0">
-            <div className="txt-compact-small-plus truncate">GateRust</div>
-            <div className="txt-compact-xsmall text-[color:var(--fg-muted)]">中心控制台</div>
-          </div>
+          <div className="txt-compact-small-plus truncate">GateRust</div>
           <Button
             aria-label="关闭导航"
             className="ml-auto lg:hidden"

@@ -45,7 +45,7 @@ export function Dashboard({ config, dashboard }: DashboardProps) {
       </section>
 
       <Panel>
-        <PanelHeader description="当前进程的启用状态与配置载入情况" title="模块状态" />
+        <PanelHeader title="模块状态" />
         <div className="px-5 sm:px-6">
           <ModuleStatus
             description={config.tunnel ? `${config.tunnel.quic.bind} · 已载入配置` : '尚未创建配置'}

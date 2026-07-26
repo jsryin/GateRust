@@ -204,7 +204,6 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
               <Pencil className="h-4 w-4" />
             </Button>
           )}
-          description="HTTP、HTTPS 入口与 ACME 缓存"
           title="代理监听"
         />
         <FormGrid columns={4}>
@@ -245,7 +244,6 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
                 新建证书
               </Button>
             )}
-            description="ACME 签发、DNS Provider 与续期配置"
             title="托管证书"
           />
           {draft.certificates.length ? (
@@ -298,7 +296,6 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
                 新建路由
               </Button>
             )}
-            description="按 Host 和路径前缀转发至上游"
             title="域名路由"
           />
           {draft.routes.length ? (
@@ -345,7 +342,6 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
       <Dialog open={editor !== null} onOpenChange={(open) => !open && !saving && setEditor(null)}>
         {editor && (
           <DialogContent
-            description={editor === 'listener' || originalName ? '修改现有配置项' : '创建新的配置项'}
             title={editor === 'listener' ? '代理监听' : editor === 'certificate' ? '托管证书' : '域名路由'}
           >
             <DialogBody>
