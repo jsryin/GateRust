@@ -56,13 +56,13 @@ sudo systemctl start gaterust.service
 
 ## 发布流程
 
-发布 GitHub Tag：
+创建Tag：
 
 ```bash
 ./scripts/release.mjs 0.2.0
 ```
 
-默认只创建本地提交和 Tag。确认无误后可手动推送，或者增加 `--push`，将当前分支和 Tag 原子推送到 `origin` 并触发 GitHub Actions：
+创建并发布 GitHub Tag：
 
 ```bash
 ./scripts/release.mjs 0.2.0 --push
