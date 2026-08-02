@@ -1,3 +1,4 @@
+mod endpoint;
 mod socks5;
 mod stream;
 mod udp;
@@ -18,7 +19,7 @@ use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use quinn::{ConnectionError, Endpoint};
 use subtle::ConstantTimeEq as _;
 use tokio::{
-    sync::{OwnedSemaphorePermit, RwLock, Semaphore, oneshot},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore, oneshot, watch},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -27,10 +28,7 @@ use zeroize::Zeroize as _;
 use crate::{
     Result, TunnelError, bootstrap,
     close::{ApplicationCloseCode, connection_error_or},
-    config::{
-        GroupSecret, ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind,
-        validate_group_key,
-    },
+    config::{GroupSecret, ServerConfig, ServerTunnelConfig, TunnelKind, validate_group_key},
     identity::validate_device_id,
     protocol::{
         AuthenticationStatus, CertificateBootstrapRequest, CertificateBootstrapResponse,
@@ -43,6 +41,8 @@ use crate::{
     tls,
     watcher::ConfigWatcher,
 };
+
+use self::endpoint::QuicEndpoint;
 
 const MAX_PENDING_AUTHENTICATIONS: usize = 32;
 const MAX_PENDING_AUTHENTICATIONS_PER_IP: usize = 4;
@@ -93,23 +93,21 @@ pub async fn run_server_with_runtime(
     let config_path = config_path.as_ref().to_owned();
     let initial = ServerConfig::load(&config_path)?;
     let mut watcher = ConfigWatcher::new(&config_path)?;
-    let (endpoint, certificate) = tls::server_endpoint(&initial.quic)?;
-    let certificate = Arc::new(certificate);
-    let local_address = endpoint.local_addr()?;
+    let mut quic = QuicEndpoint::bind(initial.quic.clone())?;
+    let local_address = quic.endpoint().local_addr()?;
     let credentials = initial.credentials();
     runtime.apply_credentials(&credentials).await;
     let groups = Arc::new(RwLock::new(credentials));
     let mut listeners = ListenerManager::new(runtime.clone());
     listeners.apply(&initial.tunnels).await?;
-    runtime.report_config_applied(&initial, false)?;
+    runtime.report_config_applied(&initial)?;
     let accept_task = tokio::spawn(accept_connections(
-        endpoint.clone(),
+        quic.endpoint().clone(),
         runtime.clone(),
         Arc::clone(&groups),
-        certificate,
+        quic.subscribe_credentials(),
         cancellation.child_token(),
     ));
-    let immutable = initial.quic;
     tracing::info!(address = %local_address, "QUIC 隧道服务端已启动");
 
     loop {
@@ -121,9 +119,9 @@ pub async fn run_server_with_runtime(
                 }
                 reload_server(
                     &config_path,
-                    &immutable,
                     &runtime,
                     &groups,
+                    &mut quic,
                     &mut listeners,
                 ).await;
             }
@@ -131,22 +129,22 @@ pub async fn run_server_with_runtime(
     }
 
     cancellation.cancel();
-    endpoint.close(
+    quic.endpoint().close(
         ApplicationCloseCode::ServerShutdown.value(),
         b"server shutdown",
     );
     listeners.shutdown().await;
     await_task(accept_task, "QUIC 接入任务").await;
-    endpoint.wait_idle().await;
+    quic.endpoint().wait_idle().await;
     tracing::info!("QUIC 隧道服务端已停止");
     Ok(())
 }
 
 async fn reload_server(
     path: &Path,
-    immutable: &ServerQuicConfig,
     runtime: &TunnelRuntime,
     groups: &RwLock<Vec<(String, GroupSecret)>>,
+    quic: &mut QuicEndpoint,
     listeners: &mut ListenerManager,
 ) {
     let config = match ServerConfig::load(path) {
@@ -157,26 +155,52 @@ async fn reload_server(
             return;
         }
     };
-    let restart_required = &config.quic != immutable;
+    let quic_update = match quic.prepare(&config.quic) {
+        Ok(update) => update,
+        Err(error) => {
+            tracing::error!(%error, "应用 QUIC 监听配置失败，继续使用当前入口");
+            report_config_failed(runtime, &config, error.to_string());
+            return;
+        }
+    };
     let credentials = config.credentials();
+    let previous_tunnels = quic_update.as_ref().map(|_| listeners.configs());
     if let Err(error) = listeners.apply(&config.tunnels).await {
         tracing::error!(%error, "应用隧道监听配置失败");
-        if let Err(status_error) =
-            runtime.report_config_failed(&config, restart_required, error.to_string())
+        report_config_failed(runtime, &config, error.to_string());
+        return;
+    }
+    if let Some(update) = quic_update
+        && let Err(error) = quic.apply(update)
+    {
+        tracing::error!(%error, "切换 QUIC 监听配置失败，继续使用当前入口");
+        let error = match listeners
+            .apply(previous_tunnels.as_deref().unwrap_or_default())
+            .await
         {
-            tracing::error!(%status_error, "记录隧道配置应用失败状态失败");
-        }
+            Ok(()) => error.to_string(),
+            Err(rollback_error) => {
+                format!("切换 QUIC 入口失败: {error}; 回滚隧道监听也失败: {rollback_error}")
+            }
+        };
+        report_config_failed(runtime, &config, error);
         return;
     }
     runtime.apply_credentials(&credentials).await;
     *groups.write().await = credentials;
-    if let Err(error) = runtime.report_config_applied(&config, restart_required) {
+    if let Err(error) = runtime.report_config_applied(&config) {
         tracing::error!(%error, "记录隧道配置应用状态失败");
     }
-    if restart_required {
-        tracing::warn!("QUIC 监听或 TLS 文件变更需要重启；分组和隧道配置已热更新");
-    } else {
-        tracing::info!(tunnels = config.tunnels.len(), "服务端配置已热更新");
+    tracing::info!(
+        quic = %config.quic.bind,
+        tunnels = config.tunnels.len(),
+        "服务端配置已热更新"
+    );
+}
+
+fn report_config_failed(runtime: &TunnelRuntime, config: &ServerConfig, error: String) {
+    if let Err(status_error) = runtime.report_config_failed(config, error) {
+        tracing::error!(%status_error, "记录隧道配置应用失败状态失败");
     }
 }
 
@@ -184,7 +208,7 @@ async fn accept_connections(
     endpoint: Endpoint,
     runtime: TunnelRuntime,
     groups: Arc<RwLock<Vec<(String, GroupSecret)>>>,
-    certificate: Arc<rustls::pki_types::CertificateDer<'static>>,
+    credentials: watch::Receiver<Arc<tls::ServerCredentials>>,
     cancellation: CancellationToken,
 ) {
     let ids = Arc::new(AtomicU64::new(1));
@@ -212,21 +236,28 @@ async fn accept_connections(
                         tracing::debug!("待认证客户端数量已达上限，拒绝新连接");
                         continue;
                     };
+                    let credentials = credentials.borrow().clone();
+                    let connecting = match incoming.accept_with(Arc::clone(&credentials.server_config)) {
+                        Ok(connecting) => connecting,
+                        Err(error) => {
+                            tracing::debug!(%remote, %error, "接受 QUIC 连接失败");
+                            continue;
+                        }
+                    };
                     let runtime = runtime.clone();
                     let groups = Arc::clone(&groups);
-                    let certificate = Arc::clone(&certificate);
                     let id = ids.fetch_add(1, Ordering::Relaxed);
                     tasks.spawn(async move {
                         let admission = AuthenticationAdmission {
                             _global: permit,
                             _peer: peer_permit,
                         };
-                        match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
+                        match tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting).await {
                             Err(_) => tracing::debug!(%remote, "QUIC 握手超时"),
                             Ok(connection) => {
                                 match connection {
                                     Ok(connection) => {
-                                        if let Err(error) = authenticate(connection, id, runtime, groups, certificate, admission).await {
+                                        if let Err(error) = authenticate(connection, id, runtime, groups, credentials, admission).await {
                                             tracing::warn!(%error, "QUIC 客户端认证失败");
                                         }
                                     }
@@ -257,7 +288,7 @@ async fn authenticate(
     id: u64,
     runtime: TunnelRuntime,
     groups: Arc<RwLock<Vec<(String, GroupSecret)>>>,
-    certificate: Arc<rustls::pki_types::CertificateDer<'static>>,
+    credentials: Arc<tls::ServerCredentials>,
     authentication_admission: AuthenticationAdmission,
 ) -> Result<()> {
     let mut changes = runtime.subscribe();
@@ -278,7 +309,7 @@ async fn authenticate(
                 &mut send,
                 request,
                 &groups,
-                certificate.as_ref(),
+                &credentials.certificate,
                 authentication_admission,
             )
             .await;
@@ -611,6 +642,13 @@ impl ListenerManager {
             active: HashMap::new(),
             retired: Vec::new(),
         }
+    }
+
+    fn configs(&self) -> Vec<ServerTunnelConfig> {
+        self.active
+            .values()
+            .map(|handle| handle.config.clone())
+            .collect()
     }
 
     async fn apply(&mut self, configs: &[ServerTunnelConfig]) -> Result<()> {

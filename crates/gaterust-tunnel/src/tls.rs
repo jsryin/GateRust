@@ -13,16 +13,21 @@ use crate::{
     config::{MAX_DATA_STREAMS, ServerQuicConfig},
 };
 
-pub(crate) fn server_endpoint(
-    config: &ServerQuicConfig,
-) -> Result<(Endpoint, CertificateDer<'static>)> {
-    let (server, certificate) = build_server_config(config)?;
-    let endpoint = Endpoint::server(server, config.bind)?;
-    Ok((endpoint, certificate))
+pub(crate) struct ServerCredentials {
+    pub(crate) server_config: Arc<ServerConfig>,
+    pub(crate) certificate: CertificateDer<'static>,
+}
+
+pub(crate) fn server_credentials(config: &ServerQuicConfig) -> Result<ServerCredentials> {
+    let (server_config, certificate) = build_server_config(config)?;
+    Ok(ServerCredentials {
+        server_config: Arc::new(server_config),
+        certificate,
+    })
 }
 
 pub(crate) fn validate_server_credentials(config: &ServerQuicConfig) -> Result<()> {
-    build_server_config(config).map(drop)
+    server_credentials(config).map(drop)
 }
 
 fn build_server_config(

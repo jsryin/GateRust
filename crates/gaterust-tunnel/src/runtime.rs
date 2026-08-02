@@ -37,7 +37,6 @@ pub struct TunnelRuntimeSnapshot {
 #[derive(Clone, Serialize)]
 pub struct TunnelConfigStatus {
     pub revision: u64,
-    pub restart_required: bool,
     pub last_apply_error: Option<String>,
 }
 
@@ -113,7 +112,6 @@ impl Default for TunnelRuntime {
             fingerprint: None,
             status: TunnelConfigStatus {
                 revision: 0,
-                restart_required: false,
                 last_apply_error: None,
             },
         });
@@ -272,22 +270,17 @@ impl TunnelRuntime {
         }
     }
 
-    pub(crate) fn report_config_applied(
-        &self,
-        config: &ServerConfig,
-        restart_required: bool,
-    ) -> crate::Result<()> {
-        self.publish_config_status(config_fingerprint(config)?, restart_required, None);
+    pub(crate) fn report_config_applied(&self, config: &ServerConfig) -> crate::Result<()> {
+        self.publish_config_status(config_fingerprint(config)?, None);
         Ok(())
     }
 
     pub(crate) fn report_config_failed(
         &self,
         config: &ServerConfig,
-        restart_required: bool,
         error: String,
     ) -> crate::Result<()> {
-        self.publish_config_status(config_fingerprint(config)?, restart_required, Some(error));
+        self.publish_config_status(config_fingerprint(config)?, Some(error));
         Ok(())
     }
 
@@ -430,16 +423,10 @@ impl TunnelRuntime {
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
-    fn publish_config_status(
-        &self,
-        fingerprint: [u8; 32],
-        restart_required: bool,
-        last_apply_error: Option<String>,
-    ) {
+    fn publish_config_status(&self, fingerprint: [u8; 32], last_apply_error: Option<String>) {
         self.config_status.send_modify(|state| {
             state.fingerprint = Some(fingerprint);
             state.status.revision = state.status.revision.wrapping_add(1);
-            state.status.restart_required = restart_required;
             state.status.last_apply_error = last_apply_error;
         });
     }
@@ -543,7 +530,7 @@ mod tests {
         let config = config();
         let revision = runtime.config_revision();
         runtime
-            .report_config_applied(&config, true)
+            .report_config_applied(&config)
             .expect("记录配置状态");
 
         let status = runtime
@@ -552,7 +539,6 @@ mod tests {
             .expect("生成配置指纹")
             .expect("应匹配配置状态");
 
-        assert!(status.restart_required);
         assert_eq!(status.last_apply_error, None);
     }
 
@@ -561,7 +547,7 @@ mod tests {
         let runtime = TunnelRuntime::new();
         let mut applied = config();
         runtime
-            .report_config_applied(&applied, false)
+            .report_config_applied(&applied)
             .expect("记录配置状态");
         let revision = runtime.config_revision();
         applied.quic.bind = "127.0.0.1:2444".parse().expect("测试地址有效");
@@ -580,7 +566,7 @@ mod tests {
         let runtime = TunnelRuntime::new();
         let config = config();
         runtime
-            .report_config_applied(&config, false)
+            .report_config_applied(&config)
             .expect("记录配置状态");
         let revision = runtime.config_revision();
         runtime.report_config_load_error("配置文件无效".into());

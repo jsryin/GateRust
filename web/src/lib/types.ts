@@ -171,7 +171,6 @@ export interface TunnelRuntimeState {
   }[];
   config_status: {
     revision: number;
-    restart_required: boolean;
     last_apply_error: string | null;
   };
 }

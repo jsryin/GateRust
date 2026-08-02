@@ -11,9 +11,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ClientConfig, ClientServerConfig, ClientServiceConfig, ClientStatus, ClientTunnelState,
-    TunnelError, TunnelKind, TunnelRuntime, TunnelRuntimeSnapshot, check_server_config,
-    client_control_channel, fetch_server_certificate, run_client_with_shutdown,
-    run_managed_client_with_status, run_server_with_runtime, verify_client_credentials,
+    ServerConfig, TunnelError, TunnelKind, TunnelRuntime, TunnelRuntimeSnapshot,
+    check_server_config, client_control_channel, fetch_server_certificate,
+    run_client_with_shutdown, run_managed_client_with_status, run_server_with_runtime,
+    verify_client_credentials,
 };
 
 const TEST_KEY: &str = "12345678901234567890123456789012";
@@ -103,6 +104,106 @@ async fn bootstraps_certificate_with_key_proof_and_checks_credentials() {
         .await
         .expect_err("错误密钥必须被拒绝");
     assert!(matches!(error, TunnelError::Authentication(_)));
+
+    cancellation.cancel();
+    assert_task_ok(server, "服务端").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hot_reloads_quic_listener_and_tls_credentials() {
+    let directory = tempfile::tempdir().expect("应能创建测试目录");
+    write_certificate(directory.path());
+    write_named_certificate(directory.path(), "rotated.pem", "rotated-key.pem");
+    let initial_address = unused_udp_address();
+    let updated_address = unused_udp_address();
+    write_server_config(
+        directory.path(),
+        initial_address,
+        unused_tcp_address(),
+        unused_udp_address(),
+        unused_tcp_address(),
+        true,
+    );
+
+    let runtime = TunnelRuntime::new();
+    let cancellation = CancellationToken::new();
+    let server_path = directory.path().join("server.toml");
+    let server = tokio::spawn(run_server_with_runtime(
+        server_path.clone(),
+        runtime.clone(),
+        cancellation.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let initial_certificate =
+        fetch_server_certificate(&format!("localhost:{}", initial_address.port()), TEST_KEY)
+            .await
+            .expect("初始 QUIC 入口应可下载证书")
+            .pem()
+            .to_owned();
+
+    let revision = runtime.config_revision();
+    let mut config = ServerConfig::read(&server_path).expect("读取服务端配置");
+    config.quic.bind = updated_address;
+    config.quic.certificate = "rotated.pem".into();
+    config.quic.private_key = "rotated-key.pem".into();
+    write_server_config_value(&server_path, &config);
+    wait_for_runtime(&runtime, |snapshot| {
+        snapshot.config_status.revision > revision
+            && snapshot.config_status.last_apply_error.is_none()
+    })
+    .await;
+
+    let updated_certificate =
+        fetch_server_certificate(&format!("localhost:{}", updated_address.port()), TEST_KEY)
+            .await
+            .expect("更新后的 QUIC 入口应立即可用")
+            .pem()
+            .to_owned();
+    assert_ne!(updated_certificate, initial_certificate);
+
+    cancellation.cancel();
+    assert_task_ok(server, "服务端").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keeps_current_quic_listener_when_rebind_fails() {
+    let directory = tempfile::tempdir().expect("应能创建测试目录");
+    write_certificate(directory.path());
+    let initial_address = unused_udp_address();
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("占用测试 UDP 端口");
+    let occupied_address = occupied.local_addr().expect("读取占用地址");
+    write_server_config(
+        directory.path(),
+        initial_address,
+        unused_tcp_address(),
+        unused_udp_address(),
+        unused_tcp_address(),
+        true,
+    );
+
+    let runtime = TunnelRuntime::new();
+    let cancellation = CancellationToken::new();
+    let server_path = directory.path().join("server.toml");
+    let server = tokio::spawn(run_server_with_runtime(
+        server_path.clone(),
+        runtime.clone(),
+        cancellation.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let revision = runtime.config_revision();
+    let mut config = ServerConfig::read(&server_path).expect("读取服务端配置");
+    config.quic.bind = occupied_address;
+    write_server_config_value(&server_path, &config);
+    wait_for_runtime(&runtime, |snapshot| {
+        snapshot.config_status.revision > revision
+            && snapshot.config_status.last_apply_error.is_some()
+    })
+    .await;
+
+    fetch_server_certificate(&format!("localhost:{}", initial_address.port()), TEST_KEY)
+        .await
+        .expect("换绑失败后原 QUIC 入口应继续可用");
 
     cancellation.cancel();
     assert_task_ok(server, "服务端").await;
@@ -581,14 +682,23 @@ async fn wait_for_runtime(
 }
 
 fn write_certificate(directory: &Path) {
+    write_named_certificate(directory, "server.pem", "server-key.pem");
+}
+
+fn write_named_certificate(directory: &Path, certificate: &str, private_key: &str) {
     let certified =
         generate_simple_self_signed(vec!["localhost".into()]).expect("应能生成测试证书");
-    std::fs::write(directory.join("server.pem"), certified.cert.pem()).expect("应能写入测试证书");
+    std::fs::write(directory.join(certificate), certified.cert.pem()).expect("应能写入测试证书");
     std::fs::write(
-        directory.join("server-key.pem"),
+        directory.join(private_key),
         certified.signing_key.serialize_pem(),
     )
     .expect("应能写入测试私钥");
+}
+
+fn write_server_config_value(path: &Path, config: &ServerConfig) {
+    let content = toml::to_string(config).expect("序列化服务端测试配置");
+    std::fs::write(path, content).expect("写入服务端测试配置");
 }
 
 fn write_ca_certificate(directory: &Path) {

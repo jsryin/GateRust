@@ -89,7 +89,7 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
   const [runtime, setRuntime] = useState<TunnelRuntimeState>({
     clients: [],
     tunnels: [],
-    config_status: { revision: 0, restart_required: false, last_apply_error: null }
+    config_status: { revision: 0, last_apply_error: null }
   });
 
   useEffect(() => {
@@ -174,7 +174,7 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
     }
     await persistMutation(
       () => setTunnelQuic(token, quic),
-      'QUIC 监听配置已保存；修改监听或 TLS 文件后请重启服务'
+      'QUIC 监听配置已应用'
     );
   }
 
@@ -284,10 +284,6 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
       {runtime.config_status.last_apply_error && (
         <Notice tone="error">最近一次运行时应用失败：{runtime.config_status.last_apply_error}</Notice>
       )}
-      {runtime.config_status.restart_required && (
-        <Notice tone="warning">QUIC 监听或 TLS 文件已变更，重启服务后生效</Notice>
-      )}
-
       <Panel>
         <PanelHeader
           action={(
