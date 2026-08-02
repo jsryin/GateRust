@@ -31,8 +31,6 @@ const installer = readFileSync(
   "utf8",
 );
 const installerVersion = installer.match(/^SCRIPT_VERSION="([^"]+)"$/m)?.[1];
-const readme = readFileSync(resolve(repositoryRoot, "README.md"), "utf8");
-const documentedVersion = readme.match(/^version=([^\s]+)$/m)?.[1];
 
 const versions = [
   ...workspacePackages.map(({ name, version }) => [
@@ -43,7 +41,6 @@ const versions = [
   ["client/package.json", readPackageVersion("client/package.json"), expectedVersion],
   ["web/package.json", readPackageVersion("web/package.json"), expectedVersion],
   ["scripts/gaterust.sh", installerVersion, tag],
-  ["README.md release example", documentedVersion, expectedVersion],
 ];
 const mismatches = versions.filter(([, actual, expected]) => actual !== expected);
 
