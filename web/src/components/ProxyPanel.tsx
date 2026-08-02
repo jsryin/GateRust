@@ -90,7 +90,7 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
     try {
       saved(await setProxyListener(token, listener));
       setListener(null);
-      setMessage('代理监听配置已保存');
+      setMessage('代理监听配置已应用');
       refreshRuntime();
     } catch (cause) {
       setError(errorMessage(cause, '保存代理监听失败'));
@@ -103,7 +103,6 @@ export function ProxyPanel({ config, onSaved, token }: ProxyPanelProps) {
     <div className="space-y-4">
       <PageIntro description="域名代理与证书账户" title="Web 与 SSL" />
       {message && <Notice tone="success">{message}</Notice>}
-      {runtime?.config_status.restart_required && <Notice tone="warning">监听地址、缓存目录或连接上限已变更，重启服务后生效；证书与路由配置已应用。</Notice>}
       {runtime?.config_status.last_apply_error && <Notice tone="error">{runtime.config_status.last_apply_error}</Notice>}
 
       <Panel>

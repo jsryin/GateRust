@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     AcmeAccountConfig, CertificateConfig, CertificateValidation, DnsAccountConfig, ProxyConfig,
-    ProxyError, ProxyListenerConfig, Result,
+    ProxyError, Result,
     acme::{
         IssuanceRequest, IssueResult, IssuedCertificate, ManualDnsRecord, ManualOrder, begin_issue,
         continue_manual, verify_manual,
@@ -42,6 +42,7 @@ struct RuntimeInner {
     commands: mpsc::Sender<Command>,
     receiver: Mutex<Option<mpsc::Receiver<Command>>>,
     snapshot: watch::Sender<ProxyRuntimeSnapshot>,
+    config_apply: watch::Sender<ConfigApplyState>,
 }
 
 #[derive(Clone, Serialize)]
@@ -53,8 +54,13 @@ pub struct ProxyRuntimeSnapshot {
 #[derive(Clone, Serialize)]
 pub struct ProxyConfigStatus {
     pub revision: u64,
-    pub restart_required: bool,
     pub last_apply_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct ConfigApplyState {
+    config: Option<ProxyConfig>,
+    status: ProxyConfigStatus,
 }
 
 #[derive(Clone, Serialize)]
@@ -81,8 +87,7 @@ pub enum CertificateStatus {
 enum Command {
     Apply {
         config: ProxyConfig,
-        restart_required: bool,
-        response: oneshot::Sender<Result<ProxyConfigStatus>>,
+        response: oneshot::Sender<Result<()>>,
     },
     Issue {
         certificate_id: String,
@@ -105,7 +110,13 @@ impl Default for ProxyRuntime {
             certificates: Vec::new(),
             config_status: ProxyConfigStatus {
                 revision: 0,
-                restart_required: false,
+                last_apply_error: None,
+            },
+        });
+        let (config_apply, _) = watch::channel(ConfigApplyState {
+            config: None,
+            status: ProxyConfigStatus {
+                revision: 0,
                 last_apply_error: None,
             },
         });
@@ -114,6 +125,7 @@ impl Default for ProxyRuntime {
                 commands,
                 receiver: Mutex::new(Some(receiver)),
                 snapshot,
+                config_apply,
             }),
         }
     }
@@ -135,24 +147,53 @@ impl ProxyRuntime {
         self.inner.snapshot.subscribe()
     }
 
-    /// 应用已通过校验的代理配置，并等待证书运行时完成缓存装载。
-    ///
-    /// # Errors
-    ///
-    /// 运行时未启动、命令队列关闭或缓存证书无效时返回错误。
-    pub async fn apply_config(
+    /// 等待代理服务处理指定配置，返回匹配配置的应用结果。
+    /// 超过等待期限时返回 `None`。
+    #[must_use]
+    pub async fn wait_for_config(
         &self,
-        config: ProxyConfig,
-        restart_required: bool,
-    ) -> Result<ProxyConfigStatus> {
+        config: &ProxyConfig,
+        after_revision: u64,
+        timeout: Duration,
+    ) -> Option<ProxyConfigStatus> {
+        let mut changes = self.inner.config_apply.subscribe();
+        let wait = async {
+            loop {
+                let current = changes.borrow_and_update().clone();
+                if current.status.revision != after_revision
+                    && current.config.as_ref() == Some(config)
+                {
+                    return Some(current.status);
+                }
+                if changes.changed().await.is_err() {
+                    return None;
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.unwrap_or(None)
+    }
+
+    #[must_use]
+    pub fn config_revision(&self) -> u64 {
+        self.inner.snapshot.borrow().config_status.revision
+    }
+
+    pub(crate) async fn apply_config(&self, config: ProxyConfig) -> Result<()> {
         let (response, result) = oneshot::channel();
-        self.send(Command::Apply {
-            config,
-            restart_required,
-            response,
-        })
-        .await?;
+        self.send(Command::Apply { config, response }).await?;
         result.await.map_err(runtime_closed)?
+    }
+
+    pub(crate) fn report_config_applied(&self, config: &ProxyConfig) {
+        self.publish_config_status(Some(config.clone()), None);
+    }
+
+    pub(crate) fn report_config_failed(&self, config: &ProxyConfig, error: String) {
+        self.publish_config_status(Some(config.clone()), Some(error));
+    }
+
+    pub(crate) fn report_config_load_error(&self, error: String) {
+        self.publish_config_status(None, Some(error));
     }
 
     /// 发起指定证书的首次申请或重新申请。
@@ -204,6 +245,19 @@ impl ProxyRuntime {
             .map_err(|_| ProxyError::Runtime("代理运行时未启动".into()))
     }
 
+    fn publish_config_status(&self, config: Option<ProxyConfig>, error: Option<String>) {
+        self.inner.snapshot.send_modify(|snapshot| {
+            snapshot.config_status = ProxyConfigStatus {
+                revision: snapshot.config_status.revision.wrapping_add(1),
+                last_apply_error: error,
+            };
+        });
+        let status = self.inner.snapshot.borrow().config_status.clone();
+        self.inner
+            .config_apply
+            .send_replace(ConfigApplyState { config, status });
+    }
+
     pub(crate) async fn run_manager(
         &self,
         resolver: CertificateResolver,
@@ -241,7 +295,6 @@ struct CertificateManager {
     account_gates: HashMap<String, Arc<Semaphore>>,
     dns_gates: HashMap<String, Arc<Semaphore>>,
     generation: u64,
-    config_revision: u64,
     issuance_permits: Arc<Semaphore>,
     dns_test_permits: Arc<Semaphore>,
 }
@@ -284,7 +337,6 @@ impl CertificateManager {
             account_gates: HashMap::new(),
             dns_gates: HashMap::new(),
             generation: 0,
-            config_revision: 0,
             issuance_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_ISSUANCE)),
             dns_test_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DNS_TESTS)),
         }
@@ -325,12 +377,8 @@ impl CertificateManager {
 
     async fn handle_command(&mut self, command: Command) {
         match command {
-            Command::Apply {
-                config,
-                restart_required,
-                response,
-            } => {
-                let result = self.apply_config(config, restart_required).await;
+            Command::Apply { config, response } => {
+                let result = self.apply_config(config).await;
                 if response.send(result).is_err() {
                     tracing::debug!("配置应用请求方已断开");
                 }
@@ -383,11 +431,7 @@ impl CertificateManager {
         }
     }
 
-    async fn apply_config(
-        &mut self,
-        config: ProxyConfig,
-        restart_required: bool,
-    ) -> Result<ProxyConfigStatus> {
+    async fn apply_config(&mut self, config: ProxyConfig) -> Result<()> {
         let reload = certificates_requiring_reload(self.config.as_ref(), &config);
         let desired_ids = config
             .certificates
@@ -446,10 +490,9 @@ impl CertificateManager {
             }
         }
         self.config = Some(config);
-        self.config_revision = self.config_revision.wrapping_add(1);
-        self.publish_config(restart_required, None);
+        self.publish();
         self.schedule_due();
-        Ok(self.snapshot.borrow().config_status.clone())
+        Ok(())
     }
 
     fn start_issue(&mut self, certificate_id: &str, renewal: bool) -> Result<()> {
@@ -753,34 +796,11 @@ impl CertificateManager {
         self.generation
     }
 
-    fn publish_config(&self, restart_required: bool, error: Option<String>) {
-        let mut snapshot = self.build_snapshot();
-        snapshot.config_status = ProxyConfigStatus {
-            revision: self.config_revision,
-            restart_required,
-            last_apply_error: error,
-        };
-        self.snapshot.send_replace(snapshot);
-    }
-
     fn publish(&self) {
-        let config_status = self.snapshot.borrow().config_status.clone();
-        let mut snapshot = self.build_snapshot();
-        snapshot.config_status = config_status;
-        self.snapshot.send_replace(snapshot);
-    }
-
-    fn build_snapshot(&self) -> ProxyRuntimeSnapshot {
         let mut certificates = self.statuses.values().cloned().collect::<Vec<_>>();
         certificates.sort_unstable_by(|left, right| left.certificate_id.cmp(&right.certificate_id));
-        ProxyRuntimeSnapshot {
-            certificates,
-            config_status: ProxyConfigStatus {
-                revision: self.config_revision,
-                restart_required: false,
-                last_apply_error: None,
-            },
-        }
+        self.snapshot
+            .send_modify(|snapshot| snapshot.certificates = certificates);
     }
 }
 
@@ -956,16 +976,10 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
-pub(crate) fn listener_restart_required(
-    running: &ProxyListenerConfig,
-    requested: &ProxyListenerConfig,
-) -> bool {
-    running != requested
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProxyListenerConfig;
 
     fn proxy_config() -> ProxyConfig {
         ProxyConfig {
@@ -1008,13 +1022,44 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn waits_for_matching_config_application_status() {
+        let runtime = ProxyRuntime::new();
+        let config = proxy_config();
+        let revision = runtime.config_revision();
+        runtime.report_config_applied(&config);
+
+        let status = runtime
+            .wait_for_config(&config, revision, Duration::from_millis(50))
+            .await
+            .expect("应匹配配置状态");
+
+        assert_eq!(status.last_apply_error, None);
+    }
+
+    #[tokio::test]
+    async fn ignores_status_for_another_config() {
+        let runtime = ProxyRuntime::new();
+        let expected = proxy_config();
+        let mut applied = expected.clone();
+        applied.proxy.max_connections += 1;
+        let revision = runtime.config_revision();
+        runtime.report_config_applied(&applied);
+
+        assert!(
+            runtime
+                .wait_for_config(&expected, revision, Duration::from_millis(10))
+                .await
+                .is_none()
+        );
+    }
+
     #[test]
     fn scheduler_marks_elapsed_certificate_expired() {
         let (snapshot, _) = watch::channel(ProxyRuntimeSnapshot {
             certificates: Vec::new(),
             config_status: ProxyConfigStatus {
                 revision: 0,
-                restart_required: false,
                 last_apply_error: None,
             },
         });

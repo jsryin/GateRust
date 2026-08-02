@@ -1,5 +1,3 @@
-#[cfg(feature = "proxy")]
-use std::sync::Mutex;
 use std::{
     fs::{File, OpenOptions},
     io::Write as _,
@@ -12,7 +10,7 @@ use std::{
 
 use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "tunnel")]
+#[cfg(any(feature = "tunnel", feature = "proxy"))]
 use tokio::sync::Semaphore;
 use tokio::sync::{RwLock, watch};
 
@@ -91,11 +89,9 @@ struct StoreInner {
     #[cfg(feature = "proxy")]
     proxy_path: PathBuf,
     #[cfg(feature = "proxy")]
-    proxy_writer: Mutex<()>,
+    proxy_writer: Semaphore,
     #[cfg(feature = "proxy")]
     proxy_runtime: Option<gaterust_proxy::ProxyRuntime>,
-    #[cfg(feature = "proxy")]
-    running_proxy_listener: Option<gaterust_proxy::ProxyListenerConfig>,
 }
 
 impl ConfigStore {
@@ -132,11 +128,9 @@ impl ConfigStore {
                 #[cfg(feature = "proxy")]
                 proxy_path: absolute_path(&options.proxy_config)?,
                 #[cfg(feature = "proxy")]
-                proxy_writer: Mutex::new(()),
+                proxy_writer: Semaphore::new(1),
                 #[cfg(feature = "proxy")]
                 proxy_runtime: options.proxy_runtime.clone(),
-                #[cfg(feature = "proxy")]
-                running_proxy_listener: proxy_config.map(|config| config.proxy),
             }),
         })
     }
@@ -636,20 +630,22 @@ impl ConfigStore {
         F: FnOnce(&mut gaterust_proxy::ProxyConfig) -> Result<()> + Send + 'static,
     {
         let inner = Arc::clone(&self.inner);
+        let _permit = inner
+            .proxy_writer
+            .acquire()
+            .await
+            .map_err(|_| ControlError::WriteRuntimeConfig("代理配置写入通道已关闭".into()))?;
+        let runtime_revision = self
+            .inner
+            .proxy_runtime
+            .as_ref()
+            .map_or(0, gaterust_proxy::ProxyRuntime::config_revision);
+        let path = inner.proxy_path.clone();
         let (stored, runtime_config) = tokio::task::spawn_blocking(move || {
-            // 文件锁仅存在于阻塞任务内，不跨异步等待持有。
-            let _guard = inner
-                .proxy_writer
-                .lock()
-                .map_err(|_| ControlError::WriteRuntimeConfig("代理配置写入锁已损坏".into()))?;
-            let mut config = load_optional_proxy(&inner.proxy_path)?.unwrap_or_else(default_proxy);
+            let mut config = load_optional_proxy(&path)?.unwrap_or_else(default_proxy);
             mutate(&mut config)?;
-            let stored = write_validated(
-                &inner.proxy_path,
-                &config,
-                gaterust_proxy::ProxyConfig::read,
-            )?;
-            let runtime_config = gaterust_proxy::ProxyConfig::load(&inner.proxy_path)
+            let stored = write_validated(&path, &config, gaterust_proxy::ProxyConfig::read)?;
+            let runtime_config = gaterust_proxy::ProxyConfig::load(&path)
                 .map_err(|error| ControlError::ReadRuntimeConfig(error.to_string()))?;
             Ok::<_, ControlError>((stored, runtime_config))
         })
@@ -657,15 +653,17 @@ impl ConfigStore {
         .map_err(|error| ControlError::WriteRuntimeConfig(error.to_string()))??;
         self.update_proxy(Some(stored.clone())).await;
         if let Some(runtime) = &self.inner.proxy_runtime {
-            let restart_required = self
-                .inner
-                .running_proxy_listener
-                .as_ref()
-                .is_some_and(|running| running != &runtime_config.proxy);
-            runtime
-                .apply_config(runtime_config, restart_required)
+            let status = runtime
+                .wait_for_config(
+                    &runtime_config,
+                    runtime_revision,
+                    std::time::Duration::from_secs(5),
+                )
                 .await
-                .map_err(|error| ControlError::ProxyRuntimeApply(error.to_string()))?;
+                .ok_or_else(|| ControlError::ProxyRuntimeApply("等待运行时确认超时".into()))?;
+            if let Some(error) = status.last_apply_error {
+                return Err(ControlError::ProxyRuntimeApply(error));
+            }
         }
         Ok(gaterust_proxy::ProxyConfigView::from(&stored))
     }
