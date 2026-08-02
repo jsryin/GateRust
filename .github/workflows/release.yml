@@ -112,8 +112,105 @@ jobs:
           path: dist/gaterust_*
           if-no-files-found: error
 
-  release:
+  installer:
     needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binaries-linux-*
+          path: installer-input
+          merge-multiple: true
+      - name: Build Web UI
+        working-directory: web
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: Package installer assets
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p installer-dist
+
+          for spec in x86_64:amd64 aarch64:arm64; do
+            arch="${spec%%:*}"
+            release_arch="${spec#*:}"
+            target="$arch-unknown-linux-musl"
+            stage="$(mktemp -d)"
+            mkdir -p "$stage/config"
+
+            install -m 0755 \
+              "installer-input/gaterust_server_${version}_linux_${release_arch}" \
+              "$stage/gaterust-server"
+            cp -a web/dist "$stage/web"
+            install -m 0644 scripts/gaterust.service "$stage/gaterust.service"
+            sed \
+              's#../certs/server.pem#/etc/gaterust/tunnel/server.pem#; s#../certs/server-key.pem#/etc/gaterust/tunnel/server-key.pem#' \
+              config/server.example.toml > "$stage/config/server.example.toml"
+            sed \
+              's#../data/acme#/var/lib/gaterust/proxy/acme#' \
+              config/proxy.example.toml > "$stage/config/proxy.example.toml"
+            sed \
+              's#../web/dist#/usr/local/lib/gaterust/web#' \
+              config/web.example.toml > "$stage/config/web.example.toml"
+            printf '%s\n' "$GITHUB_REF_NAME" > "$stage/VERSION"
+            printf '%s\n' "$target" > "$stage/TARGET"
+            tar -C "$stage" -czf "installer-dist/gaterust-$arch-linux-musl.tar.gz" .
+            rm -rf "$stage"
+          done
+
+          install -m 0755 scripts/gaterust.sh installer-dist/gaterust.sh
+          (
+            cd installer-dist
+            sha256sum \
+              gaterust-x86_64-linux-musl.tar.gz \
+              gaterust-aarch64-linux-musl.tar.gz \
+              gaterust.sh > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+      - name: Verify installer assets
+        run: |
+          set -euo pipefail
+          for arch in x86_64 aarch64; do
+            archive="installer-dist/gaterust-$arch-linux-musl.tar.gz"
+            target="$arch-unknown-linux-musl"
+            archive_files="$(mktemp)"
+            tar -tzf "$archive" > "$archive_files"
+            test "$(tar -xOf "$archive" ./VERSION)" = "$GITHUB_REF_NAME"
+            test "$(tar -xOf "$archive" ./TARGET)" = "$target"
+            for path in \
+              ./gaterust-server \
+              ./gaterust.service \
+              ./config/server.example.toml \
+              ./config/proxy.example.toml \
+              ./config/web.example.toml \
+              ./web/ \
+              ./VERSION \
+              ./TARGET; do
+              grep -Fqx "$path" "$archive_files"
+            done
+            rm -f "$archive_files"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installer-assets
+          path: |
+            installer-dist/gaterust-x86_64-linux-musl.tar.gz
+            installer-dist/gaterust-aarch64-linux-musl.tar.gz
+            installer-dist/gaterust.sh
+            installer-dist/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    needs:
+      - binaries
+      - installer
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -121,11 +218,15 @@ jobs:
           pattern: binaries-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: installer-assets
+          path: dist
       - name: Verify release assets
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 14
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 18
           for target in linux_amd64 linux_arm linux_arm64 mac_amd64 mac_arm64; do
             test -f "dist/gaterust_server_${version}_${target}"
             test -f "dist/gaterust_client_${version}_${target}"
@@ -134,11 +235,16 @@ jobs:
             test -f "dist/gaterust_server_${version}_${target}.exe"
             test -f "dist/gaterust_client_${version}_${target}.exe"
           done
+          test -f dist/gaterust-x86_64-linux-musl.tar.gz
+          test -f dist/gaterust-aarch64-linux-musl.tar.gz
+          test -f dist/gaterust.sh
+          test -f dist/SHA256SUMS
+          (cd dist && sha256sum -c SHA256SUMS)
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           fail_on_unmatched_files: true
           overwrite_files: true
-          files: dist/gaterust_*
+          files: dist/*
       - name: Remove obsolete release assets
         env:
           GH_TOKEN: ${{ github.token }}
