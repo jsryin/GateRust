@@ -1,23 +1,21 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+
+import { versionFromReleaseTag } from "./release-version.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const tag = process.env.TAG;
-
-if (!tag?.startsWith("v") || tag.length === 1) {
-  throw new Error("TAG must be a release tag starting with v");
-}
-
-const expectedVersion = tag.slice(1);
-const metadata = JSON.parse(
-  execFileSync(
-    "cargo",
-    ["metadata", "--locked", "--no-deps", "--format-version", "1"],
-    { cwd: repositoryRoot, encoding: "utf8" },
-  ),
+const expectedVersion = versionFromReleaseTag(tag);
+const execFileAsync = promisify(execFile);
+const { stdout: metadataJson } = await execFileAsync(
+  "cargo",
+  ["metadata", "--locked", "--no-deps", "--format-version", "1"],
+  { cwd: repositoryRoot, encoding: "utf8" },
 );
+const metadata = JSON.parse(metadataJson);
 const workspaceMembers = new Set(metadata.workspace_members);
 const workspacePackages = metadata.packages.filter(({ id }) =>
   workspaceMembers.has(id),
