@@ -36,6 +36,7 @@ SERVICE_FILE_MODE=""
 TEMP_DIR=""
 LOCK_HELD=0
 TRANSACTION=0
+TTY_STATE=""
 STATE_VERSION=""
 STATE_ARCH=""
 STATE_MODULES=""
@@ -56,7 +57,16 @@ cleanup_generated_files() {
     fi
 }
 
+restore_tty() {
+    [ -n "$TTY_STATE" ] || return 0
+    if [ -r /dev/tty ]; then
+        stty "$TTY_STATE" < /dev/tty 2>/dev/null || true
+    fi
+    TTY_STATE=""
+}
+
 cleanup() {
+    restore_tty
     if [ "$TRANSACTION" -eq 1 ]; then
         rollback_install
     fi
@@ -741,11 +751,15 @@ perform_install() {
     say "GateRust $SCRIPT_VERSION 安装完成"
     say "已安装模块：$(display_modules "$NEW_MODULES")"
     say "服务配置模块：$(display_modules "$RUN_MODULES")"
-    if [ -n "${GENERATED_WEB_PASSWORD:-}" ]; then
+    if [ -n "${GENERATED_WEB_CONFIG:-}" ]; then
         say "Web 管理端口：TCP 8080（监听所有 IPv4 地址）"
         say "Web 管理用户：admin"
-        say "Web 初始密码：$GENERATED_WEB_PASSWORD"
-        warn "Web 初始密码只显示这一次，请立即妥善保存并限制主机登录权限"
+        if [ -n "${GENERATED_WEB_PASSWORD:-}" ]; then
+            say "Web 初始密码：$GENERATED_WEB_PASSWORD"
+            warn "Web 初始密码只显示这一次，请立即妥善保存并限制主机登录权限"
+        else
+            say "Web 管理密码：已使用安装时设置的密码"
+        fi
     fi
     if [ -n "${GENERATED_TUNNEL_CERTIFICATE:-}" ]; then
         say "QUIC TLS 已自动初始化（自签名证书，服务器名称：gaterust.local）"
@@ -762,6 +776,33 @@ tty_read() {
     [ -r /dev/tty ] || die "交互模式需要可用的 /dev/tty，请改用命令行参数"
     printf '%s' "$1" > /dev/tty
     IFS= read -r REPLY < /dev/tty || die "读取交互输入失败"
+}
+
+tty_read_secret() {
+    [ -r /dev/tty ] || die "交互模式需要可用的 /dev/tty，请改用命令行参数"
+    require_command stty
+    printf '%s' "$1" > /dev/tty
+    TTY_STATE=$(stty -g < /dev/tty) || die "读取终端状态失败"
+    if ! stty -echo < /dev/tty; then
+        restore_tty
+        die "关闭终端回显失败"
+    fi
+    secret_read_status=0
+    IFS= read -r REPLY < /dev/tty || secret_read_status=$?
+    restore_tty
+    printf '\n' > /dev/tty
+    [ "$secret_read_status" -eq 0 ] || die "读取交互输入失败"
+}
+
+generate_web_config_interactively() {
+    tty_read_secret "请输入 Web 管理员 admin 的密码（留空则自动生成）："
+    web_password_input=$REPLY
+    if [ -n "$web_password_input" ]; then
+        tty_read_secret "请再次输入 Web 管理员密码："
+        [ "$REPLY" = "$web_password_input" ] || die "两次输入的 Web 管理员密码不一致"
+    fi
+    generate_web_config "$web_password_input"
+    web_password_input=""
 }
 
 interactive_modules() {
@@ -788,7 +829,8 @@ interactive_modules() {
 
 choose_configs() {
     TUNNEL_SOURCE="" TUNNEL_INSTALL_SOURCE="" PROXY_SOURCE="" WEB_SOURCE="" EXAMPLE_SELECTED=0
-    GENERATED_TUNNEL_CERTIFICATE="" GENERATED_TUNNEL_PRIVATE_KEY="" GENERATED_PROXY_CONFIG="" GENERATED_WEB_PASSWORD=""
+    GENERATED_TUNNEL_CERTIFICATE="" GENERATED_TUNNEL_PRIVATE_KEY="" GENERATED_PROXY_CONFIG=""
+    GENERATED_WEB_CONFIG="" GENERATED_WEB_PASSWORD=""
     GENERATED_TUNNEL_FILES_INSTALLED=0 GENERATED_PROXY_CONFIG_INSTALLED=0
     for choose_module in tunnel proxy web; do
         has_module "$NEW_MODULES" "$choose_module" || continue
@@ -830,7 +872,7 @@ choose_configs() {
                     say "  3. 仅安装示例配置"
                     tty_read "请选择 [默认 1]："
                     case "${REPLY:-1}" in
-                        1) generate_web_config; choose_source=$GENERATED_WEB_CONFIG ;;
+                        1) generate_web_config_interactively; choose_source=$GENERATED_WEB_CONFIG ;;
                         2) tty_read "请输入配置文件路径："; [ -f "$REPLY" ] || die "配置文件不存在：$REPLY"; choose_source=$REPLY ;;
                         3) choose_source=""; EXAMPLE_SELECTED=1 ;;
                         *) die "无效选择" ;;
@@ -926,9 +968,16 @@ generate_proxy_config() {
 }
 
 generate_web_config() {
-    GENERATED_WEB_PASSWORD=$(random_hex 16)
+    generated_web_password=${1:-}
+    if [ -z "$generated_web_password" ]; then
+        GENERATED_WEB_PASSWORD=$(random_hex 16)
+        generated_web_password=$GENERATED_WEB_PASSWORD
+    else
+        GENERATED_WEB_PASSWORD=""
+    fi
     generated_jwt_secret=$(random_hex 32)
-    generated_password_hash=$(printf '%s' "$GENERATED_WEB_PASSWORD" | "$package/gaterust-server" hash-password) || die "生成 Web 管理员密码哈希失败"
+    generated_password_hash=$(printf '%s' "$generated_web_password" | "$package/gaterust-server" hash-password) || die "生成 Web 管理员密码哈希失败"
+    generated_web_password=""
     GENERATED_WEB_CONFIG="$TEMP_DIR/web.toml"
     (
         umask 077
