@@ -6,6 +6,9 @@ SCRIPT_VERSION="v0.1.1-beta.2"
 REPOSITORY="jsryin/GateRust"
 ROOT="${GATERUST_ROOT:-}"
 SYSTEMCTL="${GATERUST_SYSTEMCTL:-systemctl}"
+RC_SERVICE="${GATERUST_RC_SERVICE:-rc-service}"
+RC_UPDATE="${GATERUST_RC_UPDATE:-rc-update}"
+SERVICE_MANAGER="${GATERUST_SERVICE_MANAGER:-}"
 RELEASE_BASE="${GATERUST_RELEASE_BASE:-https://github.com/$REPOSITORY/releases/download}"
 
 BIN="$ROOT/usr/local/bin/gaterust-server"
@@ -22,8 +25,13 @@ PROXY_DIR="$ETC_DIR/proxy"
 PROXY_CONFIG="$PROXY_DIR/proxy.toml"
 STATE_FILE="$DATA_DIR/install-state"
 ENV_FILE="$DATA_DIR/service.env"
-UNIT_FILE="$ROOT/etc/systemd/system/gaterust.service"
+SYSTEMD_SERVICE_FILE="$ROOT/etc/systemd/system/gaterust.service"
+OPENRC_SERVICE_FILE="$ROOT/etc/init.d/gaterust"
+LOG_DIR="$ROOT/var/log/gaterust"
+LOG_FILE="$LOG_DIR/gaterust.log"
 LOCK_DIR="$ROOT/run/lock/gaterust.lock"
+SERVICE_FILE=""
+SERVICE_FILE_MODE=""
 
 TEMP_DIR=""
 LOCK_HELD=0
@@ -66,6 +74,10 @@ require_root() {
     [ "$(id -u)" -eq 0 ] || die "此操作需要管理员权限，请使用 sudo"
 }
 
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "未找到命令：$1"
+}
+
 run_installed_as_root() {
     [ -z "$ROOT" ] || die "测试根目录模式不支持自动提权"
     trusted_ctl=/usr/local/sbin/gaterust
@@ -74,14 +86,145 @@ run_installed_as_root() {
     sudo -- "$trusted_ctl" "$@"
 }
 
+detect_service_manager() {
+    if [ -z "$SERVICE_MANAGER" ]; then
+        if [ -d "$ROOT/run/systemd/system" ]; then
+            SERVICE_MANAGER=systemd
+        elif [ -e "$ROOT/run/openrc/softlevel" ]; then
+            SERVICE_MANAGER=openrc
+        else
+            die "当前系统未运行受支持的服务管理器（systemd 或 OpenRC）"
+        fi
+    fi
+    case "$SERVICE_MANAGER" in
+        systemd)
+            require_command "$SYSTEMCTL"
+            [ -d "$ROOT/run/systemd/system" ] || [ -n "${GATERUST_TESTING:-}" ] || die "当前系统未运行 systemd"
+            SERVICE_FILE=$SYSTEMD_SERVICE_FILE
+            SERVICE_FILE_MODE=0644
+            ;;
+        openrc)
+            require_command "$RC_SERVICE"
+            require_command "$RC_UPDATE"
+            [ -n "${GATERUST_TESTING:-}" ] || require_command supervise-daemon
+            require_command pgrep
+            [ -e "$ROOT/run/openrc/softlevel" ] || [ -n "${GATERUST_TESTING:-}" ] || die "当前系统未运行 OpenRC"
+            SERVICE_FILE=$OPENRC_SERVICE_FILE
+            SERVICE_FILE_MODE=0755
+            ;;
+        *) die "不支持的服务管理器：$SERVICE_MANAGER" ;;
+    esac
+}
+
 require_platform() {
     [ "$(uname -s)" = "Linux" ] || die "仅支持 Linux"
-    command -v "$SYSTEMCTL" >/dev/null 2>&1 || die "未找到 systemctl"
-    [ -d "$ROOT/run/systemd/system" ] || [ -n "${GATERUST_TESTING:-}" ] || die "当前系统未运行 systemd"
+    detect_service_manager
     case "$(uname -m)" in
         x86_64) ARCH="x86_64"; TARGET="x86_64-unknown-linux-musl" ;;
         aarch64|arm64) ARCH="aarch64"; TARGET="aarch64-unknown-linux-musl" ;;
         *) die "不支持的架构：$(uname -m)" ;;
+    esac
+}
+
+service_is_active() {
+    case "$SERVICE_MANAGER" in
+        systemd) "$SYSTEMCTL" is-active --quiet gaterust.service ;;
+        openrc) "$RC_SERVICE" gaterust status >/dev/null 2>&1 ;;
+    esac
+}
+
+service_is_enabled() {
+    case "$SERVICE_MANAGER" in
+        systemd) "$SYSTEMCTL" is-enabled --quiet gaterust.service ;;
+        openrc) [ -L "$ROOT/etc/runlevels/default/gaterust" ] ;;
+    esac
+}
+
+service_start() {
+    case "$SERVICE_MANAGER" in
+        systemd) "$SYSTEMCTL" start gaterust.service ;;
+        openrc) "$RC_SERVICE" gaterust start ;;
+    esac
+}
+
+service_stop() {
+    case "$SERVICE_MANAGER" in
+        systemd) "$SYSTEMCTL" stop gaterust.service ;;
+        openrc) "$RC_SERVICE" gaterust stop ;;
+    esac
+}
+
+service_restart() {
+    case "$SERVICE_MANAGER" in
+        systemd) "$SYSTEMCTL" restart gaterust.service ;;
+        openrc) "$RC_SERVICE" gaterust restart ;;
+    esac
+}
+
+service_enable() {
+    case "$SERVICE_MANAGER" in
+        systemd) "$SYSTEMCTL" enable gaterust.service ;;
+        openrc) "$RC_UPDATE" add gaterust default ;;
+    esac
+}
+
+service_disable() {
+    case "$SERVICE_MANAGER" in
+        systemd) "$SYSTEMCTL" disable gaterust.service ;;
+        openrc) "$RC_UPDATE" del gaterust default ;;
+    esac
+}
+
+service_reload_manager() {
+    [ "$SERVICE_MANAGER" != systemd ] || "$SYSTEMCTL" daemon-reload
+}
+
+service_reset_failed() {
+    [ "$SERVICE_MANAGER" != systemd ] || "$SYSTEMCTL" reset-failed gaterust.service
+}
+
+service_main_pid() {
+    case "$SERVICE_MANAGER" in
+        systemd) "$SYSTEMCTL" show gaterust.service -p MainPID --value 2>/dev/null ;;
+        openrc)
+            pgrep -o -u gaterust -x gaterust-server
+            ;;
+    esac
+}
+
+service_uptime_seconds() {
+    service_uptime_pid=$1
+    boot_seconds=$(awk '{ print int($1) }' /proc/uptime 2>/dev/null) || return 1
+    case "$SERVICE_MANAGER" in
+        systemd)
+            service_started=$("$SYSTEMCTL" show gaterust.service -p ActiveEnterTimestampMonotonic --value 2>/dev/null) || return 1
+            [ -n "$service_started" ] && [ "$service_started" -gt 0 ] 2>/dev/null || return 1
+            service_seconds=$((boot_seconds - service_started / 1000000))
+            ;;
+        openrc)
+            command -v getconf >/dev/null 2>&1 || return 1
+            service_clock_ticks=$(getconf CLK_TCK) || return 1
+            service_started=$(awk '{ print $22 }' "/proc/$service_uptime_pid/stat" 2>/dev/null) || return 1
+            case "$service_clock_ticks:$service_started" in *[!0-9:]*) return 1 ;; esac
+            [ "$service_clock_ticks" -gt 0 ] || return 1
+            service_seconds=$((boot_seconds - service_started / service_clock_ticks))
+            ;;
+    esac
+    [ "$service_seconds" -ge 0 ] || service_seconds=0
+    printf '%s\n' "$service_seconds"
+}
+
+service_logs() {
+    case "$SERVICE_MANAGER" in
+        systemd)
+            require_command journalctl
+            exec journalctl -u gaterust.service -f
+            ;;
+        openrc)
+            require_command tail
+            [ -f "$LOG_FILE" ] || die "服务日志不存在：$LOG_FILE"
+            exec tail -n 100 -f "$LOG_FILE"
+            ;;
     esac
 }
 
@@ -230,6 +373,7 @@ prepare_release() {
     package="$TEMP_DIR/package"
     [ -x "$package/gaterust-server" ] || die "压缩包缺少 gaterust-server"
     [ -f "$package/gaterust.service" ] || die "压缩包缺少 systemd unit"
+    [ -f "$package/gaterust.openrc" ] || die "压缩包缺少 OpenRC 服务脚本"
     for package_config in server.example.toml proxy.example.toml web.example.toml; do
         [ -f "$package/config/$package_config" ] || die "压缩包缺少 $package_config"
     done
@@ -297,11 +441,22 @@ write_service_files() {
     installed_modules=$1
     enabled_modules=$2
     write_service_environment "$enabled_modules"
-    if has_module "$installed_modules" proxy; then
-        awk '/@PROXY_CAPABILITIES@/ { print "AmbientCapabilities=CAP_NET_BIND_SERVICE"; print "CapabilityBoundingSet=CAP_NET_BIND_SERVICE"; next } { print }' "$package/gaterust.service" > "$TEMP_DIR/gaterust.service"
-    else
-        sed '/@PROXY_CAPABILITIES@/d' "$package/gaterust.service" > "$TEMP_DIR/gaterust.service"
-    fi
+    case "$SERVICE_MANAGER" in
+        systemd)
+            if has_module "$installed_modules" proxy; then
+                awk '/@PROXY_CAPABILITIES@/ { print "AmbientCapabilities=CAP_NET_BIND_SERVICE"; print "CapabilityBoundingSet=CAP_NET_BIND_SERVICE"; next } { print }' "$package/gaterust.service" > "$TEMP_DIR/service-file"
+            else
+                sed '/@PROXY_CAPABILITIES@/d' "$package/gaterust.service" > "$TEMP_DIR/service-file"
+            fi
+            ;;
+        openrc)
+            if has_module "$installed_modules" proxy; then
+                sed 's/@PROXY_CAPABILITIES@/capabilities="^cap_net_bind_service"/' "$package/gaterust.openrc" > "$TEMP_DIR/service-file"
+            else
+                sed '/@PROXY_CAPABILITIES@/d' "$package/gaterust.openrc" > "$TEMP_DIR/service-file"
+            fi
+            ;;
+    esac
 }
 
 atomic_install() {
@@ -318,16 +473,68 @@ atomic_install() {
 
 create_account() {
     if ! getent group gaterust >/dev/null 2>&1; then
-        groupadd --system gaterust
+        if command -v groupadd >/dev/null 2>&1; then
+            groupadd --system gaterust
+        elif command -v addgroup >/dev/null 2>&1; then
+            addgroup -S gaterust
+        else
+            die "未找到系统组创建命令"
+        fi
     fi
     if ! id gaterust >/dev/null 2>&1; then
-        useradd --system --gid gaterust --home-dir /var/lib/gaterust --no-create-home --shell /usr/sbin/nologin gaterust
+        if command -v nologin >/dev/null 2>&1; then
+            account_shell=$(command -v nologin)
+        elif [ -x /bin/false ]; then
+            account_shell=/bin/false
+        else
+            die "未找到不可登录 shell"
+        fi
+        if command -v useradd >/dev/null 2>&1; then
+            useradd --system --gid gaterust --home-dir /var/lib/gaterust --no-create-home --shell "$account_shell" gaterust
+        elif command -v adduser >/dev/null 2>&1; then
+            adduser -S -D -H -h /var/lib/gaterust -s "$account_shell" -G gaterust gaterust
+        else
+            die "未找到系统用户创建命令"
+        fi
     fi
     mkdir -p "$ETC_DIR" "$DATA_DIR" "$LIB_DIR"
     chown root:gaterust "$ETC_DIR"
     chmod 0750 "$ETC_DIR"
     chown root:root "$DATA_DIR" "$LIB_DIR"
     chmod 0755 "$DATA_DIR" "$LIB_DIR"
+}
+
+delete_account() {
+    if id gaterust >/dev/null 2>&1; then
+        if command -v userdel >/dev/null 2>&1; then
+            userdel gaterust
+        elif command -v deluser >/dev/null 2>&1; then
+            deluser gaterust
+        else
+            die "未找到系统用户删除命令"
+        fi
+    fi
+    if getent group gaterust >/dev/null 2>&1; then
+        if command -v groupdel >/dev/null 2>&1; then
+            groupdel gaterust
+        elif command -v delgroup >/dev/null 2>&1; then
+            delgroup gaterust
+        else
+            die "未找到系统组删除命令"
+        fi
+    fi
+}
+
+prepare_service_runtime() {
+    [ "$SERVICE_MANAGER" = openrc ] || return 0
+    mkdir -p "$LOG_DIR"
+    chown root:root "$LOG_DIR"
+    chmod 0750 "$LOG_DIR"
+    if [ ! -e "$LOG_FILE" ]; then
+        : > "$LOG_FILE"
+    fi
+    chown root:gaterust "$LOG_FILE"
+    chmod 0660 "$LOG_FILE"
 }
 
 save_backup() {
@@ -354,11 +561,12 @@ restore_backup() {
 rollback_install() {
     TRANSACTION=0
     warn "启动失败，正在恢复原版本"
-    "$SYSTEMCTL" stop gaterust.service >/dev/null 2>&1 || true
+    service_stop >/dev/null 2>&1 || true
+    [ "${OLD_ENABLED:-0}" -eq 1 ] || service_disable >/dev/null 2>&1 || true
     cleanup_generated_files
     restore_backup "$BIN" binary
     restore_backup "$CTL" control
-    restore_backup "$UNIT_FILE" unit
+    restore_backup "$SERVICE_FILE" service
     restore_backup "$ENV_FILE" environment
     restore_backup "$STATE_FILE" state
     if [ "${WEB_REPLACED:-0}" -eq 1 ]; then
@@ -367,9 +575,13 @@ rollback_install() {
             mv "$TEMP_DIR/web.old" "$LIB_DIR/web"
         fi
     fi
-    "$SYSTEMCTL" daemon-reload || true
-    [ "${OLD_ENABLED:-0}" -eq 1 ] && "$SYSTEMCTL" enable gaterust.service >/dev/null 2>&1 || "$SYSTEMCTL" disable gaterust.service >/dev/null 2>&1 || true
-    [ "${OLD_ACTIVE:-0}" -eq 1 ] && "$SYSTEMCTL" start gaterust.service >/dev/null 2>&1 || true
+    service_reload_manager || true
+    if [ "${OLD_ENABLED:-0}" -eq 1 ]; then
+        service_enable >/dev/null 2>&1 || true
+    else
+        service_disable >/dev/null 2>&1 || true
+    fi
+    [ "${OLD_ACTIVE:-0}" -eq 1 ] && service_start >/dev/null 2>&1 || true
 }
 
 install_module_files() {
@@ -415,12 +627,12 @@ install_module_files() {
 
 perform_install() {
     OLD_ACTIVE=0 OLD_ENABLED=0
-    "$SYSTEMCTL" is-active --quiet gaterust.service 2>/dev/null && OLD_ACTIVE=1 || true
-    "$SYSTEMCTL" is-enabled --quiet gaterust.service 2>/dev/null && OLD_ENABLED=1 || true
+    service_is_active && OLD_ACTIVE=1 || true
+    service_is_enabled && OLD_ENABLED=1 || true
     mkdir -p "$TEMP_DIR/backup"
     save_backup "$BIN" binary
     save_backup "$CTL" control
-    save_backup "$UNIT_FILE" unit
+    save_backup "$SERVICE_FILE" service
     save_backup "$ENV_FILE" environment
     save_backup "$STATE_FILE" state
     write_service_files "$NEW_MODULES" "$RUN_MODULES"
@@ -429,12 +641,13 @@ perform_install() {
     WEB_REPLACED=0
     TRANSACTION=1
     if [ "$OLD_ACTIVE" -eq 1 ]; then
-        "$SYSTEMCTL" stop gaterust.service
+        service_stop
     fi
     atomic_install "$package/gaterust-server" "$BIN" 0755 root root
     atomic_install "$TEMP_DIR/gaterust.sh" "$CTL" 0755 root root
-    atomic_install "$TEMP_DIR/gaterust.service" "$UNIT_FILE" 0644 root root
+    atomic_install "$TEMP_DIR/service-file" "$SERVICE_FILE" "$SERVICE_FILE_MODE" root root
     install_service_environment
+    prepare_service_runtime
     printf 'VERSION=%s\nARCH=%s\nMODULES=%s\n' "$SCRIPT_VERSION" "$ARCH" "$NEW_MODULES" > "$TEMP_DIR/install-state"
     atomic_install "$TEMP_DIR/install-state" "$STATE_FILE" 0644 root root
     if has_module "$NEW_MODULES" web; then
@@ -446,7 +659,7 @@ perform_install() {
         mkdir -p "$LIB_DIR"
         mv "$TEMP_DIR/web.new" "$LIB_DIR/web"
     fi
-    "$SYSTEMCTL" daemon-reload
+    service_reload_manager
 
     FINAL_VALID=0
     if [ -n "$RUN_MODULES" ]; then
@@ -457,16 +670,29 @@ perform_install() {
         warn "已安装示例或无效配置，服务保持停止且不开机启动"
     fi
     case "$START_MODE" in
-        enable) "$SYSTEMCTL" enable gaterust.service; "$SYSTEMCTL" start gaterust.service || { rollback_install; die "服务启动失败"; } ;;
-        start) "$SYSTEMCTL" disable gaterust.service >/dev/null 2>&1 || true; "$SYSTEMCTL" start gaterust.service || { rollback_install; die "服务启动失败"; } ;;
+        enable)
+            service_enable
+            service_start || { rollback_install; die "服务启动失败"; }
+            ;;
+        start)
+            service_disable >/dev/null 2>&1 || true
+            service_start || { rollback_install; die "服务启动失败"; }
+            ;;
         preserve)
-            [ "$OLD_ENABLED" -eq 1 ] && "$SYSTEMCTL" enable gaterust.service >/dev/null || "$SYSTEMCTL" disable gaterust.service >/dev/null 2>&1 || true
-            if [ "$OLD_ACTIVE" -eq 1 ] && ! "$SYSTEMCTL" start gaterust.service; then
+            if [ "$OLD_ENABLED" -eq 1 ]; then
+                service_enable >/dev/null
+            else
+                service_disable >/dev/null 2>&1 || true
+            fi
+            if [ "$OLD_ACTIVE" -eq 1 ] && ! service_start; then
                 rollback_install
                 die "升级后服务启动失败"
             fi
             ;;
-        stop) "$SYSTEMCTL" disable --now gaterust.service >/dev/null 2>&1 || true ;;
+        stop)
+            service_is_active && service_stop >/dev/null 2>&1 || true
+            service_disable >/dev/null 2>&1 || true
+            ;;
     esac
     GENERATED_TUNNEL_FILES_INSTALLED=0
     GENERATED_PROXY_CONFIG_INSTALLED=0
@@ -762,21 +988,25 @@ prepare_service_config() {
 service_command() {
     service_action=$1
     case "$service_action" in
+        start|stop|restart|enable|disable|logs) require_root ;;
+    esac
+    require_platform
+    case "$service_action" in
         start|restart|enable)
-            require_root
-            require_platform
             acquire_lock
             prepare_service_config
             ;;
-        stop|disable) require_root; read_state >/dev/null || die "GateRust 尚未安装" ;;
     esac
     case "$service_action" in
-        start) "$SYSTEMCTL" start gaterust.service ;;
-        stop) "$SYSTEMCTL" stop gaterust.service ;;
-        restart) "$SYSTEMCTL" restart gaterust.service ;;
-        enable) "$SYSTEMCTL" enable gaterust.service ;;
-        disable) "$SYSTEMCTL" disable gaterust.service ;;
-        logs) exec journalctl -u gaterust.service -f ;;
+        stop|disable|logs) read_state >/dev/null || die "GateRust 尚未安装" ;;
+    esac
+    case "$service_action" in
+        start) service_start ;;
+        stop) service_stop ;;
+        restart) service_restart ;;
+        enable) service_enable ;;
+        disable) service_disable ;;
+        logs) service_logs ;;
     esac
     case "$service_action" in
         start|restart|enable)
@@ -798,19 +1028,17 @@ read_service_modules() {
 }
 
 status_command() {
+    require_platform
     read_state || die "GateRust 尚未安装"
     read_service_modules
     status_active="已停止" status_enabled="未启用" status_pid="-" status_uptime="-"
-    "$SYSTEMCTL" is-active --quiet gaterust.service 2>/dev/null && status_active="运行中" || true
-    "$SYSTEMCTL" is-enabled --quiet gaterust.service 2>/dev/null && status_enabled="已启用" || true
+    service_is_active && status_active="运行中" || true
+    service_is_enabled && status_enabled="已启用" || true
     if [ "$status_active" = "运行中" ]; then
-        status_pid=$("$SYSTEMCTL" show gaterust.service -p MainPID --value 2>/dev/null || printf '-')
+        status_pid=$(service_main_pid || printf '-')
         [ "$status_pid" = 0 ] && status_pid="-"
-        status_started=$("$SYSTEMCTL" show gaterust.service -p ActiveEnterTimestampMonotonic --value 2>/dev/null || true)
-        if [ -n "$status_started" ] && [ "$status_started" -gt 0 ] 2>/dev/null; then
-            boot_seconds=$(awk '{ print int($1) }' /proc/uptime 2>/dev/null || printf '0')
-            status_seconds=$((boot_seconds - status_started / 1000000))
-            [ "$status_seconds" -lt 0 ] && status_seconds=0
+        status_seconds=$(service_uptime_seconds "$status_pid" 2>/dev/null || true)
+        if [ -n "$status_seconds" ]; then
             status_days=$((status_seconds / 86400))
             status_hours=$(((status_seconds % 86400) / 3600))
             status_minutes=$(((status_seconds % 3600) / 60))
@@ -836,22 +1064,21 @@ delete_module_files() {
 }
 
 full_uninstall() {
-    if "$SYSTEMCTL" is-active --quiet gaterust.service 2>/dev/null; then
-        "$SYSTEMCTL" stop gaterust.service
+    if service_is_active; then
+        service_stop
     fi
-    "$SYSTEMCTL" disable gaterust.service >/dev/null 2>&1 || true
-    rm -f "$UNIT_FILE"
-    "$SYSTEMCTL" daemon-reload
-    "$SYSTEMCTL" reset-failed gaterust.service >/dev/null 2>&1 || true
+    service_disable >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_SERVICE_FILE" "$OPENRC_SERVICE_FILE"
+    service_reload_manager
+    service_reset_failed >/dev/null 2>&1 || true
     rm -f "$BIN"
     if [ "$KEEP_CONFIG" -eq 1 ]; then
         chown -R root:root "$ETC_DIR"
     else
         rm -rf "$ETC_DIR"
     fi
-    rm -rf "$DATA_DIR" "$LIB_DIR"
-    if id gaterust >/dev/null 2>&1; then userdel gaterust; fi
-    if getent group gaterust >/dev/null 2>&1; then groupdel gaterust; fi
+    rm -rf "$DATA_DIR" "$LIB_DIR" "$LOG_DIR"
+    delete_account
     rm -f "$CTL" "$LEGACY_CTL"
     say "GateRust 已完整卸载"
 }
@@ -867,10 +1094,11 @@ show_uninstall_files() {
         say "将删除："
         say "  /usr/local/bin/gaterust-server"
         say "  /usr/local/sbin/gaterust"
-        say "  /etc/systemd/system/gaterust.service"
+        say "  ${SERVICE_FILE#$ROOT}"
         [ "$KEEP_CONFIG" -eq 1 ] || say "  /etc/gaterust/"
         say "  /var/lib/gaterust/"
         say "  /usr/local/lib/gaterust/"
+        [ "$SERVICE_MANAGER" != openrc ] || say "  /var/log/gaterust/"
         say "  gaterust 系统用户和组"
         return
     fi
@@ -913,10 +1141,10 @@ uninstall_command() {
     [ "$KEEP_CONFIG" -eq 1 ] && say "配置目录将保留。"
     confirm_uninstall
     was_active=0 was_enabled=0
-    "$SYSTEMCTL" is-active --quiet gaterust.service 2>/dev/null && was_active=1 || true
-    "$SYSTEMCTL" is-enabled --quiet gaterust.service 2>/dev/null && was_enabled=1 || true
+    service_is_active && was_active=1 || true
+    service_is_enabled && was_enabled=1 || true
     if [ "$was_active" -eq 1 ]; then
-        "$SYSTEMCTL" stop gaterust.service
+        service_stop
     fi
     for remove_module in "$@"; do delete_module_files "$remove_module"; done
     if [ -z "$remaining" ]; then full_uninstall; release_lock; return; fi
@@ -926,13 +1154,13 @@ uninstall_command() {
         done
     fi
     NEW_MODULES=$remaining
-    atomic_install "$TEMP_DIR/gaterust.service" "$UNIT_FILE" 0644 root root
+    atomic_install "$TEMP_DIR/service-file" "$SERVICE_FILE" "$SERVICE_FILE_MODE" root root
     install_service_environment
     atomic_install "$TEMP_DIR/install-state" "$STATE_FILE" 0644 root root
-    "$SYSTEMCTL" daemon-reload
-    [ "$was_enabled" -eq 1 ] && "$SYSTEMCTL" enable gaterust.service >/dev/null || true
+    service_reload_manager
+    [ "$was_enabled" -eq 1 ] && service_enable >/dev/null || true
     if [ "$was_active" -eq 1 ]; then
-        [ -n "$RUN_MODULES" ] && configs_valid "$RUN_MODULES" && "$SYSTEMCTL" start gaterust.service || die "剩余模块没有有效配置，服务保持停止"
+        [ -n "$RUN_MODULES" ] && configs_valid "$RUN_MODULES" && service_start || die "剩余模块没有有效配置，服务保持停止"
     fi
     say "已卸载模块：$REMOVE_MODULES；剩余模块：$remaining"
     release_lock
@@ -949,7 +1177,7 @@ interactive_service_menu() {
             3) interactive_service_command restart ;;
             4) interactive_service_command enable ;;
             5) interactive_service_command disable ;;
-            6) service_command logs ;;
+            6) interactive_service_command logs ;;
             0) return ;;
             *) warn "无效选择" ;;
         esac
@@ -1034,7 +1262,7 @@ START_MODE=default INTERACTIVE=0 ASSUME_YES=0 KEEP_CONFIG=0 UNINSTALL_ALL=0 FORC
 [ "${GATERUST_LIBRARY_ONLY:-0}" -eq 1 ] && return 0
 command_name=${1:-}
 case "$command_name" in
-    install|start|stop|restart|enable|disable|uninstall)
+    install|start|stop|restart|enable|disable|logs|uninstall)
         if [ "$(id -u)" -ne 0 ] && [ "$0" = "$CTL" ]; then
             run_installed_as_root "$@"
             exit $?

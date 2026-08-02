@@ -23,7 +23,7 @@ curl -fLO "https://github.com/jsryin/GateRust/releases/download/v${version}/gate
 chmod +x "gaterust_server_${version}_linux_amd64"
 ```
 
-配置示例和 systemd unit 位于源码仓库的 `config` 与 `scripts` 目录。Web 控制台静态文件需单独构建或部署。
+配置示例、systemd unit 和 OpenRC 服务脚本位于源码仓库的 `config` 与 `scripts` 目录。Web 控制台静态文件需单独构建或部署。一键安装器支持运行 systemd 的 Linux，以及使用 OpenRC 的 Alpine Linux 3.21；Alpine 自动初始化证书前需执行 `apk add --no-cache openssl`。
 
 服务端隧道证书默认位于配置指定的路径；使用仓库 systemd 示例部署时建议放在 `/etc/gaterust/tunnel/server.pem`。
 
@@ -46,10 +46,10 @@ sudo openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 3650 \
   -addext 'extendedKeyUsage=serverAuth' \
   -keyout /etc/gaterust/tunnel/server-key.pem.new \
   -out /etc/gaterust/tunnel/server.pem.new
-sudo systemctl stop gaterust.service
+sudo gaterust stop
 sudo install -o root -g gaterust -m 0640 /etc/gaterust/tunnel/server.pem.new /etc/gaterust/tunnel/server.pem
 sudo install -o root -g gaterust -m 0640 /etc/gaterust/tunnel/server-key.pem.new /etc/gaterust/tunnel/server-key.pem
-sudo systemctl start gaterust.service
+sudo gaterust start
 ```
 
 升级后的桌面客户端检测到本地受管证书为 `CA:TRUE` 时，会重新执行分组密钥证明并安全替换该证书。

@@ -27,6 +27,8 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: node scripts/verify-release-version.mjs
+      - name: Verify installer service files
+        run: sh scripts/test-installer-service-files.sh
 
   binaries:
     needs: verify
@@ -168,6 +170,7 @@ jobs:
               "$stage/gaterust-server"
             cp -a web/dist "$stage/web"
             install -m 0644 scripts/gaterust.service "$stage/gaterust.service"
+            install -m 0755 scripts/gaterust.openrc "$stage/gaterust.openrc"
             sed \
               's#../certs/server.pem#/etc/gaterust/tunnel/server.pem#; s#../certs/server-key.pem#/etc/gaterust/tunnel/server-key.pem#' \
               config/server.example.toml > "$stage/config/server.example.toml"
@@ -205,6 +208,7 @@ jobs:
             for path in \
               ./gaterust-server \
               ./gaterust.service \
+              ./gaterust.openrc \
               ./config/server.example.toml \
               ./config/proxy.example.toml \
               ./config/web.example.toml \

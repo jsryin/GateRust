@@ -1,0 +1,44 @@
+#!/sbin/openrc-run
+
+name="GateRust unified server"
+description="GateRust unified server"
+command="/usr/local/bin/gaterust-server"
+command_user="gaterust:gaterust"
+supervisor="supervise-daemon"
+pidfile="/run/gaterust.pid"
+respawn_delay=5
+respawn_max=0
+no_new_privs=true
+umask=0027
+output_log="/var/log/gaterust/gaterust.log"
+error_log="/var/log/gaterust/gaterust.log"
+@PROXY_CAPABILITIES@
+
+read_service_args() {
+    service_line=""
+    if ! IFS= read -r service_line < /var/lib/gaterust/service.env; then
+        eerror "无法读取 /var/lib/gaterust/service.env"
+        return 1
+    fi
+    case "$service_line" in
+        GATERUST_ARGS=*) command_args=${service_line#GATERUST_ARGS=} ;;
+        *)
+            eerror "/var/lib/gaterust/service.env 格式无效"
+            return 1
+            ;;
+    esac
+}
+
+checkconfig() {
+    read_service_args || return $?
+    # 参数由安装器生成且路径固定，需要拆分为独立的命令参数。
+    "$command" check-config $command_args
+}
+
+start_pre() {
+    [ "$RC_CMD" = restart ] || checkconfig
+}
+
+stop_pre() {
+    [ "$RC_CMD" != restart ] || checkconfig
+}

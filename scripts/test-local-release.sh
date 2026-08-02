@@ -13,6 +13,8 @@ TUNNEL_CERTIFICATE=$TUNNEL_DIR/server.pem
 TUNNEL_PRIVATE_KEY=$TUNNEL_DIR/server-key.pem
 PROXY_DIR=/etc/gaterust/proxy
 PROXY_CONFIG=$PROXY_DIR/proxy.toml
+SERVICE_MANAGER=""
+SERVICE_FILE=""
 
 SERVER_PID=""
 SERVER_LOG=""
@@ -22,8 +24,10 @@ MANAGED_PATHS=(
     /usr/local/sbin/gaterust
     /etc/gaterust
     /etc/systemd/system/gaterust.service
+    /etc/init.d/gaterust
     /var/lib/gaterust
     /usr/local/lib/gaterust
+    /var/log/gaterust
 )
 
 say() { printf '%s\n' "$*"; }
@@ -51,6 +55,36 @@ as_root() {
     else
         sudo "$@"
     fi
+}
+
+detect_service_manager() {
+    if [[ -d /run/systemd/system ]]; then
+        SERVICE_MANAGER=systemd
+        SERVICE_FILE=/etc/systemd/system/gaterust.service
+        require_command systemctl
+    elif [[ -e /run/openrc/softlevel ]]; then
+        SERVICE_MANAGER=openrc
+        SERVICE_FILE=/etc/init.d/gaterust
+        require_command rc-service
+        require_command rc-update
+        require_command supervise-daemon
+    else
+        die "当前系统未运行受支持的服务管理器（systemd 或 OpenRC）"
+    fi
+}
+
+service_is_active() {
+    case "$SERVICE_MANAGER" in
+        systemd) as_root systemctl is-active --quiet gaterust.service ;;
+        openrc) as_root rc-service gaterust status >/dev/null 2>&1 ;;
+    esac
+}
+
+service_is_enabled() {
+    case "$SERVICE_MANAGER" in
+        systemd) as_root systemctl is-enabled --quiet gaterust.service ;;
+        openrc) as_root test -L /etc/runlevels/default/gaterust ;;
+    esac
 }
 
 detect_release() {
@@ -84,16 +118,19 @@ build_release() {
     require_command tar
     detect_release
 
-    local release_tmp stage musl_cc cc_env linker_env rust_version
+    local release_tmp stage musl_cc cc_env linker_env rust_host rust_version
     rust_version=$(rustc --version)
     [[ "$rust_version" == "rustc 1.97.0 "* ]] ||
         die "需要 Rust 1.97.0，当前为：$rust_version"
+    rust_host=$(rustc -vV | sed -n 's/^host: //p')
     if command -v "$ARCH-linux-musl-gcc" >/dev/null 2>&1; then
         musl_cc=$(command -v "$ARCH-linux-musl-gcc")
     elif command -v musl-gcc >/dev/null 2>&1; then
         musl_cc=$(command -v musl-gcc)
+    elif [[ "$rust_host" == "$TARGET" ]] && command -v cc >/dev/null 2>&1; then
+        musl_cc=$(command -v cc)
     else
-        die "缺少 musl C 编译器；Debian/Ubuntu 请执行：sudo apt-get install musl-tools"
+        die "缺少 musl C 编译器；Debian/Ubuntu 安装 musl-tools，Alpine 安装 build-base"
     fi
     mkdir -p "$OUTPUT_ROOT"
     release_tmp=$(mktemp -d "$OUTPUT_ROOT/.release-${SCRIPT_VERSION}.XXXXXX")
@@ -125,6 +162,7 @@ build_release() {
         "$stage/gaterust-server"
     cp -a "$REPO_ROOT/web/dist" "$stage/web"
     install -m 0644 "$SCRIPT_DIR/gaterust.service" "$stage/gaterust.service"
+    install -m 0755 "$SCRIPT_DIR/gaterust.openrc" "$stage/gaterust.openrc"
     sed \
         's#../certs/server.pem#/etc/gaterust/tunnel/server.pem#; s#../certs/server-key.pem#/etc/gaterust/tunnel/server-key.pem#' \
         "$REPO_ROOT/config/server.example.toml" > "$stage/config/server.example.toml"
@@ -148,6 +186,7 @@ build_release() {
     for required_path in \
         ./gaterust-server \
         ./gaterust.service \
+        ./gaterust.openrc \
         ./config/server.example.toml \
         ./config/proxy.example.toml \
         ./config/web.example.toml \
@@ -211,15 +250,16 @@ ensure_clean_vm() {
 }
 
 verify_install() {
-    local default_install=$1 expect_running=$2
+    local default_install=$1 expect_running=$2 expect_enabled=$3
     local state modules expected_state service_environment service_environment_attributes
+    local service_file_attributes log_file_attributes
     local proxy_config expected_proxy_config
     local attempt tunnel_mode proxy_mode tunnel_config_attributes tunnel_certificate_attributes
     local tunnel_private_key_attributes tunnel_basic_constraints
     local proxy_config_attributes proxy_http_status
     as_root test -x /usr/local/bin/gaterust-server || die "服务端二进制未安装"
     as_root test -x /usr/local/sbin/gaterust || die "管理脚本未安装"
-    as_root test -f /etc/systemd/system/gaterust.service || die "systemd unit 未安装"
+    as_root test -f "$SERVICE_FILE" || die "服务文件未安装：$SERVICE_FILE"
     as_root test -f /var/lib/gaterust/install-state || die "安装状态未生成"
     cmp "$REPO_ROOT/target/$TARGET/release/gaterust-server" /usr/local/bin/gaterust-server >/dev/null ||
         die "安装后的服务端二进制与本地构建产物不一致"
@@ -234,6 +274,20 @@ verify_install() {
     [[ "$service_environment_attributes" == "644 root root" ]] ||
         die "服务参数文件权限不正确：$service_environment_attributes"
     service_environment=$(cat /var/lib/gaterust/service.env)
+    service_file_attributes=$(as_root stat -c '%a %U %G' "$SERVICE_FILE")
+    case "$SERVICE_MANAGER" in
+        systemd)
+            [[ "$service_file_attributes" == "644 root root" ]] ||
+                die "systemd unit 权限不正确：$service_file_attributes"
+            ;;
+        openrc)
+            [[ "$service_file_attributes" == "755 root root" ]] ||
+                die "OpenRC 服务文件权限不正确：$service_file_attributes"
+            log_file_attributes=$(as_root stat -c '%a %U %G' /var/log/gaterust/gaterust.log)
+            [[ "$log_file_attributes" == "660 root gaterust" ]] ||
+                die "OpenRC 日志权限不正确：$log_file_attributes"
+            ;;
+    esac
     if [[ ",$modules," == *,web,* ]]; then
         as_root test -f /etc/gaterust/web/web.toml || die "Web 正式配置不存在"
     fi
@@ -285,13 +339,21 @@ verify_install() {
         tunnel_mode=$(as_root stat -c '%a' "$TUNNEL_DIR")
         proxy_mode=$(as_root stat -c '%a' "$PROXY_DIR")
         [[ "$tunnel_mode" == 770 && "$proxy_mode" == 770 ]] || die "Web 配置目录权限不正确"
-        as_root grep -Fq -- '-/etc/gaterust/tunnel' /etc/systemd/system/gaterust.service ||
-            die "systemd 未放行 Web 写入 QUIC 配置目录"
-        as_root grep -Fq -- '-/etc/gaterust/proxy' /etc/systemd/system/gaterust.service ||
-            die "systemd 未放行 Web 写入 Proxy 配置目录"
+        case "$SERVICE_MANAGER" in
+            systemd)
+                as_root grep -Fq -- '-/etc/gaterust/tunnel' "$SERVICE_FILE" ||
+                    die "systemd 未放行 Web 写入 QUIC 配置目录"
+                as_root grep -Fq -- '-/etc/gaterust/proxy' "$SERVICE_FILE" ||
+                    die "systemd 未放行 Web 写入 Proxy 配置目录"
+                ;;
+            openrc)
+                as_root grep -Fqx 'capabilities="^cap_net_bind_service"' "$SERVICE_FILE" ||
+                    die "OpenRC 服务未授予 Proxy 低端口绑定能力"
+                ;;
+        esac
     fi
     if [[ "$expect_running" == 1 ]]; then
-        as_root systemctl is-active --quiet gaterust.service || die "GateRust 服务未运行"
+        service_is_active || die "GateRust 服务未运行"
         if [[ "$service_environment" == *"--enable-web"* ]]; then
             for attempt in {1..50}; do
                 curl --noproxy '*' -fsS http://127.0.0.1:8080/ >/dev/null && break
@@ -311,6 +373,11 @@ verify_install() {
                 die "Proxy HTTP 监听未返回预期的 404，实际状态：${proxy_http_status:-无响应}"
         fi
     fi
+    if [[ "$expect_enabled" == 1 ]]; then
+        service_is_enabled || die "GateRust 未启用开机启动"
+    else
+        ! service_is_enabled || die "GateRust 不应启用开机启动"
+    fi
 
     /usr/local/sbin/gaterust status
     say "本地 Release 安装及 QUIC、Proxy、Web 启动验证通过。"
@@ -318,9 +385,8 @@ verify_install() {
 }
 
 test_release() {
-    require_command systemctl
+    detect_service_manager
     require_command openssl
-    [[ -d /run/systemd/system ]] || die "当前 VM 未运行 systemd"
     if [[ $EUID -ne 0 ]]; then
         require_command sudo
         sudo -v
@@ -329,7 +395,8 @@ test_release() {
     build_release
     start_server
 
-    local base_url="http://$SERVER_HOST:$SERVER_PORT" default_install=1 expect_running=1 argument
+    local base_url="http://$SERVER_HOST:$SERVER_PORT" default_install=1
+    local expect_enabled=0 expect_running=1 argument
     local installer_args=(install --modules tunnel,proxy,web --init-tunnel --init-proxy --enable)
     if [[ $# -gt 0 ]]; then
         [[ $1 == -- ]] || die "自定义安装参数前需要使用 --"
@@ -344,16 +411,18 @@ test_release() {
     expect_running=0
     for argument in "${installer_args[@]}"; do
         [[ "$argument" == --enable || "$argument" == --start ]] && expect_running=1
+        [[ "$argument" == --enable ]] && expect_enabled=1
     done
 
     say "执行本地安装器..."
     curl -fsSL "$base_url/$SCRIPT_VERSION/gaterust.sh" |
         as_root env GATERUST_RELEASE_BASE="$base_url" sh -s -- "${installer_args[@]}"
-    verify_install "$default_install" "$expect_running"
+    verify_install "$default_install" "$expect_running" "$expect_enabled"
 }
 
 uninstall_release() {
     local managed_path
+    detect_service_manager
     if [[ $EUID -ne 0 ]]; then
         require_command sudo
         sudo -v
