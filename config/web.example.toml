@@ -1,5 +1,5 @@
 [web]
-bind = "127.0.0.1:8080"
+bind = "0.0.0.0:8080"
 # 构建前端后由服务端直接托管；独立部署到 Cloudflare Pages 时可删除此项。
 static_dir = "../web/dist"
 admin_username = "admin"

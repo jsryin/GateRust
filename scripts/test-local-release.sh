@@ -295,6 +295,8 @@ verify_install() {
         as_root test -f /etc/gaterust/web/web.toml || die "Web 正式配置不存在"
     fi
     if [[ "$default_install" == 1 ]]; then
+        as_root grep -Fqx 'bind = "0.0.0.0:8080"' /etc/gaterust/web/web.toml ||
+            die "Web 自动初始化配置未监听所有 IPv4 地址"
         as_root test -f "$TUNNEL_CONFIG" || die "QUIC 正式配置不存在"
         as_root test -f "$TUNNEL_CERTIFICATE" || die "QUIC 证书不存在"
         as_root test -f "$TUNNEL_PRIVATE_KEY" || die "QUIC 私钥不存在"

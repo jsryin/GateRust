@@ -742,7 +742,7 @@ perform_install() {
     say "已安装模块：$(display_modules "$NEW_MODULES")"
     say "服务配置模块：$(display_modules "$RUN_MODULES")"
     if [ -n "${GENERATED_WEB_PASSWORD:-}" ]; then
-        say "Web 管理地址：http://127.0.0.1:8080/"
+        say "Web 管理端口：TCP 8080（监听所有 IPv4 地址）"
         say "Web 管理用户：admin"
         say "Web 初始密码：$GENERATED_WEB_PASSWORD"
         warn "Web 初始密码只显示这一次，请立即妥善保存并限制主机登录权限"
@@ -925,7 +925,7 @@ generate_web_config() {
         umask 077
         {
             printf '%s\n' '[web]'
-            printf '%s\n' 'bind = "127.0.0.1:8080"'
+            printf '%s\n' 'bind = "0.0.0.0:8080"'
             printf '%s\n' 'static_dir = "/usr/local/lib/gaterust/web"'
             printf '%s\n' 'admin_username = "admin"'
             printf 'admin_password_hash = "%s"\n' "$generated_password_hash"
