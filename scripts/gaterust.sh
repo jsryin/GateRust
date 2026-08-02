@@ -798,7 +798,10 @@ choose_configs() {
             say ""
             case "$choose_module" in
                 tunnel)
-                    say "QUIC 配置：1. 自动生成证书和私钥  2. 导入已有配置  3. 仅安装示例配置"
+                    say "QUIC 配置："
+                    say "  1. 自动生成证书和私钥"
+                    say "  2. 导入已有配置"
+                    say "  3. 仅安装示例配置"
                     tty_read "请选择 [默认 1]："
                     case "${REPLY:-1}" in
                         1) generate_tunnel_config; choose_source=$GENERATED_TUNNEL_CHECK_CONFIG ;;
@@ -808,7 +811,10 @@ choose_configs() {
                     esac
                     ;;
                 proxy)
-                    say "Proxy 配置：1. 自动生成最小配置  2. 导入已有配置  3. 仅安装示例配置"
+                    say "Proxy 配置："
+                    say "  1. 自动生成最小配置"
+                    say "  2. 导入已有配置"
+                    say "  3. 仅安装示例配置"
                     tty_read "请选择 [默认 1]："
                     case "${REPLY:-1}" in
                         1) generate_proxy_config; choose_source=$GENERATED_PROXY_CONFIG ;;
@@ -818,7 +824,10 @@ choose_configs() {
                     esac
                     ;;
                 web)
-                    say "Web 配置：1. 自动安全初始化  2. 导入已有配置  3. 仅安装示例配置"
+                    say "Web 配置："
+                    say "  1. 自动安全初始化"
+                    say "  2. 导入已有配置"
+                    say "  3. 仅安装示例配置"
                     tty_read "请选择 [默认 1]："
                     case "${REPLY:-1}" in
                         1) generate_web_config; choose_source=$GENERATED_WEB_CONFIG ;;
@@ -985,7 +994,10 @@ install_command() {
             say "没有可运行的正式配置，服务将保持停止且不开机启动。"
         else
             [ "$EXAMPLE_SELECTED" -eq 0 ] || say "未配置的模块本次不会启动，可在 Web 保存配置后执行 gaterust restart 启用。"
-            say "启动方式：1. 立即启动并启用开机启动  2. 立即启动  3. 暂不启动"
+            say "启动方式："
+            say "  1. 立即启动并启用开机启动"
+            say "  2. 立即启动"
+            say "  3. 暂不启动"
             tty_read "请选择 [默认 1]："
             case "${REPLY:-1}" in 1) START_MODE=enable ;; 2) START_MODE=start ;; 3) START_MODE=stop ;; *) die "无效选择" ;; esac
         fi
@@ -1211,8 +1223,13 @@ uninstall_command() {
 
 interactive_service_menu() {
     while :; do
-        say "1. 启动服务  2. 停止服务  3. 重启服务"
-        say "4. 启用开机启动  5. 关闭开机启动  6. 查看实时日志  0. 返回"
+        say "  1. 启动服务"
+        say "  2. 停止服务"
+        say "  3. 重启服务"
+        say "  4. 启用开机启动"
+        say "  5. 关闭开机启动"
+        say "  6. 查看实时日志"
+        say "  0. 返回"
         tty_read "请选择："
         case "$REPLY" in
             1) interactive_service_command start ;;
@@ -1237,8 +1254,11 @@ interactive_service_command() {
 
 interactive_uninstall() {
     say "请选择卸载内容："
-    say "  1. QUIC 内网穿透  2. 反向代理 + 自动 SSL"
-    say "  3. Web 管理界面  4. 完整卸载 GateRust  0. 返回"
+    say "  1. QUIC 内网穿透"
+    say "  2. 反向代理 + 自动 SSL"
+    say "  3. Web 管理界面"
+    say "  4. 完整卸载 GateRust"
+    say "  0. 返回"
     tty_read "请输入模块编号，多个用逗号分隔："
     [ "$REPLY" = 0 ] && return
     if [ "$REPLY" = 4 ]; then UNINSTALL_ALL=1; else
@@ -1286,8 +1306,11 @@ interactive_main() {
         say ""
         status_command
         say ""
-        say "  1. 安装或更新模块  2. 服务管理"
-        say "  3. 查看安装信息和服务状态  4. 卸载模块  0. 退出"
+        say "  1. 安装或更新模块"
+        say "  2. 服务管理"
+        say "  3. 查看安装信息和服务状态"
+        say "  4. 卸载模块"
+        say "  0. 退出"
         tty_read "请选择："
         case "$REPLY" in
             1) interactive_install_as_root ;;
