@@ -8,8 +8,8 @@ use std::{collections::HashSet, future::Future, path::PathBuf, sync::Arc, time::
 
 pub use error::{ClientError, Result};
 use gaterust_tunnel::{
-    ClientConfig, ClientController, ClientServiceConfig, ClientStatus, ClientTunnel,
-    ClientTunnelState, MAX_CLIENT_SERVICES, TunnelKind, client_control_channel,
+    ClientCommandReceiver, ClientConfig, ClientController, ClientServiceConfig, ClientStatus,
+    ClientTunnel, ClientTunnelState, MAX_CLIENT_SERVICES, TunnelKind, client_control_channel,
     run_managed_client_with_status, verify_client_credentials,
 };
 use tokio::{
@@ -21,12 +21,19 @@ use tokio_util::sync::CancellationToken;
 
 /// 可嵌入桌面壳层的客户端运行时。
 pub struct ClientRuntime {
+    runtime: tokio::runtime::Handle,
     config_path: Arc<PathBuf>,
+    status_sender: watch::Sender<ClientStatus>,
     status: watch::Receiver<ClientStatus>,
     shutdown: CancellationToken,
-    task: Mutex<Option<JoinHandle<gaterust_tunnel::Result<()>>>>,
+    task: Mutex<ManagedTask>,
     login: Mutex<Option<LoginOperation>>,
     controller: ClientController,
+}
+
+struct ManagedTask {
+    commands: Option<ClientCommandReceiver>,
+    handle: Option<JoinHandle<gaterust_tunnel::Result<()>>>,
 }
 
 #[derive(Clone)]
@@ -48,7 +55,7 @@ const LOGIN_TIMEOUT: Duration = Duration::from_mins(1);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl ClientRuntime {
-    /// 初始化配置并启动隧道后台任务。
+    /// 初始化桌面客户端运行时；首次成功获取配置前不启动网络任务。
     ///
     /// # Errors
     ///
@@ -57,36 +64,22 @@ impl ClientRuntime {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| ClientError::RuntimeUnavailable)?;
         let config_path = prepare_config_path(explicit_config_path)?;
-        clear_saved_services(&config_path)?;
 
         let config_path = Arc::new(config_path);
         let shutdown = CancellationToken::new();
         let (status_sender, status) = watch::channel(ClientStatus::Starting);
         let (controller, commands) = client_control_channel();
-        let task_status = status_sender.clone();
-        let task_path = Arc::clone(&config_path);
-        let task_shutdown = shutdown.clone();
-        let task = runtime.spawn(async move {
-            let result = run_managed_client_with_status(
-                task_path.as_ref(),
-                task_shutdown,
-                status_sender,
-                commands,
-            )
-            .await;
-            if let Err(error) = &result {
-                task_status.send_replace(ClientStatus::Stopped {
-                    reason: Some(error.to_string()),
-                });
-            }
-            result
-        });
 
         Ok(Self {
+            runtime,
             config_path,
+            status_sender,
             status,
             shutdown,
-            task: Mutex::new(Some(task)),
+            task: Mutex::new(ManagedTask {
+                commands: Some(commands),
+                handle: None,
+            }),
             login: Mutex::new(None),
             controller,
         })
@@ -125,7 +118,7 @@ impl ClientRuntime {
         .map_err(ClientError::from)
     }
 
-    /// 验证服务器凭据，必要时下载证书，并在成功后保存配置。
+    /// 验证服务器凭据，必要时下载证书，并在成功后保存配置、启动后台连接。
     ///
     /// # Errors
     ///
@@ -145,8 +138,37 @@ impl ClientRuntime {
         let result = self
             .login_inner(address, key, &operation.cancellation, deadline)
             .await;
+        if result.is_ok() {
+            self.activate().await;
+        }
         self.finish_login(&operation).await;
         result
+    }
+
+    async fn activate(&self) {
+        let mut task = self.task.lock().await;
+        if task.handle.is_some() || self.shutdown.is_cancelled() {
+            return;
+        }
+        let Some(commands) = task.commands.take() else {
+            return;
+        };
+
+        // 配置已完成远端验证，此时才允许桌面客户端建立持久控制连接。
+        let path = Arc::clone(&self.config_path);
+        let shutdown = self.shutdown.clone();
+        let status = self.status_sender.clone();
+        let task_status = status.clone();
+        task.handle = Some(self.runtime.spawn(async move {
+            let result =
+                run_managed_client_with_status(path.as_ref(), shutdown, status, commands).await;
+            if let Err(error) = &result {
+                task_status.send_replace(ClientStatus::Stopped {
+                    reason: Some(error.to_string()),
+                });
+            }
+            result
+        }));
     }
 
     async fn begin_login(&self) -> Result<LoginOperation> {
@@ -305,7 +327,7 @@ impl ClientRuntime {
         if let Some(operation) = &login {
             operation.cancellation.cancel();
         }
-        let mut task = self.task.lock().await.take();
+        let mut task = self.task.lock().await.handle.take();
 
         let graceful_shutdown = async {
             if let Some(operation) = login {
@@ -423,22 +445,6 @@ pub fn prepare_config_path(explicit_config_path: Option<PathBuf>) -> Result<Path
     Ok(path)
 }
 
-fn clear_saved_services(path: &std::path::Path) -> Result<()> {
-    let Ok(mut config) = ClientConfig::read(path) else {
-        return Ok(());
-    };
-    if config.services.is_empty() {
-        return Ok(());
-    }
-    // 桌面端的隧道选择是进程内状态，避免重新打开应用时未经确认自动启用。
-    config.services.clear();
-    if config.validate().is_err() {
-        return Ok(());
-    }
-    config.save(path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use rcgen::generate_simple_self_signed;
@@ -487,8 +493,8 @@ mod tests {
         assert!(services_for_selection(tunnels, vec!["ssh".into()]).is_err());
     }
 
-    #[test]
-    fn removes_legacy_saved_services_for_desktop_runtime() {
+    #[tokio::test]
+    async fn desktop_runtime_does_not_modify_or_connect_from_saved_config() {
         let directory = tempfile::tempdir().expect("创建测试目录");
         let path = directory.path().join("client.toml");
         let mut config = ClientConfig::initial();
@@ -499,15 +505,21 @@ mod tests {
             target: Some("127.0.0.1:22".into()),
         });
         config.save(&path).expect("保存旧版客户端配置");
+        let saved = std::fs::read(&path).expect("读取启动前配置");
 
-        clear_saved_services(&path).expect("清理旧版持久化服务");
+        let runtime = ClientRuntime::start(Some(path.clone())).expect("初始化客户端运行时");
 
-        assert!(
-            ClientConfig::read(&path)
-                .expect("读取迁移后的客户端配置")
-                .services
-                .is_empty()
+        assert_eq!(
+            std::fs::read(&path).expect("读取启动后配置"),
+            saved,
+            "初始化桌面运行时不得改写已有配置"
         );
+        assert!(matches!(runtime.status(), ClientStatus::Starting));
+        let task = runtime.task.lock().await;
+        assert!(task.handle.is_none());
+        assert!(task.commands.is_some());
+        drop(task);
+        runtime.shutdown().await.expect("停止客户端运行时");
     }
 
     #[tokio::test]
@@ -727,19 +739,25 @@ key = "{TEST_KEY}"
         }
 
         let directory = tempfile::tempdir().expect("创建临时目录");
-        let (_status_sender, status) = watch::channel(ClientStatus::Starting);
+        let (status_sender, status) = watch::channel(ClientStatus::Starting);
         let (dropped_sender, dropped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let _signal = DropSignal(Some(dropped_sender));
             std::future::pending::<gaterust_tunnel::Result<()>>().await
         });
+        let (controller, _commands) = client_control_channel();
         let runtime = ClientRuntime {
+            runtime: tokio::runtime::Handle::current(),
             config_path: Arc::new(directory.path().join("client.toml")),
+            status_sender,
             status,
             shutdown: CancellationToken::new(),
-            task: Mutex::new(Some(task)),
+            task: Mutex::new(ManagedTask {
+                commands: None,
+                handle: Some(task),
+            }),
             login: Mutex::new(None),
-            controller: client_control_channel().0,
+            controller,
         };
 
         let result = runtime
