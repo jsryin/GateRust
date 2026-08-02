@@ -29,6 +29,8 @@ jobs:
         run: node scripts/verify-release-version.mjs
       - name: Verify installer service files
         run: sh scripts/test-installer-service-files.sh
+      - name: Verify installer dependencies
+        run: sh scripts/test-installer-dependencies.sh
 
   binaries:
     needs: verify

@@ -78,6 +78,45 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || die "未找到命令：$1"
 }
 
+ensure_openssl() {
+    command -v openssl >/dev/null 2>&1 && return
+
+    if [ "$INTERACTIVE" -eq 1 ]; then
+        tty_read "未检测到 openssl，是否使用系统包管理器自动安装？[Y/n]："
+        case "${REPLY:-y}" in
+            y|Y|yes|YES) ;;
+            n|N|no|NO) die "自动初始化 QUIC 需要 openssl，请安装后重试" ;;
+            *) die "无效选择" ;;
+        esac
+    elif [ "$ASSUME_YES" -ne 1 ]; then
+        die "自动初始化 QUIC 需要 openssl；请先安装，或添加 --yes 允许自动安装依赖"
+    fi
+
+    say "正在使用系统包管理器安装 openssl..."
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache openssl || die "使用 apk 安装 openssl 失败，请手动安装后重试"
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update || die "使用 apt-get 更新软件包索引失败，请手动安装 openssl 后重试"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssl ||
+            die "使用 apt-get 安装 openssl 失败，请手动安装后重试"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y openssl || die "使用 dnf 安装 openssl 失败，请手动安装后重试"
+    elif command -v microdnf >/dev/null 2>&1; then
+        microdnf install -y openssl || die "使用 microdnf 安装 openssl 失败，请手动安装后重试"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y openssl || die "使用 yum 安装 openssl 失败，请手动安装后重试"
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive install --no-recommends openssl ||
+            die "使用 zypper 安装 openssl 失败，请手动安装后重试"
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -S --noconfirm --needed openssl ||
+            die "使用 pacman 安装 openssl 失败，请手动安装后重试"
+    else
+        die "未找到受支持的包管理器，请手动安装 openssl 后重试"
+    fi
+    command -v openssl >/dev/null 2>&1 || die "openssl 安装完成后仍不可用，请检查 PATH 后重试"
+}
+
 run_installed_as_root() {
     [ -z "$ROOT" ] || die "测试根目录模式不支持自动提权"
     trusted_ctl=/usr/local/sbin/gaterust
@@ -834,8 +873,8 @@ require_tunnel_init_targets_available() {
 }
 
 generate_tunnel_config() {
-    command -v openssl >/dev/null 2>&1 || die "自动初始化 QUIC 需要 openssl"
     require_tunnel_init_targets_available
+    ensure_openssl
     GENERATED_TUNNEL_CERTIFICATE="$TEMP_DIR/server.pem"
     GENERATED_TUNNEL_PRIVATE_KEY="$TEMP_DIR/server-key.pem"
     GENERATED_TUNNEL_CONFIG="$TEMP_DIR/server.toml"
