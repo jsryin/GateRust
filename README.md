@@ -18,7 +18,7 @@ GateRust 是一个基于 Rust 的内网穿透与反向代理工具，提供 QUIC
 以 Linux amd64 服务端为例：
 
 ```bash
-version=0.1.1-beta.1
+version=0.1.1-beta.2
 curl -fLO "https://github.com/jsryin/GateRust/releases/download/v${version}/gaterust_server_${version}_linux_amd64"
 chmod +x "gaterust_server_${version}_linux_amd64"
 ```
