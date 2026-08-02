@@ -252,7 +252,7 @@ ensure_clean_vm() {
 verify_install() {
     local default_install=$1 expect_running=$2 expect_enabled=$3
     local state modules expected_state service_environment service_environment_attributes
-    local service_file_attributes log_file_attributes
+    local service_file_attributes log_dir_attributes log_file_attributes
     local proxy_config expected_proxy_config
     local attempt tunnel_mode proxy_mode tunnel_config_attributes tunnel_certificate_attributes
     local tunnel_private_key_attributes tunnel_basic_constraints
@@ -283,6 +283,9 @@ verify_install() {
         openrc)
             [[ "$service_file_attributes" == "755 root root" ]] ||
                 die "OpenRC 服务文件权限不正确：$service_file_attributes"
+            log_dir_attributes=$(as_root stat -c '%a %U %G' /var/log/gaterust)
+            [[ "$log_dir_attributes" == "750 root gaterust" ]] ||
+                die "OpenRC 日志目录权限不正确：$log_dir_attributes"
             log_file_attributes=$(as_root stat -c '%a %U %G' /var/log/gaterust/gaterust.log)
             [[ "$log_file_attributes" == "660 root gaterust" ]] ||
                 die "OpenRC 日志权限不正确：$log_file_attributes"

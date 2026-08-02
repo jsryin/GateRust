@@ -567,7 +567,7 @@ delete_account() {
 prepare_service_runtime() {
     [ "$SERVICE_MANAGER" = openrc ] || return 0
     mkdir -p "$LOG_DIR"
-    chown root:root "$LOG_DIR"
+    chown root:gaterust "$LOG_DIR"
     chmod 0750 "$LOG_DIR"
     if [ ! -e "$LOG_FILE" ]; then
         : > "$LOG_FILE"
@@ -1071,11 +1071,15 @@ status_command() {
     read_state || die "GateRust 尚未安装"
     read_service_modules
     status_active="已停止" status_enabled="未启用" status_pid="-" status_uptime="-"
-    service_is_active && status_active="运行中" || true
     service_is_enabled && status_enabled="已启用" || true
+    if service_is_active; then
+        detected_pid=$(service_main_pid 2>/dev/null || true)
+        case "$detected_pid" in
+            ''|0|*[!0-9]*) status_active="启动异常" ;;
+            *) status_active="运行中"; status_pid=$detected_pid ;;
+        esac
+    fi
     if [ "$status_active" = "运行中" ]; then
-        status_pid=$(service_main_pid || printf '-')
-        [ "$status_pid" = 0 ] && status_pid="-"
         status_seconds=$(service_uptime_seconds "$status_pid" 2>/dev/null || true)
         if [ -n "$status_seconds" ]; then
             status_days=$((status_seconds / 86400))
