@@ -523,7 +523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_login_preserves_existing_config() {
+    async fn failed_login_does_not_modify_config_or_start_connection() {
         let directory = tempfile::tempdir().expect("创建测试目录");
         let config_path = directory.path().join("client.toml");
         let sink = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -553,6 +553,8 @@ mod tests {
             std::fs::read_to_string(&config_path).expect("读取失败登录后的配置"),
             before
         );
+        assert!(matches!(runtime.status(), ClientStatus::Starting));
+        assert!(runtime.task.lock().await.handle.is_none());
         runtime.shutdown().await.expect("停止客户端运行时");
     }
 
