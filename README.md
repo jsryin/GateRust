@@ -11,9 +11,9 @@ GateRust 是一个基于 Rust 的内网穿透与反向代理工具，提供 QUIC
 - 支持 Let's Encrypt、Google Trust Services，以及 HTTP-01、TLS-ALPN-01、Cloudflare DNS-01 验证。
 - Web 控制台提供管理员认证、配置管理、热重载状态和客户端配置生成。
 
-## Release 二进制
+## Release 产物
 
-每个版本只发布服务端和命令行客户端的原始可执行文件，覆盖 Linux amd64/arm/arm64、macOS amd64/arm64 和 Windows amd64/arm64。文件名中的版本号不包含标签前导 `v`，Windows 文件带 `.exe` 后缀。
+每个版本发布服务端、命令行客户端和带界面的桌面客户端。服务端与命令行客户端的原始可执行文件覆盖 Linux amd64/arm/arm64、macOS amd64/arm64 和 Windows amd64/arm64；桌面客户端覆盖 Linux amd64/arm64、macOS amd64/arm64 和 Windows amd64/arm64。Linux 桌面客户端使用 AppImage，macOS 使用 DMG，Windows 使用 NSIS 安装程序。文件名中的版本号不包含标签前导 `v`。
 
 以 Linux amd64 服务端为例：
 
@@ -22,6 +22,8 @@ version=0.1.1-beta.2
 curl -fLO "https://github.com/jsryin/GateRust/releases/download/v${version}/gaterust_server_${version}_linux_amd64"
 chmod +x "gaterust_server_${version}_linux_amd64"
 ```
+
+桌面客户端使用 `gaterust_client_${version}_<平台>_<架构>` 前缀，命令行客户端使用 `gaterust_client_cli_${version}_<平台>_<架构>` 前缀。Windows amd64 桌面客户端的文件名为 `gaterust_client_${version}_windows_amd64.exe`，该文件是带界面的客户端安装程序。
 
 配置示例、systemd unit 和 OpenRC 服务脚本位于源码仓库的 `config` 与 `scripts` 目录。Web 控制台静态文件需单独构建或部署。一键安装器支持运行 systemd 的 Linux，以及使用 OpenRC 的 Alpine Linux 3.21；Alpine 自动初始化证书前需执行 `apk add --no-cache openssl`。
 
@@ -77,16 +79,17 @@ pnpm --dir client dev
 pnpm --dir client build
 ```
 
-生成可直接运行的 Windows .exe，不打安装包：
-```
+生成可直接运行的 Windows `.exe`，不打安装包：
+
+```bash
 RC=llvm-rc-21 pnpm --dir client exec tauri build \
     --runner cargo-xwin \
     --target x86_64-pc-windows-msvc \
     --no-bundle \
     -- --locked
 ```
-安装包输出位置：
-target/x86_64-pc-windows-msvc/release/bundle/nsis/GateRust Client_*_x64-setup.exe
+
+可执行文件输出位置：`target/x86_64-pc-windows-msvc/release/gaterust-client-desktop.exe`。GitHub Actions 发布的 Windows 客户端会进一步打包为 NSIS 安装程序。
 
 
 ## 本地测试
