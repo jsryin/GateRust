@@ -7,6 +7,6 @@ admin_username = "admin"
 admin_password_hash = "replace-with-argon2id-phc-hash"
 # 使用 `cargo run -p gaterust-client -- --generate-key` 生成至少 32 字节的随机密钥。
 jwt_secret = "replace-with-a-random-256-bit-signing-secret"
-token_ttl_seconds = 3600
+token_ttl_seconds = 259200
 # SPA 独立部署时填写其完整 Origin；同源托管时保持空数组。
 allowed_origins = []

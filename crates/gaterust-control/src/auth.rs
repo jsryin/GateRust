@@ -18,6 +18,7 @@ use crate::{ControlError, Result, config::WebConfig};
 const LOGIN_WINDOW: Duration = Duration::from_mins(1);
 const MAX_LOGIN_FAILURES: u8 = 5;
 const MAX_TRACKED_ADDRESSES: usize = 4_096;
+const TOKEN_REFRESH_INTERVAL: Duration = Duration::from_hours(1);
 
 #[derive(Clone)]
 pub(crate) struct AuthService {
@@ -53,6 +54,16 @@ struct Claims {
     exp: u64,
 }
 
+pub(crate) struct AuthToken {
+    pub(crate) value: String,
+    pub(crate) expires_at: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct AuthenticatedSession {
+    issued_at: u64,
+}
+
 impl AuthService {
     pub(crate) fn new(config: &WebConfig) -> Result<Self> {
         PasswordHash::new(&config.admin_password_hash).map_err(|_| {
@@ -76,7 +87,7 @@ impl AuthService {
         address: IpAddr,
         username: String,
         password: String,
-    ) -> std::result::Result<(String, u64), LoginError> {
+    ) -> std::result::Result<AuthToken, LoginError> {
         if !self.can_attempt(address).await {
             return Err(LoginError::RateLimited);
         }
@@ -105,25 +116,44 @@ impl AuthService {
         }
         self.inner.attempts.lock().await.remove(&address);
         let now = unix_seconds().map_err(|_| LoginError::Internal)?;
-        let expires_at = now.saturating_add(self.inner.token_ttl.as_secs());
-        let token = encode(
+        self.issue_token(now)
+    }
+
+    pub(crate) fn verify_token(&self, token: &str) -> Option<AuthenticatedSession> {
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_required_spec_claims(&["sub", "iat", "exp"]);
+        decode::<Claims>(token, &self.inner.decoding_key, &validation)
+            .ok()
+            .filter(|data| data.claims.sub == self.inner.username)
+            .map(|data| AuthenticatedSession {
+                issued_at: data.claims.iat,
+            })
+    }
+
+    pub(crate) fn refresh_token(
+        &self,
+        session: &AuthenticatedSession,
+    ) -> std::result::Result<Option<AuthToken>, LoginError> {
+        let now = unix_seconds().map_err(|_| LoginError::Internal)?;
+        if now.saturating_sub(session.issued_at) < TOKEN_REFRESH_INTERVAL.as_secs() {
+            return Ok(None);
+        }
+        self.issue_token(now).map(Some)
+    }
+
+    fn issue_token(&self, issued_at: u64) -> std::result::Result<AuthToken, LoginError> {
+        let expires_at = issued_at.saturating_add(self.inner.token_ttl.as_secs());
+        let value = encode(
             &Header::new(Algorithm::HS256),
             &Claims {
                 sub: self.inner.username.clone(),
-                iat: now,
+                iat: issued_at,
                 exp: expires_at,
             },
             &self.inner.encoding_key,
         )
         .map_err(|_| LoginError::Internal)?;
-        Ok((token, expires_at))
-    }
-
-    pub(crate) fn verify_token(&self, token: &str) -> bool {
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_required_spec_claims(&["sub", "iat", "exp"]);
-        decode::<Claims>(token, &self.inner.decoding_key, &validation)
-            .is_ok_and(|data| data.claims.sub == self.inner.username)
+        Ok(AuthToken { value, expires_at })
     }
 
     async fn can_attempt(&self, address: IpAddr) -> bool {
@@ -190,7 +220,7 @@ mod tests {
             admin_username: "admin".into(),
             admin_password_hash: password_hash,
             jwt_secret: "0123456789abcdef0123456789abcdef".into(),
-            token_ttl_seconds: 3_600,
+            token_ttl_seconds: 72 * 60 * 60,
             allowed_origins: Vec::new(),
         }
     }
@@ -200,11 +230,13 @@ mod tests {
         let auth = AuthService::new(&config(hash_password(b"correct").expect("生成测试哈希")))
             .expect("创建认证服务");
         let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let (token, _) = auth
+        let issued_after = unix_seconds().expect("获取登录前时间");
+        let token = auth
             .login(address, "admin".into(), "correct".into())
             .await
             .expect("正确凭据应登录成功");
-        assert!(auth.verify_token(&token));
+        assert!(auth.verify_token(&token.value).is_some());
+        assert!(token.expires_at >= issued_after + 72 * 60 * 60);
         assert!(matches!(
             auth.login(address, "admin".into(), "wrong".into()).await,
             Err(LoginError::InvalidCredentials)
@@ -223,5 +255,40 @@ mod tests {
             auth.login(address, "admin".into(), "correct".into()).await,
             Err(LoginError::RateLimited)
         ));
+    }
+
+    #[test]
+    fn active_session_is_refreshed_at_most_once_per_hour() {
+        let auth = AuthService::new(&config(hash_password(b"correct").expect("生成测试哈希")))
+            .expect("创建认证服务");
+        let now = unix_seconds().expect("获取当前时间");
+        let token = auth.issue_token(now).expect("签发测试令牌");
+        let session = auth.verify_token(&token.value).expect("测试令牌有效");
+
+        assert!(
+            auth.refresh_token(&session)
+                .expect("检查令牌续期")
+                .is_none()
+        );
+
+        let refreshed = auth
+            .issue_token(now - TOKEN_REFRESH_INTERVAL.as_secs())
+            .and_then(|old_token| {
+                let old_session = auth
+                    .verify_token(&old_token.value)
+                    .expect("旧测试令牌仍有效");
+                auth.refresh_token(&old_session)
+            })
+            .expect("刷新令牌")
+            .expect("签发新令牌");
+        assert!(refreshed.expires_at >= now + 72 * 60 * 60);
+        let refreshed_session = auth
+            .verify_token(&refreshed.value)
+            .expect("刷新后的令牌有效");
+        assert!(
+            auth.refresh_token(&refreshed_session)
+                .expect("检查刷新后的令牌")
+                .is_none()
+        );
     }
 }

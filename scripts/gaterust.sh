@@ -988,7 +988,7 @@ generate_web_config() {
             printf '%s\n' 'admin_username = "admin"'
             printf 'admin_password_hash = "%s"\n' "$generated_password_hash"
             printf 'jwt_secret = "%s"\n' "$generated_jwt_secret"
-            printf '%s\n' 'token_ttl_seconds = 3600'
+            printf '%s\n' 'token_ttl_seconds = 259200'
             printf '%s\n' 'allowed_origins = []'
         } > "$GENERATED_WEB_CONFIG"
     )

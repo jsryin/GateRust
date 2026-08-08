@@ -17,6 +17,18 @@ import type {
 } from './types';
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, '') ?? '';
+const TOKEN_STORAGE_KEY = 'gaterust_token';
+const REFRESHED_TOKEN_HEADER = 'x-gaterust-token';
+
+export const getStoredToken = () => sessionStorage.getItem(TOKEN_STORAGE_KEY) ?? '';
+
+export function storeToken(token: string) {
+  sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+}
+
+export function clearStoredToken() {
+  sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+}
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -25,11 +37,12 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {
+  const authToken = token ? getStoredToken() || token : '';
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: {
       ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
       ...init.headers
     }
   });
@@ -37,6 +50,9 @@ async function request<T>(path: string, token: string, init: RequestInit = {}): 
     const body = await response.json().catch(() => ({ error: `请求失败 (${response.status})` }));
     throw new ApiError(response.status, body.error ?? `请求失败 (${response.status})`);
   }
+  const refreshedToken = response.headers.get(REFRESHED_TOKEN_HEADER);
+  // 仅替换当前请求使用的令牌，避免退出登录后在途请求恢复旧会话。
+  if (refreshedToken && getStoredToken() === authToken) storeToken(refreshedToken);
   return response.status === 204 || response.status === 202 ? (undefined as T) : response.json();
 }
 
@@ -145,8 +161,9 @@ export async function streamDashboard(
   signal: AbortSignal,
   onDashboard: (dashboard: Dashboard) => void
 ) {
+  const authToken = getStoredToken() || token;
   const response = await fetch(`${API_BASE}/api/events`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { Authorization: `Bearer ${authToken}` },
     signal
   });
   if (!response.ok || !response.body) throw new ApiError(response.status, '实时状态连接失败');

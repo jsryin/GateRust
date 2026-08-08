@@ -1,6 +1,14 @@
 import { LoaderCircle } from 'lucide-react';
 import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
-import { ApiError, checkSession, getConfig, streamDashboard } from './lib/api';
+import {
+  ApiError,
+  checkSession,
+  clearStoredToken,
+  getConfig,
+  getStoredToken,
+  storeToken,
+  streamDashboard
+} from './lib/api';
 import type { ConfigSnapshot, Dashboard as DashboardState } from './lib/types';
 import { useTheme } from './hooks/useTheme';
 import { AppShell, type PageId } from './components/AppShell';
@@ -12,9 +20,11 @@ import { Notice } from './components/ui/Notice';
 const TunnelPanel = lazy(() => import('./components/TunnelPanel').then((module) => ({ default: module.TunnelPanel })));
 const ProxyPanel = lazy(() => import('./components/ProxyPanel').then((module) => ({ default: module.ProxyPanel })));
 const ClientGenerator = lazy(() => import('./components/ClientGenerator').then((module) => ({ default: module.ClientGenerator })));
+const SESSION_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+const SESSION_REFRESH_RETRY_MS = 60 * 1000;
 
 export function App() {
-  const [token, setToken] = useState(() => sessionStorage.getItem('gaterust_token') ?? '');
+  const [token, setToken] = useState(getStoredToken);
   const [active, setActive] = useState<PageId>('dashboard');
   const [config, setConfig] = useState<ConfigSnapshot>({});
   const [dashboard, setDashboard] = useState<DashboardState | null>(null);
@@ -24,7 +34,7 @@ export function App() {
   const { theme, toggleTheme } = useTheme();
 
   const logout = useCallback(() => {
-    sessionStorage.removeItem('gaterust_token');
+    clearStoredToken();
     setToken('');
     setConfig({});
     setDashboard(null);
@@ -90,8 +100,43 @@ export function App() {
     };
   }, [logout, retry, token]);
 
+  useEffect(() => {
+    if (!token) return;
+
+    let nextRefreshAt = Date.now() + SESSION_REFRESH_INTERVAL_MS;
+    let refreshing = false;
+    const refreshSession = () => {
+      const now = Date.now();
+      if (refreshing || now < nextRefreshAt) return;
+      refreshing = true;
+      nextRefreshAt = now + SESSION_REFRESH_INTERVAL_MS;
+      void checkSession(token)
+        .catch((cause: unknown) => {
+          if (cause instanceof ApiError && cause.status === 401) logout();
+          else nextRefreshAt = Date.now() + SESSION_REFRESH_RETRY_MS;
+        })
+        .finally(() => {
+          refreshing = false;
+        });
+    };
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') refreshSession();
+    };
+
+    window.addEventListener('pointerdown', refreshSession, { passive: true });
+    window.addEventListener('keydown', refreshSession);
+    window.addEventListener('wheel', refreshSession, { passive: true });
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    return () => {
+      window.removeEventListener('pointerdown', refreshSession);
+      window.removeEventListener('keydown', refreshSession);
+      window.removeEventListener('wheel', refreshSession);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+    };
+  }, [logout, token]);
+
   function authenticated(nextToken: string) {
-    sessionStorage.setItem('gaterust_token', nextToken);
+    storeToken(nextToken);
     setToken(nextToken);
   }
 

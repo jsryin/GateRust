@@ -3,9 +3,9 @@ use std::{convert::Infallible, net::SocketAddr};
 #[cfg(feature = "tunnel")]
 use axum::routing::delete;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
-    http::{HeaderMap, Method, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response, Sse,
@@ -21,12 +21,13 @@ use tokio_stream::wrappers::WatchStream;
 use tower_http::cors::CorsLayer;
 
 use crate::{
-    auth::{AuthService, LoginError},
+    auth::{AuthService, AuthenticatedSession, LoginError},
     config::WebConfig,
     store::ConfigStore,
 };
 
 const MAX_API_BODY_BYTES: usize = 512 * 1_024;
+const REFRESHED_TOKEN_HEADER: &str = "x-gaterust-token";
 
 #[derive(Clone)]
 struct ApiState {
@@ -83,7 +84,8 @@ pub(crate) fn router(config: &WebConfig, auth: AuthService, store: ConfigStore) 
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     let mut cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .expose_headers([header::HeaderName::from_static(REFRESHED_TOKEN_HEADER)]);
     if !config.allowed_origins.is_empty() {
         let origins = config
             .allowed_origins
@@ -168,7 +170,10 @@ async fn login(
         .login(address.ip(), request.username, request.password)
         .await
     {
-        Ok((token, expires_at)) => Ok(Json(LoginResponse { token, expires_at })),
+        Ok(token) => Ok(Json(LoginResponse {
+            token: token.value,
+            expires_at: token.expires_at,
+        })),
         Err(LoginError::InvalidCredentials) => {
             Err(ApiError::new(StatusCode::UNAUTHORIZED, "用户名或密码错误"))
         }
@@ -186,21 +191,38 @@ async fn login(
 async fn require_auth(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    if token.is_some_and(|token| state.auth.verify_token(token)) {
+    if let Some(session) = token.and_then(|token| state.auth.verify_token(token)) {
+        request.extensions_mut().insert(session);
         return next.run(request).await;
     }
     ApiError::new(StatusCode::UNAUTHORIZED, "登录已失效").into_response()
 }
 
-async fn session() -> StatusCode {
-    StatusCode::NO_CONTENT
+async fn session(
+    State(state): State<ApiState>,
+    Extension(session): Extension<AuthenticatedSession>,
+) -> Result<Response, ApiError> {
+    let Some(token) = state
+        .auth
+        .refresh_token(&session)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "认证服务暂时不可用"))?
+    else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    let header = HeaderValue::from_str(&token.value)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "认证服务暂时不可用"))?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response
+        .headers_mut()
+        .insert(REFRESHED_TOKEN_HEADER, header);
+    Ok(response)
 }
 
 async fn get_config(State(state): State<ApiState>) -> Json<crate::store::ConfigSnapshot> {

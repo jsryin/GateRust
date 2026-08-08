@@ -56,6 +56,7 @@ test_custom_password() (
     [ -z "$GENERATED_WEB_PASSWORD" ] || die "自定义密码不应作为自动密码显示"
     assert_contains "$GENERATED_WEB_CONFIG" 'admin_password_hash = "test-hash-custom-password"'
     assert_contains "$GENERATED_WEB_CONFIG" 'jwt_secret = "jwt-secret"'
+    assert_contains "$GENERATED_WEB_CONFIG" 'token_ttl_seconds = 259200'
 )
 
 test_automatic_password() (

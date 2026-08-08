@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::{ControlError, Result};
 
-const DEFAULT_TOKEN_TTL_SECONDS: u64 = 3_600;
+const DEFAULT_TOKEN_TTL_SECONDS: u64 = 72 * 60 * 60;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,9 +68,9 @@ impl WebConfig {
                 "jwt_secret 至少需要 32 字节".into(),
             ));
         }
-        if !(300..=86_400).contains(&self.token_ttl_seconds) {
+        if !(300..=DEFAULT_TOKEN_TTL_SECONDS).contains(&self.token_ttl_seconds) {
             return Err(ControlError::InvalidConfig(
-                "token_ttl_seconds 必须为 300..=86400".into(),
+                "token_ttl_seconds 必须为 300..=259200".into(),
             ));
         }
         for origin in &self.allowed_origins {
