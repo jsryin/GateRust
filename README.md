@@ -11,75 +11,24 @@ GateRust 是一个基于 Rust 的内网穿透与反向代理工具，提供 QUIC
 - 支持 Let's Encrypt、Google Trust Services，以及 HTTP-01、TLS-ALPN-01、Cloudflare DNS-01 验证。
 - Web 控制台提供管理员认证、配置管理、热重载状态和客户端配置生成。
 
-## Release 产物
+## 快速开始
 
-每个版本发布服务端、命令行客户端和带界面的桌面客户端。服务端与命令行客户端的原始可执行文件覆盖 Linux amd64/arm/arm64、macOS amd64/arm64 和 Windows amd64/arm64；桌面客户端覆盖 Linux amd64/arm64、macOS amd64/arm64 和 Windows amd64/arm64。Linux 桌面客户端使用 AppImage，macOS 使用 DMG，Windows 使用 NSIS 安装程序。文件名中的版本号不包含标签前导 `v`。
+### 安装服务端
 
-以 Linux amd64 服务端为例：
-
-```bash
-version=0.1.1-beta.2
-curl -fLO "https://github.com/jsryin/GateRust/releases/download/v${version}/gaterust_server_${version}_linux_amd64"
-chmod +x "gaterust_server_${version}_linux_amd64"
-```
-
-桌面客户端使用 `gaterust_client_${version}_<平台>_<架构>` 前缀，命令行客户端使用 `gaterust_client_cli_${version}_<平台>_<架构>` 前缀。Windows amd64 桌面客户端的文件名为 `gaterust_client_${version}_windows_amd64.exe`，该文件是带界面的客户端安装程序。
-
-配置示例、systemd unit 和 OpenRC 服务脚本位于源码仓库的 `config` 与 `scripts` 目录。Web 控制台静态文件需单独构建或部署。一键安装器支持运行 systemd 的 Linux，以及使用 OpenRC 的 Alpine Linux 3.21；Alpine 自动初始化证书前需执行 `apk add --no-cache openssl`。
-
-服务端隧道证书默认位于配置指定的路径；使用仓库 systemd 示例部署时建议放在 `/etc/gaterust/tunnel/server.pem`。
-
-旧版本的 `--init-tunnel` 可能生成 `Basic Constraints CA:TRUE` 的证书，新版本会在服务端启动前拒绝将其作为叶证书。可先用以下命令确认：
+支持运行 systemd 的 Linux 发行版，以及使用 OpenRC 的 Alpine Linux 3.21；支持 x86_64 和 aarch64 架构。复制并执行以下命令，下载安装脚本、授予执行权限并进入交互式安装：
 
 ```bash
-sudo openssl x509 -in /etc/gaterust/tunnel/server.pem -noout -ext basicConstraints
+version=v0.1.1-beta.2
+curl -fsSLO "https://github.com/jsryin/GateRust/releases/download/${version}/gaterust.sh"
+chmod +x gaterust.sh
+sudo ./gaterust.sh
 ```
 
-如果输出包含 `CA:TRUE`，请备份并生成新的服务端叶证书：
+安装完成后，使用 `sudo gaterust status` 查看状态，使用 `sudo gaterust logs` 查看日志。
 
-```bash
-sudo cp -a /etc/gaterust/tunnel/server.pem /etc/gaterust/tunnel/server.pem.ca-true.bak
-sudo cp -a /etc/gaterust/tunnel/server-key.pem /etc/gaterust/tunnel/server-key.pem.ca-true.bak
-sudo openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 3650 \
-  -subj '/CN=gaterust.local' \
-  -addext 'subjectAltName=DNS:gaterust.local' \
-  -addext 'basicConstraints=critical,CA:FALSE' \
-  -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
-  -addext 'extendedKeyUsage=serverAuth' \
-  -keyout /etc/gaterust/tunnel/server-key.pem.new \
-  -out /etc/gaterust/tunnel/server.pem.new
-sudo gaterust stop
-sudo install -o root -g gaterust -m 0640 /etc/gaterust/tunnel/server.pem.new /etc/gaterust/tunnel/server.pem
-sudo install -o root -g gaterust -m 0640 /etc/gaterust/tunnel/server-key.pem.new /etc/gaterust/tunnel/server-key.pem
-sudo gaterust start
-```
+### Windows 客户端
 
-升级后的桌面客户端检测到本地受管证书为 `CA:TRUE` 时，会重新执行分组密钥证明并安全替换该证书。
-
-## 桌面客户端
-
-每次点击“获取配置”时，客户端都会通过分组密钥双向证明重新验证服务端证书，再以唯一文件名保存候选证书并建立受信任连接。只有正常 QUIC 认证成功后才提交证书和配置；取消、超时、密钥错误或网络失败会保留原配置及现有会话。整个过程最多持续 60 秒，证书引导协议要求客户端与服务端同时升级到相同版本。
-
-隧道配置中，单条 TCP/SOCKS5 隧道最多允许 512 个并发连接，单条 UDP 隧道最多允许 128 个会话。服务端还使用跨隧道、跨热更新代际的全局数据流、UDP 会话和 16 MiB UDP 排队字节预算。当前 SOCKS5 入口仅支持免认证，因此必须监听 `127.0.0.0/8` 或 `::1`；如需公网使用，应在外层部署经过认证和访问控制的代理。
-
-桌面客户端启动后会自动建立控制会话以获取隧道目录，但不会自动启用上次选择的隧道。“启用”和“停用”操作通过控制通道发送，并在服务端确认最终隧道状态后完成；运行中的选择不会写入客户端配置文件。
-
-服务器地址必须能从客户端所在系统直接访问；`localhost` 只指客户端自己的网络命名空间。例如 Windows 客户端访问 WSL2 NAT 内的 QUIC/UDP 服务时，应使用 Windows 可达的 WSL 地址或启用支持 UDP 的镜像网络，而不能依赖 TCP localhost 转发。
-
-安装前端依赖并启动开发环境：
-
-```bash
-pnpm --dir client install --frozen-lockfile
-pnpm --dir client dev
-```
-
-生成当前平台安装包：
-
-```bash
-pnpm --dir client build
-```
-
-生成可直接运行的 Windows `.exe`，不打安装包：
+本地生成可直接运行的 Windows `.exe`，不打安装包：
 
 ```bash
 RC=llvm-rc-21 pnpm --dir client exec tauri build \
@@ -89,8 +38,7 @@ RC=llvm-rc-21 pnpm --dir client exec tauri build \
     -- --locked
 ```
 
-可执行文件输出位置：`target/x86_64-pc-windows-msvc/release/gaterust-client-desktop.exe`。GitHub Actions 发布的 Windows 客户端会进一步打包为 NSIS 安装程序。
-
+可执行文件输出位置：`target/x86_64-pc-windows-msvc/release/gaterust-client-desktop.exe`。
 
 ## 本地测试
 
