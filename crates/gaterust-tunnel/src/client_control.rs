@@ -12,7 +12,7 @@ use crate::{
 };
 
 const CLIENT_COMMAND_CAPACITY: usize = 4;
-pub(crate) const SERVICE_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const SERVICE_UPDATE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 向正在运行的客户端控制会话提交临时隧道选择。
 #[derive(Clone)]

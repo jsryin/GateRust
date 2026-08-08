@@ -44,6 +44,7 @@ use crate::{
 };
 
 const MAX_RESOLVED_ADDRESSES: usize = 8;
+const BOOTSTRAP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONFIG_RELOAD_GRACE: Duration = Duration::from_millis(100);
 const CONFIG_RELOAD_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -1006,7 +1007,7 @@ async fn bootstrap_at_address(
     .await
     .map_err(|error| connection_error_or(&connection, error))?;
     let response: ServerHandshake =
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut receive))
+        tokio::time::timeout(BOOTSTRAP_RESPONSE_TIMEOUT, read_frame(&mut receive))
             .await
             .map_err(|_| TunnelError::Timeout("等待证书引导结果"))?
             .map_err(|error| connection_error_or(&connection, error))?;

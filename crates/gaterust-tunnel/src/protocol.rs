@@ -13,7 +13,7 @@ use crate::{
 pub(crate) const PROTOCOL_VERSION: u16 = 5;
 pub(crate) const MAX_CONTROL_FRAME: usize = 256 * 1024;
 pub(crate) const MAX_DATAGRAM: usize = u16::MAX as usize;
-pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(serde::Deserialize, Serialize)]
 pub(crate) enum ClientHandshake {
