@@ -1051,8 +1051,8 @@ install_command() {
             case "${REPLY:-1}" in 1) START_MODE=enable ;; 2) START_MODE=start ;; 3) START_MODE=stop ;; *) die "无效选择" ;; esac
         fi
         say "安装摘要：版本 $SCRIPT_VERSION，架构 $ARCH，模块 $NEW_MODULES"
-        tty_read "输入 yes 确认安装："
-        [ "$REPLY" = yes ] || die "已取消安装"
+        tty_read "输入 y 确认安装："
+        [ "$REPLY" = y ] || die "已取消安装"
     fi
     [ "$had_state" -eq 1 ] && [ "$START_MODE" = default ] && START_MODE=preserve
     [ "$START_MODE" = default ] && START_MODE=stop
@@ -1189,8 +1189,8 @@ full_uninstall() {
 
 confirm_uninstall() {
     [ "$ASSUME_YES" -eq 1 ] && return
-    tty_read "以上内容将被删除，输入 yes 确认："
-    [ "$REPLY" = yes ] || die "已取消卸载"
+    tty_read "以上内容将被删除，输入 y 确认："
+    [ "$REPLY" = y ] || die "已取消卸载"
 }
 
 show_uninstall_files() {
