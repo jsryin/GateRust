@@ -10,6 +10,7 @@ export interface TunnelConfig {
   group: string;
   kind: TunnelKind;
   bind: string;
+  local_ip: string;
   local_port: number | null;
   limit_bps: number | null;
   max_connections: number;

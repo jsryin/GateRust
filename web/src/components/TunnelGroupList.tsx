@@ -16,6 +16,7 @@ import type {
   TunnelRuntimeClient,
   TunnelRuntimeState
 } from '../lib/types';
+import { tunnelLocalTarget } from '../lib/tunnels';
 import { Badge } from './ui/Badge';
 import { Button } from './ui/Button';
 import { ConfirmAction } from './ui/ConfirmAction';
@@ -140,6 +141,7 @@ export function TunnelGroupList({
         const tunnelMatches = normalizedQuery === '' || groupMatches || [
           tunnel.name,
           tunnel.bind,
+          tunnel.local_ip,
           kindLabel[tunnel.kind],
           tunnel.local_port?.toString() ?? '',
           owner?.device_id ?? '',
@@ -474,7 +476,7 @@ function sameSet(left: Set<string>, right: Set<string>): boolean {
 
 function tunnelMapping(tunnel: TunnelConfig): string {
   if (tunnel.kind === 'socks5') return `${tunnel.bind} → 动态目标`;
-  return `${tunnel.bind} → ${tunnel.local_port === null ? '同端口' : `:${tunnel.local_port}`}`;
+  return `${tunnel.bind} → ${tunnelLocalTarget(tunnel)}`;
 }
 
 function formatConnectedAt(timestamp: number): string {

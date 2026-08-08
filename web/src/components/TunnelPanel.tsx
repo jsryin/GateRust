@@ -51,6 +51,7 @@ function defaultTunnel(): TunnelConfig {
     group: '',
     kind: 'tcp',
     bind: '0.0.0.0:8080',
+    local_ip: '127.0.0.1',
     local_port: 8080,
     limit_bps: null,
     max_connections: 128,
@@ -203,6 +204,10 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
     const next = { ...tunnel, limit_bps: limitBps };
     if (!next.name || !next.group || !next.bind) {
       setError('名称、分组和监听地址不能为空');
+      return;
+    }
+    if (next.kind !== 'socks5' && !next.local_ip) {
+      setError('本地 IP 不能为空');
       return;
     }
     if (
@@ -379,19 +384,28 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
                       <Input onChange={(event) => setTunnel((current) => ({ ...current, bind: event.target.value }))} value={tunnel.bind} />
                     </Field>
                     {tunnel.kind !== 'socks5' && (
-                      <Field label="本地端口">
-                        <Input
-                          max="65535"
-                          min="1"
-                          onChange={(event) => setTunnel((current) => ({
-                            ...current,
-                            local_port: event.target.value ? Number(event.target.value) : null
-                          }))}
-                          placeholder="留空则与监听端口相同"
-                          type="number"
-                          value={tunnel.local_port ?? ''}
-                        />
-                      </Field>
+                      <>
+                        <Field label="本地 IP">
+                          <Input
+                            onChange={(event) => setTunnel((current) => ({ ...current, local_ip: event.target.value }))}
+                            placeholder="127.0.0.1 或 localhost"
+                            value={tunnel.local_ip}
+                          />
+                        </Field>
+                        <Field label="本地端口">
+                          <Input
+                            max="65535"
+                            min="1"
+                            onChange={(event) => setTunnel((current) => ({
+                              ...current,
+                              local_port: event.target.value ? Number(event.target.value) : null
+                            }))}
+                            placeholder="留空则与监听端口相同"
+                            type="number"
+                            value={tunnel.local_port ?? ''}
+                          />
+                        </Field>
+                      </>
                     )}
                     <Field label="限速（KB/s）">
                       <Input

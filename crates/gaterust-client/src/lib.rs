@@ -408,12 +408,9 @@ fn services_for_selection(
             )));
         }
         let target = match tunnel.kind {
-            TunnelKind::Tcp | TunnelKind::Udp => Some(format!(
-                "127.0.0.1:{}",
-                tunnel.local_port.ok_or_else(|| {
-                    ClientError::InvalidOperation(format!("隧道 {} 缺少本地端口配置", tunnel.name))
-                })?
-            )),
+            TunnelKind::Tcp | TunnelKind::Udp => Some(tunnel.local_target().ok_or_else(|| {
+                ClientError::InvalidOperation(format!("隧道 {} 缺少本地端口配置", tunnel.name))
+            })?),
             TunnelKind::Socks5 => None,
         };
         services.push(ClientServiceConfig {
@@ -460,6 +457,7 @@ mod tests {
                 name: "ssh".into(),
                 kind: TunnelKind::Tcp,
                 server_port: 22022,
+                local_ip: Some("localhost".into()),
                 local_port: Some(22),
                 state: ClientTunnelState::Idle,
             },
@@ -467,6 +465,7 @@ mod tests {
                 name: "proxy".into(),
                 kind: TunnelKind::Socks5,
                 server_port: 1080,
+                local_ip: None,
                 local_port: None,
                 state: ClientTunnelState::Idle,
             },
@@ -477,7 +476,7 @@ mod tests {
         assert_eq!(services[0].name, "proxy");
         assert_eq!(services[0].target, None);
         assert_eq!(services[1].name, "ssh");
-        assert_eq!(services[1].target.as_deref(), Some("127.0.0.1:22"));
+        assert_eq!(services[1].target.as_deref(), Some("localhost:22"));
     }
 
     #[test]
@@ -486,6 +485,7 @@ mod tests {
             name: "ssh".into(),
             kind: TunnelKind::Tcp,
             server_port: 22022,
+            local_ip: Some("127.0.0.1".into()),
             local_port: Some(22),
             state: ClientTunnelState::Occupied,
         }];

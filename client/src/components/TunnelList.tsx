@@ -30,12 +30,13 @@ export function TunnelList({ onToggle, selected, tunnels }: TunnelListProps) {
         <span />
         <span>隧道</span>
         <span>服务器端口</span>
-        <span>本地端口</span>
+        <span>本地目标</span>
         <span>状态</span>
       </div>
       <div className="tunnel-rows">
         {tunnels.map((tunnel) => {
           const unavailable = tunnel.state !== 'idle';
+          const target = localTarget(tunnel);
           return (
             <label className={`tunnel-row ${tunnel.state}`} key={tunnel.name}>
               <input
@@ -49,7 +50,7 @@ export function TunnelList({ onToggle, selected, tunnels }: TunnelListProps) {
                 <small>{kindLabels[tunnel.kind]}</small>
               </span>
               <code>{tunnel.server_port}</code>
-              <code>{tunnel.local_port ?? '-'}</code>
+              <code title={target}>{target}</code>
               <span className={`state-badge ${tunnel.state}`}>
                 {tunnel.state === 'occupied' && <LockKeyhole size={12} />}
                 {stateLabels[tunnel.state]}
@@ -60,4 +61,10 @@ export function TunnelList({ onToggle, selected, tunnels }: TunnelListProps) {
       </div>
     </div>
   );
+}
+
+function localTarget(tunnel: ClientTunnel): string {
+  if (tunnel.local_port === null) return '-';
+  const ip = tunnel.local_ip ?? '127.0.0.1';
+  return `${ip.includes(':') ? `[${ip}]` : ip}:${tunnel.local_port}`;
 }

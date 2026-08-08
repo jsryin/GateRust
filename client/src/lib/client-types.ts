@@ -24,6 +24,7 @@ export interface ClientTunnel {
   name: string;
   kind: TunnelKind;
   server_port: number;
+  local_ip: string | null;
   local_port: number | null;
   state: ClientTunnelState;
 }

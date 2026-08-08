@@ -312,7 +312,7 @@ input::placeholder {
 .tunnel-table-head,
 .tunnel-row {
   display: grid;
-  grid-template-columns: 28px minmax(140px, 1fr) 92px 82px 82px;
+  grid-template-columns: 28px minmax(120px, 1fr) 92px minmax(130px, 1fr) 82px;
   align-items: center;
   column-gap: 9px;
 }
@@ -385,6 +385,10 @@ input::placeholder {
 }
 
 .tunnel-row code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: #44504b;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 11px;

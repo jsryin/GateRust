@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::OpenOptions,
     io::{ErrorKind, Write as _},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     num::{NonZeroU16, NonZeroU64},
     path::{Path, PathBuf},
 };
@@ -16,6 +16,8 @@ use crate::{Result, TunnelError};
 const DEFAULT_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_MAX_UDP_SESSIONS: usize = 128;
 const DEFAULT_UDP_IDLE_SECONDS: u64 = 60;
+/// 未显式配置时，客户端连接的本地回环地址。
+pub const DEFAULT_LOCAL_IP: &str = "127.0.0.1";
 pub(crate) const MAX_DATA_STREAMS: usize = 512;
 pub(crate) const MAX_UDP_SESSIONS: usize = 128;
 pub(crate) const MAX_UDP_IDLE_SECONDS: u64 = 3_600;
@@ -64,6 +66,8 @@ pub struct ServerTunnelConfig {
     pub group: String,
     pub kind: TunnelKind,
     pub bind: SocketAddr,
+    #[serde(default = "default_local_ip")]
+    pub local_ip: String,
     #[serde(default)]
     pub local_port: Option<NonZeroU16>,
     pub limit_bps: Option<NonZeroU64>,
@@ -110,6 +114,10 @@ impl ServerTunnelConfig {
             }
             TunnelKind::Socks5 => None,
         }
+    }
+
+    pub(crate) fn client_local_ip(&self) -> Option<&str> {
+        (self.kind != TunnelKind::Socks5).then_some(self.local_ip.as_str())
     }
 }
 
@@ -229,6 +237,15 @@ impl ServerConfig {
             if tunnel.kind == TunnelKind::Socks5 && tunnel.local_port.is_some() {
                 return Err(TunnelError::InvalidConfig(format!(
                     "SOCKS5 隧道 {} 不应配置 local_port",
+                    tunnel.name
+                )));
+            }
+            if tunnel.kind != TunnelKind::Socks5
+                && tunnel.local_ip != "localhost"
+                && tunnel.local_ip.parse::<IpAddr>().is_err()
+            {
+                return Err(TunnelError::InvalidConfig(format!(
+                    "隧道 {} 的 local_ip 必须为 localhost 或有效 IP 地址",
                     tunnel.name
                 )));
             }
@@ -572,6 +589,10 @@ const fn default_udp_idle_seconds() -> u64 {
     DEFAULT_UDP_IDLE_SECONDS
 }
 
+fn default_local_ip() -> String {
+    DEFAULT_LOCAL_IP.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +643,7 @@ mod tests {
             group: "office".into(),
             kind: TunnelKind::Socks5,
             bind: "0.0.0.0:1080".parse().expect("测试地址有效"),
+            local_ip: default_local_ip(),
             local_port: None,
             limit_bps: None,
             max_connections: 8,
@@ -667,6 +689,7 @@ mod tests {
                     group: "office".into(),
                     kind: TunnelKind::Tcp,
                     bind: SocketAddr::from(([127, 0, 0, 1], 10_000 + offset)),
+                    local_ip: default_local_ip(),
                     local_port: None,
                     limit_bps: None,
                     max_connections: 8,
@@ -698,6 +721,7 @@ mod tests {
             group: "office".into(),
             kind: TunnelKind::Tcp,
             bind: "0.0.0.0:22022".parse().expect("测试地址有效"),
+            local_ip: default_local_ip(),
             local_port: None,
             limit_bps: None,
             max_connections: 8,
@@ -711,6 +735,47 @@ mod tests {
 
         tunnel.kind = TunnelKind::Socks5;
         assert_eq!(tunnel.client_local_port(), None);
+        assert_eq!(tunnel.client_local_ip(), None);
+    }
+
+    #[test]
+    fn defaults_and_validates_local_ip() {
+        let config = toml::from_str::<ServerConfig>(
+            r#"
+[quic]
+bind = "127.0.0.1:2333"
+certificate = "server.pem"
+private_key = "server-key.pem"
+
+[[groups]]
+name = "office"
+key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+[[tunnels]]
+name = "ssh"
+group = "office"
+kind = "tcp"
+bind = "0.0.0.0:22022"
+"#,
+        )
+        .expect("旧版配置应兼容");
+        assert_eq!(config.tunnels[0].local_ip, DEFAULT_LOCAL_IP);
+        assert!(config.validate().is_ok());
+
+        let mut tunnel = config.tunnels[0].clone();
+        tunnel.local_ip = "localhost".into();
+        let server = |tunnel| ServerConfig {
+            quic: config.quic.clone(),
+            groups: config.groups.clone(),
+            tunnels: vec![tunnel],
+        };
+        assert!(server(tunnel.clone()).validate().is_ok());
+
+        tunnel.local_ip = "::1".into();
+        assert!(server(tunnel.clone()).validate().is_ok());
+
+        tunnel.local_ip = "host:invalid".into();
+        assert!(server(tunnel).validate().is_err());
     }
 
     #[test]

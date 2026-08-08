@@ -27,8 +27,9 @@ pub use client::{
 };
 pub use client_control::{ClientCommandReceiver, ClientController, client_control_channel};
 pub use config::{
-    ClientConfig, ClientServerConfig, ClientServiceConfig, GroupConfig, MAX_CLIENT_SERVICES,
-    ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind, generate_group_key,
+    ClientConfig, ClientServerConfig, ClientServiceConfig, DEFAULT_LOCAL_IP, GroupConfig,
+    MAX_CLIENT_SERVICES, ServerConfig, ServerQuicConfig, ServerTunnelConfig, TunnelKind,
+    generate_group_key,
 };
 pub use error::{Result, TunnelError};
 pub use runtime::{

@@ -628,6 +628,7 @@ target = "127.0.0.1:9"
     let catalog = runtime.catalog(occupied_client).await;
     assert_eq!(catalog[0].state, ClientTunnelState::Occupied);
     assert_eq!(catalog[0].server_port, public.port());
+    assert_eq!(catalog[0].local_ip.as_deref(), Some("127.0.0.1"));
     assert_eq!(catalog[0].local_port, Some(9));
 
     assert!(runtime.disconnect(owner).await);

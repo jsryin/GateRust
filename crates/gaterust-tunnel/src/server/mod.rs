@@ -940,6 +940,7 @@ mod tests {
             group: "office".into(),
             kind: TunnelKind::Tcp,
             bind: "127.0.0.1:22022".parse().expect("测试地址有效"),
+            local_ip: "127.0.0.1".into(),
             local_port: NonZeroU16::new(22),
             limit_bps: None,
             max_connections: 8,
@@ -948,6 +949,7 @@ mod tests {
         };
         let mut updated = current.clone();
         updated.group = "home".into();
+        updated.local_ip = "localhost".into();
         updated.local_port = NonZeroU16::new(2222);
         assert!(same_listener(&current, &updated));
 

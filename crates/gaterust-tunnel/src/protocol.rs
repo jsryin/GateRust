@@ -194,6 +194,7 @@ mod tests {
                 name: format!("{index:064}"),
                 kind: TunnelKind::Tcp,
                 server_port: u16::MAX,
+                local_ip: Some("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255".into()),
                 local_port: Some(u16::MAX),
                 state: ClientTunnelState::Enabled,
             })

@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { generateClientConfig } from '../lib/api';
 import { errorMessage } from '../lib/errors';
 import type { ClientService, ServerConfig } from '../lib/types';
+import { tunnelLocalTarget } from '../lib/tunnels';
 import { Badge } from './ui/Badge';
 import { Button } from './ui/Button';
 import { CheckboxField, Field, Input, Select } from './ui/Fields';
@@ -13,12 +14,6 @@ import { Notice } from './ui/Notice';
 interface ClientGeneratorProps {
   config: ServerConfig | null | undefined;
   token: string;
-}
-
-function localTarget(bind: string, localPort: number | null): string {
-  const separator = bind.lastIndexOf(':');
-  const fallback = separator >= 0 ? bind.slice(separator + 1) : '8080';
-  return `127.0.0.1:${localPort ?? fallback}`;
 }
 
 export function ClientGenerator({ config, token }: ClientGeneratorProps) {
@@ -32,7 +27,7 @@ export function ClientGenerator({ config, token }: ClientGeneratorProps) {
     () => config?.tunnels.map((tunnel) => ({
       name: tunnel.name,
       kind: tunnel.kind,
-      target: tunnel.kind === 'socks5' ? null : localTarget(tunnel.bind, tunnel.local_port)
+      target: tunnelLocalTarget(tunnel)
     })) ?? []
   );
   const [result, setResult] = useState('');

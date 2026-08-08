@@ -96,6 +96,7 @@ struct TunnelSpec {
     group: String,
     kind: TunnelKind,
     bind: SocketAddr,
+    local_ip: Option<String>,
     local_port: Option<u16>,
 }
 
@@ -223,6 +224,7 @@ impl TunnelRuntime {
                         group: config.group.clone(),
                         kind: config.kind,
                         bind: config.bind,
+                        local_ip: config.client_local_ip().map(str::to_owned),
                         local_port: config.client_local_port(),
                     },
                 )
@@ -405,6 +407,7 @@ impl TunnelRuntime {
                     name: name.clone(),
                     kind: spec.kind,
                     server_port: spec.bind.port(),
+                    local_ip: spec.local_ip.clone(),
                     local_port: spec.local_port,
                     state,
                 }

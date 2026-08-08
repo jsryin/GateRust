@@ -60,8 +60,27 @@ pub struct ClientTunnel {
     pub name: String,
     pub kind: TunnelKind,
     pub server_port: u16,
+    #[serde(default)]
+    pub local_ip: Option<String>,
     pub local_port: Option<u16>,
     pub state: ClientTunnelState,
+}
+
+impl ClientTunnel {
+    /// 返回客户端应连接的本地目标；旧服务端未下发 IP 时使用回环地址。
+    #[must_use]
+    pub fn local_target(&self) -> Option<String> {
+        if self.kind == TunnelKind::Socks5 {
+            return None;
+        }
+        let port = self.local_port?;
+        let host = self.local_ip.as_deref().unwrap_or(crate::DEFAULT_LOCAL_IP);
+        if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            Some(format!("[{host}]:{port}"))
+        } else {
+            Some(format!("{host}:{port}"))
+        }
+    }
 }
 
 /// 客户端控制会话状态，供本机管理界面展示。
@@ -1126,6 +1145,20 @@ fn is_administrator_disconnect(error: &quinn::ConnectionError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_ipv6_local_target() {
+        let tunnel = ClientTunnel {
+            name: "web".into(),
+            kind: TunnelKind::Tcp,
+            server_port: 443,
+            local_ip: Some("::1".into()),
+            local_port: Some(8080),
+            state: ClientTunnelState::Idle,
+        };
+
+        assert_eq!(tunnel.local_target().as_deref(), Some("[::1]:8080"));
+    }
 
     #[tokio::test]
     async fn invalid_initial_config_waits_for_update() {
