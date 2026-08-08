@@ -7,6 +7,7 @@ import {
   issueCertificate,
   updateCertificate
 } from '../../lib/api';
+import { copyText } from '../../lib/clipboard';
 import { errorMessage } from '../../lib/errors';
 import type {
   CertificateConfig,
@@ -126,6 +127,15 @@ export function CertificatePanel({ config, onRuntimeRefresh, onSaved, runtime, t
     }
   }
 
+  async function copyRecord(text: string) {
+    try {
+      await copyText(text);
+      setNotice({ text: 'DNS 记录已复制', tone: 'success' });
+    } catch (cause) {
+      setNotice({ text: errorMessage(cause, '复制 DNS 记录失败'), tone: 'error' });
+    }
+  }
+
   const hasAccounts = config.acme_accounts.length > 0;
   return (
     <>
@@ -174,7 +184,7 @@ export function CertificatePanel({ config, onRuntimeRefresh, onSaved, runtime, t
       </Dialog>
 
       <Dialog open={recordsFor !== null} onOpenChange={(value) => !value && setRecordsFor(null)}>
-        {recordsFor && <DialogContent title="DNS TXT 解析值"><DialogBody><div className="space-y-3">{recordStatus?.manual_records.map((record) => <div className="rounded-md border border-[color:var(--border-base)] bg-[var(--bg-subtle)] p-3" key={`${record.name}-${record.value}`}><div className="txt-compact-xsmall text-[color:var(--fg-muted)]">记录名</div><div className="txt-compact-small mt-1 flex items-start gap-2"><code className="min-w-0 flex-1 break-all">{record.name}</code><Button aria-label="复制记录名" onClick={() => void navigator.clipboard.writeText(record.name)} size="icon" variant="ghost"><Clipboard className="h-4 w-4" /></Button></div><div className="txt-compact-xsmall mt-3 text-[color:var(--fg-muted)]">记录值</div><div className="txt-compact-small mt-1 flex items-start gap-2"><code className="min-w-0 flex-1 break-all">{record.value}</code><Button aria-label="复制记录值" onClick={() => void navigator.clipboard.writeText(record.value)} size="icon" variant="ghost"><Clipboard className="h-4 w-4" /></Button></div></div>)}</div>{recordStatus?.last_error && <p className="txt-compact-small mt-4 text-[color:var(--tag-red-text)]">{recordStatus.last_error}</p>}</DialogBody><DialogFooter><Button onClick={() => setRecordsFor(null)} variant="secondary">关闭</Button><Button onClick={() => void action(() => continueCertificate(token, recordsFor), '已提交继续验证')}>继续验证</Button></DialogFooter></DialogContent>}
+        {recordsFor && <DialogContent title="DNS TXT 解析值"><DialogBody><div className="space-y-3">{recordStatus?.manual_records.map((record) => <div className="rounded-md border border-[color:var(--border-base)] bg-[var(--bg-subtle)] p-3" key={`${record.name}-${record.value}`}><div className="txt-compact-xsmall text-[color:var(--fg-muted)]">记录名</div><div className="txt-compact-small mt-1 flex items-start gap-2"><code className="min-w-0 flex-1 break-all">{record.name}</code><Button aria-label="复制记录名" onClick={() => void copyRecord(record.name)} size="icon" variant="ghost"><Clipboard className="h-4 w-4" /></Button></div><div className="txt-compact-xsmall mt-3 text-[color:var(--fg-muted)]">记录值</div><div className="txt-compact-small mt-1 flex items-start gap-2"><code className="min-w-0 flex-1 break-all">{record.value}</code><Button aria-label="复制记录值" onClick={() => void copyRecord(record.value)} size="icon" variant="ghost"><Clipboard className="h-4 w-4" /></Button></div></div>)}</div>{recordStatus?.last_error && <p className="txt-compact-small mt-4 text-[color:var(--tag-red-text)]">{recordStatus.last_error}</p>}</DialogBody><DialogFooter><Button onClick={() => setRecordsFor(null)} variant="secondary">关闭</Button><Button onClick={() => void action(() => continueCertificate(token, recordsFor), '已提交继续验证')}>继续验证</Button></DialogFooter></DialogContent>}
       </Dialog>
     </>
   );

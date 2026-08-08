@@ -1,6 +1,7 @@
 import { Check, Clipboard, Download, FileCode2, WandSparkles } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { generateClientConfig } from '../lib/api';
+import { copyText } from '../lib/clipboard';
 import { errorMessage } from '../lib/errors';
 import type { ClientService, ServerConfig } from '../lib/types';
 import { tunnelLocalTarget } from '../lib/tunnels';
@@ -59,11 +60,13 @@ export function ClientGenerator({ config, token }: ClientGeneratorProps) {
 
   async function copy() {
     try {
-      await navigator.clipboard.writeText(result);
+      await copyText(result);
+      setError('');
       setCopied(true);
       window.clearTimeout(copiedTimer.current);
       copiedTimer.current = window.setTimeout(() => setCopied(false), 1800);
     } catch (cause) {
+      setCopied(false);
       setError(errorMessage(cause, '复制失败'));
     }
   }

@@ -12,6 +12,7 @@ import {
   updateGroup,
   updateTunnel
 } from '../lib/api';
+import { copyText } from '../lib/clipboard';
 import { errorMessage } from '../lib/errors';
 import type {
   GroupConfig,
@@ -160,10 +161,11 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
 
   async function copyGroupKey(key: string) {
     try {
-      await navigator.clipboard.writeText(key);
+      await copyText(key);
       setError('');
       setMessage('分组密钥已复制');
     } catch (cause) {
+      setMessage('');
       setError(errorMessage(cause, '复制密钥失败'));
     }
   }
