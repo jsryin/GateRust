@@ -308,11 +308,11 @@ async fn managed_client_applies_confirmed_ephemeral_tunnel_selection() {
     let client_path = directory.path().join("client.toml");
     let client_cancel = cancellation.clone();
     let (controller, commands) = client_control_channel();
-    let (status, _status_receiver) = watch::channel(ClientStatus::Starting);
+    let (status, mut status_receiver) = watch::channel(ClientStatus::Starting);
     let client = tokio::spawn(async move {
         run_managed_client_with_status(client_path, client_cancel, status, commands).await
     });
-    wait_for_runtime(&runtime, |snapshot| {
+    let initial = wait_for_runtime(&runtime, |snapshot| {
         snapshot.clients.len() == 1
             && snapshot
                 .tunnels
@@ -320,6 +320,7 @@ async fn managed_client_applies_confirmed_ephemeral_tunnel_selection() {
                 .all(|tunnel| tunnel.owner_session_id.is_none())
     })
     .await;
+    let session_id = initial.clients[0].session_id;
 
     let services = vec![ClientServiceConfig {
         name: "tcp-echo".into(),
@@ -333,6 +334,63 @@ async fn managed_client_applies_confirmed_ephemeral_tunnel_selection() {
     .await
     .expect("启用请求不应超时")
     .expect("启用请求应成功");
+    assert!(
+        enabled
+            .iter()
+            .find(|tunnel| tunnel.name == "tcp-echo")
+            .is_some_and(|tunnel| tunnel.state == ClientTunnelState::Enabled)
+    );
+
+    runtime
+        .disconnect_tunnel(session_id, "tcp-echo")
+        .await
+        .expect("管理端应能下线指定隧道");
+    let released = wait_for_runtime(&runtime, |snapshot| {
+        snapshot.clients.len() == 1
+            && snapshot.clients[0].session_id == session_id
+            && snapshot
+                .tunnels
+                .iter()
+                .find(|tunnel| tunnel.name == "tcp-echo")
+                .is_some_and(|tunnel| tunnel.owner_session_id.is_none())
+    })
+    .await;
+    assert_eq!(released.clients[0].session_id, session_id);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                &*status_receiver.borrow(),
+                ClientStatus::Online { tunnels, .. }
+                    if tunnels.iter().any(|tunnel| {
+                        tunnel.name == "tcp-echo" && tunnel.state == ClientTunnelState::Idle
+                    })
+            ) {
+                break;
+            }
+            status_receiver
+                .changed()
+                .await
+                .expect("客户端状态通道保持打开");
+        }
+    })
+    .await
+    .expect("客户端应显示隧道已正常下线");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        runtime
+            .snapshot()
+            .await
+            .tunnels
+            .iter()
+            .find(|tunnel| tunnel.name == "tcp-echo")
+            .is_some_and(|tunnel| tunnel.owner_session_id.is_none()),
+        "客户端不应自动重新连接已下线隧道"
+    );
+
+    let enabled = controller
+        .update_services(services.clone())
+        .await
+        .expect("手动重新启用应成功");
     assert!(
         enabled
             .iter()
@@ -449,6 +507,56 @@ async fn forwards_tcp_udp_and_socks5() {
     assert_eq!(snapshot.clients.len(), 1);
     assert_eq!(snapshot.clients[0].session_id, session_id);
     exchange(&mut persistent, b"after-config-replace").await;
+
+    runtime
+        .disconnect_tunnel(session_id, "tcp-echo")
+        .await
+        .expect("管理端应能下线 TCP 隧道");
+    let released = wait_for_runtime(&runtime, |snapshot| {
+        snapshot.clients.len() == 1
+            && snapshot.clients[0].session_id == session_id
+            && snapshot
+                .tunnels
+                .iter()
+                .find(|tunnel| tunnel.name == "tcp-echo")
+                .is_some_and(|tunnel| tunnel.owner_session_id.is_none())
+    })
+    .await;
+    for tunnel in ["udp-echo", "socks"] {
+        assert!(
+            released
+                .tunnels
+                .iter()
+                .find(|runtime_tunnel| runtime_tunnel.name == tunnel)
+                .is_some_and(|runtime_tunnel| {
+                    runtime_tunnel.owner_session_id == Some(session_id)
+                }),
+            "下线单条隧道不应影响其他隧道"
+        );
+    }
+    wait_until_stream_closed(&mut persistent).await;
+    assert_udp_echo(udp_public, b"udp-after-tcp-offline").await;
+    assert_socks_echo(socks_public, tcp_target_address, b"socks-after-tcp-offline").await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        runtime
+            .snapshot()
+            .await
+            .tunnels
+            .iter()
+            .find(|tunnel| tunnel.name == "tcp-echo")
+            .is_some_and(|tunnel| tunnel.owner_session_id.is_none())
+    );
+
+    ClientConfig::read(&client_path)
+        .expect("应能读取客户端配置")
+        .save(&client_path)
+        .expect("应能手动重新提交隧道选择");
+    assert_stream_echo(tcp_public, b"after-manual-reconnect").await;
+    let mut persistent = TcpStream::connect(tcp_public)
+        .await
+        .expect("手动重连后应能建立持久 TCP 隧道");
+    exchange(&mut persistent, b"before-client-remove").await;
 
     let mut runtime_changes = runtime.subscribe();
     runtime_changes.borrow_and_update();
@@ -631,9 +739,12 @@ target = "127.0.0.1:9"
     assert_eq!(catalog[0].local_ip.as_deref(), Some("127.0.0.1"));
     assert_eq!(catalog[0].local_port, Some(9));
 
-    assert!(runtime.disconnect(owner).await);
+    runtime
+        .disconnect_tunnel(owner, "shared-tunnel")
+        .await
+        .expect("应能下线当前所有者的隧道");
     wait_for_runtime(&runtime, |snapshot| {
-        snapshot.clients.len() == 1
+        snapshot.clients.len() == 2
             && snapshot
                 .tunnels
                 .first()
@@ -657,7 +768,7 @@ target = "127.0.0.1:9"
             .is_some_and(|tunnel| tunnel.owner_session_id == Some(occupied_client))
     })
     .await;
-    assert_eq!(claimed.clients.len(), 1);
+    assert_eq!(claimed.clients.len(), 2);
 
     cancellation.cancel();
     assert_task_ok(server, "服务端").await;
@@ -900,6 +1011,19 @@ async fn wait_until_stream_unavailable(address: SocketAddr) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("TCP 隧道未在预期时间内停止接受新连接");
+}
+
+async fn wait_until_stream_closed(stream: &mut TcpStream) {
+    for _ in 0..50 {
+        if tokio::time::timeout(Duration::from_millis(100), stream.read_u8())
+            .await
+            .is_ok_and(|result| result.is_err())
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("已下线隧道的现有 TCP 连接未及时释放");
 }
 
 async fn exchange(stream: &mut TcpStream, payload: &[u8]) {

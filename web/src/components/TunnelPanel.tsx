@@ -5,7 +5,7 @@ import {
   createTunnel,
   deleteGroup,
   deleteTunnel,
-  disconnectTunnelClient,
+  disconnectTunnel,
   generateKey,
   getTunnelRuntime,
   setTunnelQuic,
@@ -257,12 +257,12 @@ export function TunnelPanel({ config, onSaved, token }: TunnelPanelProps) {
     await persistMutation(() => deleteTunnel(token, name), '隧道已删除');
   }
 
-  async function disconnectClient(client: TunnelRuntimeClient) {
+  async function disconnectClient(tunnel: TunnelConfig, client: TunnelRuntimeClient) {
     try {
-      await disconnectTunnelClient(token, client.session_id);
+      await disconnectTunnel(token, client.session_id, tunnel.name);
       await refreshRuntime();
     } catch (cause) {
-      setError(errorMessage(cause, '下线客户端失败'));
+      setError(errorMessage(cause, '下线隧道失败'));
     }
   }
 

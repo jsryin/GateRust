@@ -137,8 +137,8 @@ export const generateKey = (token: string) =>
 export const getTunnelRuntime = (token: string, signal?: AbortSignal) =>
   request<TunnelRuntimeState>('/api/tunnel/runtime', token, { signal });
 
-export const disconnectTunnelClient = (token: string, sessionId: number) =>
-  request<void>(`/api/tunnel/sessions/${sessionId}`, token, { method: 'DELETE' });
+export const disconnectTunnel = (token: string, sessionId: number, name: string) =>
+  request<void>(namedPath(`/api/tunnel/sessions/${sessionId}/tunnels`, name), token, { method: 'DELETE' });
 
 export function generateClientConfig(
   token: string,

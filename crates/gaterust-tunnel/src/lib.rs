@@ -33,7 +33,8 @@ pub use config::{
 };
 pub use error::{Result, TunnelError};
 pub use runtime::{
-    RuntimeClient, RuntimeTunnel, TunnelConfigStatus, TunnelRuntime, TunnelRuntimeSnapshot,
+    RuntimeClient, RuntimeTunnel, TunnelConfigStatus, TunnelDisconnectError, TunnelRuntime,
+    TunnelRuntimeSnapshot,
 };
 pub use server::{run_server, run_server_with_runtime, run_server_with_shutdown};
 

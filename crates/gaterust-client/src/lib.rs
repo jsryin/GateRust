@@ -254,7 +254,7 @@ impl ClientRuntime {
         let ClientStatus::Online { tunnels, .. } = self.status() else {
             return Err(ClientError::InvalidOperation("尚未登录服务器".into()));
         };
-        let services = services_for_selection(tunnels, names)?;
+        let services = services_for_enable(tunnels, names)?;
         let requested = services
             .iter()
             .map(|service| service.name.clone())
@@ -428,6 +428,19 @@ fn services_for_selection(
     Ok(services)
 }
 
+fn services_for_enable(
+    tunnels: Vec<ClientTunnel>,
+    mut names: Vec<String>,
+) -> Result<Vec<ClientServiceConfig>> {
+    names.extend(
+        tunnels
+            .iter()
+            .filter(|tunnel| tunnel.state == ClientTunnelState::Enabled)
+            .map(|tunnel| tunnel.name.clone()),
+    );
+    services_for_selection(tunnels, names)
+}
+
 /// 解析并初始化客户端配置路径。
 ///
 /// # Errors
@@ -491,6 +504,39 @@ mod tests {
         }];
 
         assert!(services_for_selection(tunnels, vec!["ssh".into()]).is_err());
+    }
+
+    #[test]
+    fn enabling_idle_tunnel_preserves_enabled_tunnels() {
+        let tunnels = vec![
+            ClientTunnel {
+                name: "active".into(),
+                kind: TunnelKind::Tcp,
+                server_port: 22022,
+                local_ip: Some("127.0.0.1".into()),
+                local_port: Some(22),
+                state: ClientTunnelState::Enabled,
+            },
+            ClientTunnel {
+                name: "idle".into(),
+                kind: TunnelKind::Tcp,
+                server_port: 28080,
+                local_ip: Some("127.0.0.1".into()),
+                local_port: Some(8080),
+                state: ClientTunnelState::Idle,
+            },
+        ];
+
+        let services = services_for_enable(tunnels, vec!["idle".into()])
+            .expect("启用空闲隧道应保留已启用隧道");
+
+        assert_eq!(
+            services
+                .iter()
+                .map(|service| service.name.as_str())
+                .collect::<Vec<_>>(),
+            ["active", "idle"]
+        );
     }
 
     #[tokio::test]

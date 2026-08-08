@@ -444,6 +444,12 @@ input::placeholder {
   gap: 12px;
 }
 
+.action-buttons {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
 .select-all {
   flex: 0 0 auto;
   gap: 6px;

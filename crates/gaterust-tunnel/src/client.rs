@@ -674,6 +674,9 @@ async fn run_connected(
             message = read_frame::<_, ServerControlMessage>(control_receive) => {
                 match message {
                     Ok(ServerControlMessage::TunnelSnapshot(tunnels)) => {
+                        if managed {
+                            retain_enabled_services(config, &services, &tunnels).await;
+                        }
                         status.send_replace(ClientStatus::Online {
                             server: config.server.address.clone(),
                             device_id: device_id.into(),
@@ -692,6 +695,9 @@ async fn run_connected(
                             ));
                         }
                         *config = pending.updated;
+                        if managed {
+                            retain_enabled_services(config, &services, &tunnels).await;
+                        }
                         status.send_replace(ClientStatus::Online {
                             server: config.server.address.clone(),
                             device_id: device_id.into(),
@@ -1133,6 +1139,26 @@ fn service_map(services: &[ClientServiceConfig]) -> HashMap<String, ClientServic
         .iter()
         .map(|service| (service.name.clone(), service.clone()))
         .collect()
+}
+
+async fn retain_enabled_services(
+    config: &mut ClientConfig,
+    services: &RwLock<HashMap<String, ClientServiceConfig>>,
+    tunnels: &[ClientTunnel],
+) {
+    let enabled = tunnels
+        .iter()
+        .filter(|tunnel| tunnel.state == ClientTunnelState::Enabled)
+        .map(|tunnel| tunnel.name.as_str())
+        .collect::<HashSet<_>>();
+    let previous_len = config.services.len();
+    config
+        .services
+        .retain(|service| enabled.contains(service.name.as_str()));
+    if config.services.len() != previous_len {
+        // 服务端下线只清除对应隧道的运行时选择，避免控制连接重建时自动重新声明。
+        *services.write().await = service_map(&config.services);
+    }
 }
 
 fn connection_identity_changed(current: &ClientConfig, updated: &ClientConfig) -> bool {

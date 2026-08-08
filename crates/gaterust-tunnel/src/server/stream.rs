@@ -102,10 +102,23 @@ async fn handle(
         return Err(TunnelError::Protocol("没有可用的内网客户端".into()));
     };
 
-    let (mut send, mut receive) =
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, session.connection.open_bi())
-            .await
-            .map_err(|_| TunnelError::Timeout("打开 QUIC 数据流"))??;
+    tokio::select! {
+        biased;
+        () = session.tunnel_shutdown.cancelled() => Ok(()),
+        result = forward(public, config, limiter, session.connection, destination) => result,
+    }
+}
+
+async fn forward(
+    mut public: TcpStream,
+    config: &ServerTunnelConfig,
+    limiter: &RateLimiter,
+    connection: quinn::Connection,
+    destination: Option<String>,
+) -> Result<()> {
+    let (mut send, mut receive) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.open_bi())
+        .await
+        .map_err(|_| TunnelError::Timeout("打开 QUIC 数据流"))??;
     write_frame(
         &mut send,
         &OpenRequest {

@@ -120,8 +120,8 @@ fn module_routes() -> Router<ApiState> {
         .route("/groups/key", post(generate_key))
         .route("/tunnel/runtime", get(tunnel_runtime))
         .route(
-            "/tunnel/sessions/{session_id}",
-            delete(disconnect_tunnel_client),
+            "/tunnel/sessions/{session_id}/tunnels/{name}",
+            delete(disconnect_tunnel),
         )
         .route("/client-config", post(generate_client_config));
     #[cfg(feature = "proxy")]
@@ -486,18 +486,26 @@ async fn tunnel_runtime(
 }
 
 #[cfg(feature = "tunnel")]
-async fn disconnect_tunnel_client(
+async fn disconnect_tunnel(
     State(state): State<ApiState>,
-    Path(session_id): Path<u64>,
+    Path((session_id, name)): Path<(u64, String)>,
 ) -> Result<StatusCode, ApiError> {
     let runtime = state
         .store
         .tunnel_runtime()
         .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "隧道模块未运行"))?;
-    if runtime.disconnect(session_id).await {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::new(StatusCode::NOT_FOUND, "客户端会话不存在"))
+    match runtime.disconnect_tunnel(session_id, &name).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(gaterust_tunnel::TunnelDisconnectError::SessionNotFound) => {
+            Err(ApiError::new(StatusCode::NOT_FOUND, "客户端会话不存在"))
+        }
+        Err(gaterust_tunnel::TunnelDisconnectError::TunnelNotFound) => {
+            Err(ApiError::new(StatusCode::NOT_FOUND, "隧道不存在"))
+        }
+        Err(gaterust_tunnel::TunnelDisconnectError::NotOwnedBySession) => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "隧道归属已变化，请刷新后重试",
+        )),
     }
 }
 

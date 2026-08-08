@@ -151,10 +151,23 @@ async fn run_session(
     let Some(session) = context.runtime.find(&context.config.name).await else {
         return Err(TunnelError::Protocol("没有可用的内网客户端".into()));
     };
-    let (mut send, mut receive) =
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, session.connection.open_bi())
-            .await
-            .map_err(|_| TunnelError::Timeout("打开 QUIC UDP 数据流"))??;
+
+    tokio::select! {
+        biased;
+        () = session.tunnel_shutdown.cancelled() => Ok(()),
+        result = relay_session(peer, &mut inbound, context, session.connection) => result,
+    }
+}
+
+async fn relay_session(
+    peer: SocketAddr,
+    inbound: &mut mpsc::Receiver<QueuedDatagram>,
+    context: &SessionContext,
+    connection: quinn::Connection,
+) -> Result<()> {
+    let (mut send, mut receive) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.open_bi())
+        .await
+        .map_err(|_| TunnelError::Timeout("打开 QUIC UDP 数据流"))??;
     write_frame(
         &mut send,
         &OpenRequest {

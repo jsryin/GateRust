@@ -9,6 +9,7 @@ use quinn::Connection;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{RwLock, watch};
+use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize as _;
 
 use crate::{
@@ -58,6 +59,14 @@ pub struct RuntimeTunnel {
 #[derive(Clone)]
 pub(crate) struct ClientSession {
     pub(crate) connection: Connection,
+    pub(crate) tunnel_shutdown: CancellationToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TunnelDisconnectError {
+    SessionNotFound,
+    TunnelNotFound,
+    NotOwnedBySession,
 }
 
 pub(crate) enum RegisterError {
@@ -79,7 +88,12 @@ struct RuntimeState {
     credentials: HashMap<String, [u8; 32]>,
     sessions: HashMap<u64, SessionEntry>,
     tunnels: HashMap<String, TunnelSpec>,
-    owners: HashMap<String, u64>,
+    owners: HashMap<String, TunnelOwner>,
+}
+
+struct TunnelOwner {
+    session_id: u64,
+    shutdown: CancellationToken,
 }
 
 struct SessionEntry {
@@ -150,7 +164,7 @@ impl TunnelRuntime {
             .keys()
             .map(|name| RuntimeTunnel {
                 name: name.clone(),
-                owner_session_id: state.owners.get(name).copied(),
+                owner_session_id: state.owners.get(name).map(|owner| owner.session_id),
             })
             .collect::<Vec<_>>();
         tunnels.sort_unstable_by(|left, right| left.name.cmp(&right.name));
@@ -211,6 +225,49 @@ impl TunnelRuntime {
             b"disconnected by administrator",
         );
         true
+    }
+
+    /// 下线指定会话拥有的单条隧道，同时保留客户端控制连接和其他隧道。
+    ///
+    /// # Errors
+    ///
+    /// 会话或隧道不存在、隧道已不再属于指定会话时返回错误。
+    pub async fn disconnect_tunnel(
+        &self,
+        session_id: u64,
+        tunnel: &str,
+    ) -> Result<(), TunnelDisconnectError> {
+        let shutdown = {
+            let mut state = self.state.write().await;
+            if !state.sessions.contains_key(&session_id) {
+                return Err(TunnelDisconnectError::SessionNotFound);
+            }
+            if !state.tunnels.contains_key(tunnel) {
+                return Err(TunnelDisconnectError::TunnelNotFound);
+            }
+            if state
+                .owners
+                .get(tunnel)
+                .is_none_or(|owner| owner.session_id != session_id)
+            {
+                return Err(TunnelDisconnectError::NotOwnedBySession);
+            }
+
+            let session = state
+                .sessions
+                .get_mut(&session_id)
+                .ok_or(TunnelDisconnectError::SessionNotFound)?;
+            session.services.remove(tunnel);
+            state
+                .owners
+                .remove(tunnel)
+                .ok_or(TunnelDisconnectError::NotOwnedBySession)?
+                .shutdown
+        };
+        // 先提交所有权变更，再终止该隧道的数据流，避免新的公网连接继续进入旧客户端。
+        shutdown.cancel();
+        self.notify();
+        Ok(())
     }
 
     pub(crate) async fn apply_tunnels(&self, configs: &[ServerTunnelConfig]) {
@@ -382,10 +439,14 @@ impl TunnelRuntime {
 
     pub(crate) async fn find(&self, tunnel: &str) -> Option<ClientSession> {
         let state = self.state.read().await;
-        let id = state.owners.get(tunnel)?;
-        state.sessions.get(id).map(|session| ClientSession {
-            connection: session.connection.clone(),
-        })
+        let owner = state.owners.get(tunnel)?;
+        state
+            .sessions
+            .get(&owner.session_id)
+            .map(|session| ClientSession {
+                connection: session.connection.clone(),
+                tunnel_shutdown: owner.shutdown.clone(),
+            })
     }
 
     pub(crate) async fn catalog(&self, session_id: u64) -> Vec<ClientTunnel> {
@@ -400,7 +461,7 @@ impl TunnelRuntime {
             .map(|(name, spec)| {
                 let state = match state.owners.get(name) {
                     None => ClientTunnelState::Idle,
-                    Some(owner) if *owner == session_id => ClientTunnelState::Enabled,
+                    Some(owner) if owner.session_id == session_id => ClientTunnelState::Enabled,
                     Some(_) => ClientTunnelState::Occupied,
                 };
                 ClientTunnel {
@@ -453,25 +514,27 @@ fn retain_valid_owners(state: &mut RuntimeState) {
         owners,
         ..
     } = state;
-    owners.retain(|name, id| {
+    owners.retain(|name, owner| {
         let Some(spec) = tunnels.get(name) else {
             return false;
         };
         sessions
-            .get(id)
+            .get(&owner.session_id)
             .is_some_and(|session| eligible(session, name, spec))
     });
 }
 
 fn release_session(state: &mut RuntimeState, session_id: u64) {
-    state.owners.retain(|_, owner| *owner != session_id);
+    state
+        .owners
+        .retain(|_, owner| owner.session_id != session_id);
 }
 
 fn owned_tunnels(state: &RuntimeState, session_id: u64) -> HashSet<String> {
     state
         .owners
         .iter()
-        .filter(|&(_, owner)| *owner == session_id)
+        .filter(|&(_, owner)| owner.session_id == session_id)
         .map(|(name, _)| name.clone())
         .collect()
 }
@@ -487,7 +550,13 @@ fn claim_available(state: &mut RuntimeState, session_id: u64) {
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
     for name in available {
-        state.owners.insert(name, session_id);
+        state.owners.insert(
+            name,
+            TunnelOwner {
+                session_id,
+                shutdown: CancellationToken::new(),
+            },
+        );
     }
 }
 

@@ -32,7 +32,7 @@ interface TunnelGroupListProps {
   onCreateTunnel: (group: string) => void;
   onDeleteGroup: (name: string) => void | Promise<void>;
   onDeleteTunnel: (name: string) => void | Promise<void>;
-  onDisconnectClient: (client: TunnelRuntimeClient) => void | Promise<void>;
+  onDisconnectClient: (tunnel: TunnelConfig, client: TunnelRuntimeClient) => void | Promise<void>;
   onEditGroup: (group: GroupConfig) => void;
   onEditTunnel: (tunnel: TunnelConfig) => void;
 }
@@ -100,7 +100,6 @@ export function TunnelGroupList({
     const clientsById = new Map(runtime.clients.map((client) => [client.session_id, client]));
     const clientCountByGroup = new Map<string, number>();
     const ownerByTunnel = new Map<string, TunnelRuntimeClient>();
-    const tunnelsByOwner = new Map<number, string[]>();
 
     runtime.clients.forEach((client) => {
       clientCountByGroup.set(client.group, (clientCountByGroup.get(client.group) ?? 0) + 1);
@@ -109,12 +108,9 @@ export function TunnelGroupList({
       if (tunnel.owner_session_id === null) return;
       const owner = clientsById.get(tunnel.owner_session_id);
       if (owner) ownerByTunnel.set(tunnel.name, owner);
-      const names = tunnelsByOwner.get(tunnel.owner_session_id) ?? [];
-      names.push(tunnel.name);
-      tunnelsByOwner.set(tunnel.owner_session_id, names);
     });
 
-    return { clientCountByGroup, ownerByTunnel, tunnelsByOwner };
+    return { clientCountByGroup, ownerByTunnel };
   }, [runtime.clients, runtime.tunnels]);
 
   const views = useMemo(() => {
@@ -335,7 +331,6 @@ export function TunnelGroupList({
                             <TunnelRow
                               key={tunnel.name}
                               owner={owner}
-                              releasedTunnels={owner ? runtimeIndex.tunnelsByOwner.get(owner.session_id) ?? [] : []}
                               tunnel={tunnel}
                               onDelete={onDeleteTunnel}
                               onDisconnect={onDisconnectClient}
@@ -372,14 +367,13 @@ export function TunnelGroupList({
 
 interface TunnelRowProps {
   owner?: TunnelRuntimeClient;
-  releasedTunnels: string[];
   tunnel: TunnelConfig;
   onDelete: (name: string) => void | Promise<void>;
-  onDisconnect: (client: TunnelRuntimeClient) => void | Promise<void>;
+  onDisconnect: (tunnel: TunnelConfig, client: TunnelRuntimeClient) => void | Promise<void>;
   onEdit: (tunnel: TunnelConfig) => void;
 }
 
-function TunnelRow({ owner, releasedTunnels, tunnel, onDelete, onDisconnect, onEdit }: TunnelRowProps) {
+function TunnelRow({ owner, tunnel, onDelete, onDisconnect, onEdit }: TunnelRowProps) {
   const connectedAt = owner ? formatConnectedAt(owner.connected_at) : '';
 
   return (
@@ -426,11 +420,11 @@ function TunnelRow({ owner, releasedTunnels, tunnel, onDelete, onDisconnect, onE
         {owner && (
           <ConfirmAction
             confirmLabel="下线"
-            description={`将释放隧道：${releasedTunnels.join(', ') || '无'}`}
-            onConfirm={() => onDisconnect(owner)}
-            title={`下线 ${owner.device_id}？`}
+            description={`将断开隧道 ${tunnel.name} 的现有转发，客户端控制连接和其他隧道保持在线。`}
+            onConfirm={() => onDisconnect(tunnel, owner)}
+            title={`下线隧道 ${tunnel.name}？`}
           >
-            <Button aria-label={`下线 ${owner.device_id}`} size="icon" title="下线客户端" variant="ghost">
+            <Button aria-label={`下线隧道 ${tunnel.name}`} size="icon" title="下线隧道" variant="ghost">
               <LogOut className="h-4 w-4 text-[color:var(--tag-red-text)]" />
             </Button>
           </ConfirmAction>
