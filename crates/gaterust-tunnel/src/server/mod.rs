@@ -101,7 +101,7 @@ pub async fn run_server_with_runtime(
     let mut listeners = ListenerManager::new(runtime.clone());
     listeners.apply(&initial.tunnels).await?;
     runtime.report_config_applied(&initial)?;
-    let accept_task = tokio::spawn(accept_connections(
+    let mut accept_task = tokio::spawn(accept_connections(
         quic.endpoint().clone(),
         runtime.clone(),
         Arc::clone(&groups),
@@ -110,12 +110,24 @@ pub async fn run_server_with_runtime(
     ));
     tracing::info!(address = %local_address, "QUIC 隧道服务端已启动");
 
-    loop {
+    // Quinn 驱动失效会结束 accept 流，必须让主服务退出并交由进程管理器恢复。
+    let (failure, accept_task_finished) = loop {
         tokio::select! {
-            () = cancellation.cancelled() => break,
+            () = cancellation.cancelled() => break (None, false),
+            result = &mut accept_task => {
+                if cancellation.is_cancelled() {
+                    break (None, true);
+                }
+                let error = match result {
+                    Ok(Ok(())) => TunnelError::Protocol("QUIC 接入任务意外结束".into()),
+                    Ok(Err(error)) => error,
+                    Err(error) => TunnelError::Protocol(format!("QUIC 接入任务异常结束: {error}")),
+                };
+                break (Some(error), true);
+            }
             changed = watcher.changed() => {
                 if !changed {
-                    break;
+                    break (None, false);
                 }
                 reload_server(
                     &config_path,
@@ -126,7 +138,7 @@ pub async fn run_server_with_runtime(
                 ).await;
             }
         }
-    }
+    };
 
     cancellation.cancel();
     quic.endpoint().close(
@@ -134,10 +146,12 @@ pub async fn run_server_with_runtime(
         b"server shutdown",
     );
     listeners.shutdown().await;
-    await_task(accept_task, "QUIC 接入任务").await;
+    if !accept_task_finished {
+        await_task(accept_task, "QUIC 接入任务").await;
+    }
     quic.endpoint().wait_idle().await;
     tracing::info!("QUIC 隧道服务端已停止");
-    Ok(())
+    failure.map_or(Ok(()), Err)
 }
 
 async fn reload_server(
@@ -210,7 +224,7 @@ async fn accept_connections(
     groups: Arc<RwLock<Vec<(String, GroupSecret)>>>,
     credentials: watch::Receiver<Arc<tls::ServerCredentials>>,
     cancellation: CancellationToken,
-) {
+) -> Result<()> {
     let ids = Arc::new(AtomicU64::new(1));
     let authentication_permits = Arc::new(Semaphore::new(MAX_PENDING_AUTHENTICATIONS));
     let peer_admission = Arc::new(PeerAdmission::default());
@@ -267,7 +281,8 @@ async fn accept_connections(
                         }
                     });
                 }
-                None => break,
+                None if cancellation.is_cancelled() => break,
+                None => return Err(TunnelError::Protocol("QUIC 端点接入驱动已停止".into())),
             },
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 if let Err(error) = result {
@@ -281,6 +296,7 @@ async fn accept_connections(
             tracing::warn!(%error, "QUIC 客户端任务异常结束");
         }
     }
+    Ok(())
 }
 
 async fn authenticate(
@@ -914,9 +930,10 @@ impl Drop for PeerAdmissionPermit {
     }
 }
 
-async fn await_task(mut task: JoinHandle<()>, name: &str) {
+async fn await_task(mut task: JoinHandle<Result<()>>, name: &str) {
     match tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut task).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => tracing::warn!(%error, task = name, "后台任务异常结束"),
         Ok(Err(error)) => tracing::warn!(%error, task = name, "后台任务异常结束"),
         Err(_) => {
             tracing::warn!(task = name, "等待后台任务退出超时");
