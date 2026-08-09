@@ -123,8 +123,11 @@ impl AsyncUdpSocket for UdpSocket {
     ) -> Poll<io::Result<usize>> {
         loop {
             ready!(self.io.poll_readable(cx))?;
-            if let Ok(res) = self.inner.recv((&self.io).into(), bufs, meta) {
-                return Poll::Ready(Ok(res));
+            match self.inner.recv((&self.io).into(), bufs, meta) {
+                Ok(res) => return Poll::Ready(Ok(res)),
+                // 只有 WouldBlock 表示就绪状态已经耗尽，其他错误必须交给端点处理。
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
             }
         }
     }

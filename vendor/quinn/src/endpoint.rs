@@ -778,6 +778,7 @@ impl RecvState {
         now: Instant,
     ) -> Result<PollProgress, io::Error> {
         let mut received_connection_packet = false;
+        let mut connection_reset_seen = false;
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
         let mut iovs: [IoSliceMut; BATCH_SIZE] = {
             let mut bufs = self
@@ -793,6 +794,7 @@ impl RecvState {
         loop {
             match socket.poll_recv(cx, &mut iovs, &mut metas) {
                 Poll::Ready(Ok(msgs)) => {
+                    connection_reset_seen = false;
                     self.recv_limiter.record_work(msgs);
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
                         let mut data: BytesMut = buf[0..meta.len].into();
@@ -840,9 +842,13 @@ impl RecvState {
                         keep_going: false,
                     });
                 }
-                // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
-                // attacker
-                Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => {
+                Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    // 单次 ECONNRESET 可能由网络注入；连续出现则说明 socket 已失效，继续
+                    // 同步轮询只会形成忙循环。
+                    if connection_reset_seen {
+                        return Err(e);
+                    }
+                    connection_reset_seen = true;
                     continue;
                 }
                 Poll::Ready(Err(e)) => {
@@ -876,4 +882,156 @@ struct PollProgress {
     received_connection_packet: bool,
     /// Whether datagram handling was interrupted early by the work limiter for fairness
     keep_going: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        net::{Ipv4Addr, SocketAddr},
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::Waker,
+    };
+
+    use super::*;
+    use crate::runtime::{AsyncTimer, UdpPoller};
+
+    #[test]
+    fn persistent_connection_reset_terminates_receive_poll() {
+        let (mut endpoint, mut state) = receive_state();
+        let socket = ResetSocket::new(2);
+        let runtime = TestRuntime;
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let error = match state.poll_socket(
+            &mut cx,
+            &mut endpoint,
+            &socket,
+            &runtime,
+            runtime.now(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("连续的 ConnectionReset 必须终止接收轮询"),
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(socket.polls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn transient_connection_reset_keeps_receive_poll_active() {
+        let (mut endpoint, mut state) = receive_state();
+        let socket = ResetSocket::new(1);
+        let runtime = TestRuntime;
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let progress = state
+            .poll_socket(&mut cx, &mut endpoint, &socket, &runtime, runtime.now())
+            .expect("单次 ConnectionReset 后应继续等待 socket");
+
+        assert!(!progress.keep_going);
+        assert_eq!(socket.polls.load(Ordering::Relaxed), 2);
+    }
+
+    fn receive_state() -> (proto::Endpoint, RecvState) {
+        let (sender, _events) = mpsc::unbounded_channel();
+        let endpoint =
+            proto::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+        let mut state = RecvState::new(sender, 1, &endpoint);
+        state
+            .recv_limiter
+            .start_cycle(|| Instant::now() - std::time::Duration::from_secs(1));
+        (endpoint, state)
+    }
+
+    #[derive(Debug)]
+    struct ResetSocket {
+        resets: AtomicUsize,
+        polls: AtomicUsize,
+    }
+
+    impl ResetSocket {
+        fn new(resets: usize) -> Self {
+            Self {
+                resets: AtomicUsize::new(resets),
+                polls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl AsyncUdpSocket for ResetSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            Box::pin(PendingIo)
+        }
+
+        fn try_send(&self, _transmit: &udp::Transmit) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut Context,
+            _bufs: &mut [IoSliceMut<'_>],
+            _meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            if self
+                .resets
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |resets| {
+                    resets.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok((Ipv4Addr::LOCALHOST, 0).into())
+        }
+    }
+
+    #[derive(Debug)]
+    struct PendingIo;
+
+    impl AsyncTimer for PendingIo {
+        fn reset(self: Pin<&mut Self>, _deadline: Instant) {}
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<()> {
+            Poll::Pending
+        }
+    }
+
+    impl UdpPoller for PendingIo {
+        fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestRuntime;
+
+    impl Runtime for TestRuntime {
+        fn new_timer(&self, _deadline: Instant) -> Pin<Box<dyn AsyncTimer>> {
+            Box::pin(PendingIo)
+        }
+
+        fn spawn(&self, _future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+            unreachable!("接收轮询测试不会生成任务");
+        }
+
+        fn wrap_udp_socket(
+            &self,
+            _socket: std::net::UdpSocket,
+        ) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+            unreachable!("接收轮询测试不会包装 socket");
+        }
+
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
 }

@@ -8,6 +8,7 @@ members = [
     "crates/gaterust-server",
     "crates/gaterust-tunnel",
 ]
+exclude = ["vendor/quinn"]
 
 [workspace.package]
 version = "0.1.1-beta.2"
@@ -71,5 +72,6 @@ similar_names = "allow"
 too_many_lines = "allow"
 
 [patch.crates-io]
-# Quinn 0.11.11 会在 UDP 持久错误上忙循环；待包含上游 #2721 的版本发布后移除。
+# Quinn 0.11.11 会在 UDP 持久错误上忙循环；vendor 包含上游 #2721
+# 并补足连续 ECONNRESET 的处理，待完整修复发布后移除。
 quinn = { path = "vendor/quinn" }
