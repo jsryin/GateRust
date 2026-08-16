@@ -116,8 +116,8 @@ impl ProxyService {
     }
 }
 
-fn prepare_request(
-    request: &mut Request<Incoming>,
+fn prepare_request<B>(
+    request: &mut Request<B>,
     route: &Route,
     remote: SocketAddr,
     tls: bool,
@@ -143,17 +143,15 @@ fn prepare_request(
         .path_and_query(path)
         .build()?;
     remove_hop_headers(request.headers_mut());
+    // 上游地址只用于建连；应用仍应看到客户端请求的公开 Host。
+    if let Some(host) = &original_host {
+        request.headers_mut().insert(HOST, host.clone());
+    }
     if let Some(upgrade) = upgrade {
         request.headers_mut().insert(UPGRADE, upgrade);
         request
             .headers_mut()
             .insert(CONNECTION, HeaderValue::from_static("upgrade"));
-    }
-    if let Some(authority) = route.upstream.authority() {
-        request.headers_mut().insert(
-            HOST,
-            HeaderValue::from_str(authority.as_str()).map_err(http::Error::from)?,
-        );
     }
     set_forwarded(
         request.headers_mut(),
@@ -165,8 +163,8 @@ fn prepare_request(
         "x-forwarded-proto",
         if tls { "https" } else { "http" },
     );
-    if let Some(host) = original_host.and_then(|value| value.to_str().ok().map(str::to_owned)) {
-        set_forwarded(request.headers_mut(), "x-forwarded-host", &host);
+    if let Some(host) = original_host.as_ref().and_then(|value| value.to_str().ok()) {
+        set_forwarded(request.headers_mut(), "x-forwarded-host", host);
     }
     Ok(())
 }
@@ -255,5 +253,48 @@ mod tests {
         let upstream: Uri = "http://127.0.0.1/base".parse().unwrap();
         let incoming: Uri = "/v1/items?page=2".parse().unwrap();
         assert_eq!(joined_path(&upstream, &incoming), "/base/v1/items?page=2");
+    }
+
+    #[test]
+    fn prepares_upstream_connection_without_rewriting_public_host() {
+        let route = Route {
+            name: Arc::from("app"),
+            upstream: "http://127.0.0.1:23445".parse().unwrap(),
+            tls: false,
+        };
+        let mut request = Request::builder()
+            .uri("/app/login?next=%2F")
+            .header(HOST, "public.example:8443")
+            .header(CONNECTION, "keep-alive, x-remove")
+            .header("x-remove", "private")
+            .body(())
+            .unwrap();
+
+        prepare_request(
+            &mut request,
+            &route,
+            SocketAddr::from(([192, 0, 2, 1], 12345)),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.uri(),
+            &"http://127.0.0.1:23445/app/login?next=%2F"
+                .parse::<Uri>()
+                .unwrap()
+        );
+        assert_eq!(request.headers().get(HOST).unwrap(), "public.example:8443");
+        assert_eq!(
+            request.headers().get("x-forwarded-host").unwrap(),
+            "public.example:8443"
+        );
+        assert_eq!(request.headers().get("x-forwarded-proto").unwrap(), "https");
+        assert_eq!(
+            request.headers().get("x-forwarded-for").unwrap(),
+            "192.0.2.1"
+        );
+        assert!(!request.headers().contains_key(CONNECTION));
+        assert!(!request.headers().contains_key("x-remove"));
     }
 }
