@@ -102,10 +102,10 @@ jobs:
         with:
           command: build
           target: ${{ matrix.target }}
-          args: '--locked --release -p gaterust-server -p gaterust-client --all-features'
+          args: '--locked --release -p gaterust-server --all-features'
       - name: Build native binaries
         if: matrix.cross == false
-        run: cargo build --locked --release -p gaterust-server -p gaterust-client --all-features --target ${{ matrix.target }}
+        run: cargo build --locked --release -p gaterust-server --all-features --target ${{ matrix.target }}
       - name: Stage command binaries
         shell: bash
         env:
@@ -118,17 +118,12 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           mkdir -p dist
           server="target/$TARGET/release/gaterust-server$EXTENSION"
-          client="target/$TARGET/release/gaterust-client$EXTENSION"
           test -f "$server"
-          test -f "$client"
           cp "$server" "dist/gaterust_server_${version}_${ASSET_OS}_${ASSET_ARCH}${EXTENSION}"
-          cp "$client" "dist/gaterust_client_cli_${version}_${ASSET_OS}_${ASSET_ARCH}${EXTENSION}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: command-binaries-${{ matrix.asset_os }}-${{ matrix.asset_arch }}
-          path: |
-            dist/gaterust_server_*
-            dist/gaterust_client_cli_*
+          path: dist/gaterust_server_*
           if-no-files-found: error
 
   desktop_clients:
@@ -360,14 +355,12 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 24
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 17
           for target in linux_amd64 linux_arm linux_arm64 mac_amd64 mac_arm64; do
             test -f "dist/gaterust_server_${version}_${target}"
-            test -f "dist/gaterust_client_cli_${version}_${target}"
           done
           for target in windows_amd64 windows_arm64; do
             test -f "dist/gaterust_server_${version}_${target}.exe"
-            test -f "dist/gaterust_client_cli_${version}_${target}.exe"
           done
           for target in linux_amd64 linux_arm64; do
             test -f "dist/gaterust_client_${version}_${target}.AppImage"
